@@ -168,7 +168,7 @@ EOF
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache pytest
 
   # Upgrade compressed-tensors to fix broken quantization.utils.helpers import in older Docker images
-  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade compressed-tensors
+  # docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade compressed-tensors
 
   # Install cache-dit for qwen_image_t2i_cache_dit_enabled test (added in PR 16204)
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache cache-dit || echo "cache-dit installation failed"
