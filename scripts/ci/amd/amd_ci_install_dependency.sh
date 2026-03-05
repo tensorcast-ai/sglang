@@ -128,7 +128,7 @@ if [[ -n "${SKIP_TT_DEPS}" ]]; then
 else
   # For lmms_evals evaluating MMMU
   docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
-  install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+  install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache --no-deps -e .
 
   git_clone_with_retry https://github.com/akao-amd/human-eval.git human-eval
   docker cp human-eval ci_sglang:/
@@ -163,6 +163,13 @@ EOF
   # docker exec -w / ci_sglang mkdir -p /dummy-grok
   # mkdir -p dummy-grok && wget https://sharkpublic.blob.core.windows.net/sharkpublic/sglang/dummy_grok.json -O dummy-grok/config.json
   # docker cp ./dummy-grok ci_sglang:/
+
+  # Debug: check transformers version before tests
+  echo "=== [DEBUG] transformers info after dependency installation ==="
+  docker exec ci_sglang pip show transformers
+  docker exec ci_sglang python3 -c "import transformers; print(transformers.__version__); print(transformers.__file__)"
+  docker exec ci_sglang python3 -c "from transformers import pytorch_utils; print('OK')"
+  echo "=== [DEBUG] transformers check done ==="
 
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache huggingface_hub[hf_xet]
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache pytest
