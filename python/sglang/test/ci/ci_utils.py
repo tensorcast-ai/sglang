@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -78,6 +79,182 @@ def is_retriable_failure(output: str) -> tuple[bool, str]:
     return False, "unknown failure type"
 
 
+def _get_ancestor_pids():
+    """Return the set of PIDs from the current process up to PID 1."""
+    try:
+        import psutil
+    except ImportError:
+        return {os.getpid()}
+    pids = set()
+    try:
+        proc = psutil.Process(os.getpid())
+        while proc is not None:
+            pids.add(proc.pid)
+            proc = proc.parent()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
+    pids.add(os.getpid())
+    return pids
+
+
+def _kill_orphan_processes():
+    """Kill leftover processes from previous test runs.
+
+    After each test, tearDownClass should kill the server, but if a test
+    crashes or times out, orphan processes may linger and consume GPU memory,
+    system memory, or file descriptors, causing flaky failures in later tests.
+
+    Strategy: In CI containers we can be aggressive. Kill every Python process
+    that is NOT an ancestor of the current test-runner process (i.e. not our
+    own process chain). This catches sglang servers, multiprocessing workers,
+    torch.distributed workers, triton compilation daemons, etc.
+    """
+    try:
+        import psutil
+    except ImportError:
+        logger.warning(
+            "[cleanup] psutil not available, skipping orphan process cleanup"
+        )
+        return
+
+    protected = _get_ancestor_pids()
+    killed = []
+
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            pid = proc.pid
+            if pid in protected or pid <= 1:
+                continue
+            name = proc.info.get("name") or ""
+            cmdline = " ".join(proc.info.get("cmdline") or [])
+            is_python = "python" in name.lower()
+            is_gpu = False
+            if not is_python:
+                try:
+                    open_files = proc.open_files()
+                    is_gpu = any(
+                        "/dev/kfd" in f.path
+                        or "/dev/dri" in f.path
+                        or "/dev/nvidia" in f.path
+                        for f in open_files
+                    )
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            if is_python or is_gpu:
+                logger.info(
+                    f"[cleanup] Killing orphan pid={pid} ({name}): {cmdline[:120]}"
+                )
+                kill_process_tree(pid)
+                killed.append(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    if killed:
+        logger.info(
+            f"[cleanup] Killed {len(killed)} orphan process tree(s), waiting 5s..."
+        )
+        time.sleep(5)
+    else:
+        logger.info("[cleanup] No orphan processes found")
+
+
+def _clear_shared_memory():
+    """Remove leftover POSIX shared memory segments that may leak GPU/CPU resources.
+
+    NCCL/RCCL can leave behind both files and directories in /dev/shm.
+    """
+    shm_dir = "/dev/shm"
+    if not os.path.isdir(shm_dir):
+        return
+    uid = os.getuid()
+    removed = 0
+    for name in os.listdir(shm_dir):
+        path = os.path.join(shm_dir, name)
+        try:
+            if os.stat(path).st_uid != uid:
+                continue
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.remove(path)
+            removed += 1
+        except OSError:
+            continue
+    if removed:
+        logger.info(f"[cleanup] Removed {removed} shared memory entry(s) from /dev/shm")
+
+
+def _log_resource_status():
+    """Log disk, memory, and GPU status for post-mortem debugging."""
+    lines = ["[cleanup] === Resource status ==="]
+    for cmd, label in [
+        (["free", "-h"], "Memory"),
+        (["df", "-h", "/"], "Disk"),
+    ]:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                lines.append(r.stdout.strip())
+        except Exception:
+            pass
+
+    for gpu_cmd in [
+        ["rocm-smi", "--showmemuse"],
+        ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv"],
+    ]:
+        try:
+            r = subprocess.run(gpu_cmd, capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                lines.append(r.stdout.strip())
+                break
+        except FileNotFoundError:
+            continue
+        except Exception:
+            break
+
+    lines.append("[cleanup] === End resource status ===")
+    logger.info("\n".join(lines))
+
+
+def _verify_python_env():
+    """Quick sanity check that the Python environment is intact.
+
+    If a previous test corrupted the environment (e.g., disk full causing
+    partial writes, or stale .pyc files), catching it here gives a clear
+    diagnostic instead of a cryptic failure deep in the next test.
+    """
+    checks = [
+        "import transformers; from transformers import pytorch_utils",
+        "import torch",
+    ]
+    for check in checks:
+        try:
+            r = subprocess.run(
+                ["python3", "-c", check],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if r.returncode != 0:
+                logger.warning(
+                    f"[cleanup] ENV CHECK FAILED: `{check}`\n"
+                    f"  stdout: {r.stdout.strip()}\n"
+                    f"  stderr: {r.stderr.strip()}"
+                )
+            else:
+                logger.info(f"[cleanup] ENV OK: `{check}`")
+        except Exception as e:
+            logger.warning(f"[cleanup] ENV CHECK ERROR: `{check}` -> {e}")
+
+
+def cleanup_between_tests():
+    """Run between test files to prevent resource leaks from causing flaky failures."""
+    _kill_orphan_processes()
+    _clear_shared_memory()
+    _log_resource_status()
+    _verify_python_env()
+
+
 def run_with_timeout(
     func: Callable,
     args: tuple = (),
@@ -147,6 +324,12 @@ def run_unittest_files(
         else:
             # FIXME: remove this branch after migrating all tests to use CIRegistry
             filename, estimated_time = file.name, file.estimated_time
+
+        if i > 0 and os.environ.get("SGLANG_IS_IN_CI_AMD") == "1":
+            logger.info(
+                f"\n[cleanup] Running AMD CI cleanup before test {i}/{len(files) - 1}: {filename}"
+            )
+            cleanup_between_tests()
 
         process = None
         output_lines = []

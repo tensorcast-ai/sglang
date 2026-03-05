@@ -397,15 +397,29 @@ class HFRunner:
         return self.out_queue.get()
 
     def terminate(self):
-        self.model_proc.terminate()
+        self._cleanup_model_proc()
+
+    def _cleanup_model_proc(self):
+        """Terminate the model process and wait for it to fully exit.
+
+        Without join(), the child process may linger as a zombie holding GPU
+        memory, /dev/shm segments, and file descriptors, which causes flaky
+        failures in subsequent tests (especially on AMD CI).
+        """
+        if self.model_proc is not None and self.model_proc.is_alive():
+            self.model_proc.terminate()
+            self.model_proc.join(timeout=10)
+            if self.model_proc.is_alive():
+                self.model_proc.kill()
+                self.model_proc.join(timeout=5)
+        self.model_proc = None
         self.in_queue = self.out_queue = None
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.model_proc.terminate()
-        self.in_queue = self.out_queue = None
+        self._cleanup_model_proc()
 
     @staticmethod
     def forward_generation_raw(
