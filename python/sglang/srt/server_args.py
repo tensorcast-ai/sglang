@@ -87,6 +87,7 @@ LOAD_FORMAT_CHOICES = [
     "remote_instance",
     "fastsafetensors",
     "private",
+    "tensorcast",
 ]
 
 QUANTIZATION_CHOICES = [

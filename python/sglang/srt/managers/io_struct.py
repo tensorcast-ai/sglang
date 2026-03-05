@@ -1226,6 +1226,31 @@ class UpdateWeightFromDiskReqOutput(BaseReq):
 
 
 @dataclass
+class UpdateWeightsFromTensorcastReqInput(BaseReq):
+    """Update model weights from a Tensorcast artifact key (pull-by-key).
+
+    Control plane:
+    - The caller provides `weight_version` and optional `artifact_key`.
+    - The server pulls weights from Tensorcast and reloads in-place.
+    """
+
+    weight_version: int
+    artifact_key: Optional[str] = None
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
+    # Whether to recapture cuda graph after weight update
+    recapture_cuda_graph: bool = False
+
+
+@dataclass
+class UpdateWeightsFromTensorcastReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
 class UpdateWeightsFromDistributedReqInput(BaseReq):
     names: List[str]
     dtypes: List[str]

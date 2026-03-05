@@ -117,6 +117,7 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromTensorcastReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -807,6 +808,20 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
             content,
             status_code=HTTPStatus.BAD_REQUEST,
         )
+
+
+@app.post("/update_weights_from_tensorcast")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_weights_from_tensorcast(
+    obj: UpdateWeightsFromTensorcastReqInput, request: Request
+):
+    """Update the weights from Tensorcast by immutable key/version (pull-by-key)."""
+    success, message, status_code = (
+        await _global_state.tokenizer_manager.update_weights_from_tensorcast(obj, request)
+    )
+
+    content = {"success": success, "message": message}
+    return ORJSONResponse(content, status_code=status_code)
 
 
 @app.post("/init_weights_send_group_for_remote_instance")

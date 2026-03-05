@@ -396,6 +396,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For weight updates
         self._model_update_group = {}
         self._weights_send_group = {}
+        self._tensorcast_trace_plan = None
 
     def init_mindspore_runner(self):
         # Init the mindspore runner
@@ -1082,6 +1083,357 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
+
+    def update_weights_from_tensorcast(
+        self,
+        *,
+        weight_version: int,
+        artifact_key: str | None,
+        recapture_cuda_graph: bool = False,
+    ) -> tuple[bool, str]:
+        """Update engine weights in-place by pulling a Tensorcast artifact by key."""
+        if str(self.server_args.load_format).lower() != "tensorcast":
+            return (
+                False,
+                "Tensorcast update requires server started with --load-format tensorcast.",
+            )
+
+        extra_config = self.load_config.model_loader_extra_config or {}
+        if not isinstance(extra_config, dict):
+            return (
+                False,
+                "Tensorcast update requires LoadConfig.model_loader_extra_config to be a dict.",
+            )
+
+        logger.info(
+            "Update engine weights online from tensorcast begin. weight_version=%s key=%s avail mem=%.2f GB",
+            weight_version,
+            artifact_key,
+            get_available_gpu_memory(self.device, self.gpu_id),
+        )
+
+        graphs_enabled = (self.graph_runner is not None) or (
+            self.piecewise_cuda_graph_runner is not None
+        )
+        if graphs_enabled and not recapture_cuda_graph:
+            logger.warning(
+                "Reject tensorcast update without recapture_cuda_graph while cuda graph enabled. graph_runner=%s piecewise_cuda_graph_runner=%s",
+                self.graph_runner is not None,
+                self.piecewise_cuda_graph_runner is not None,
+            )
+            return (
+                False,
+                "CUDA graph is enabled; tensorcast update requires recapture_cuda_graph=true in v1.",
+            )
+        if graphs_enabled:
+            logger.info(
+                "Tensorcast update cuda-graph policy: enabled; recapture_cuda_graph=%s",
+                recapture_cuda_graph,
+            )
+        else:
+            logger.info(
+                "Tensorcast update cuda-graph policy: disabled; recapture_cuda_graph=%s",
+                recapture_cuda_graph,
+            )
+
+        if artifact_key is None:
+            return (
+                False,
+                "Missing artifact_key for tensorcast update (expected control plane to resolve it).",
+            )
+
+        from sglang.srt.model_loader.tensorcast_loader import (
+            TensorcastApplyError,
+            TensorcastArtifactError,
+            TensorcastLoaderError,
+            _apply_copy_plan,
+            _evict_meta_rotary_cache,
+            _materialize_tensor_dict,
+            _postprocess_after_loading,
+        )
+        from sglang.srt.model_loader.tensorcast_runtime import (
+            ensure_tensorcast_runtime_initialized,
+            is_tensorcast_key_not_found,
+            open_tensorcast_artifact_by_key,
+            parse_tensorcast_extra_config,
+            resolve_tensorcast_versioned_artifact_key,
+        )
+        from sglang.srt.model_loader.tensorcast_trace import trace_model_load
+        from sglang.srt.model_loader.tensorcast_trace_cache import (
+            build_trace_plan_cache_key,
+            get_trace_plan_cache_dir,
+            load_trace_plan_from_cache,
+            save_trace_plan_to_cache,
+        )
+        from sglang.srt.model_loader.loader import _initialize_model
+
+        target_device = (
+            torch.device("cpu")
+            if self.device == "cpu"
+            else torch.device(self.device, self.gpu_id)
+        )
+        try:
+            tc_cfg = parse_tensorcast_extra_config(extra_config)
+        except Exception as exc:  # noqa: BLE001
+            return (
+                False,
+                f"Invalid tensorcast model_loader_extra_config: {exc}",
+            )
+        require_rollback_preflight = bool(
+            tc_cfg.tensorcast_update_require_rollback_preflight
+        )
+        allow_materialize_cpu_fallback = bool(tc_cfg.tensorcast_update_allow_cpu_fallback)
+
+        def _iter_exc_chain(exc: BaseException) -> list[BaseException]:
+            chain: list[BaseException] = []
+            seen: set[int] = set()
+            cur: BaseException | None = exc
+            while cur is not None:
+                cur_id = id(cur)
+                if cur_id in seen:
+                    break
+                seen.add(cur_id)
+                chain.append(cur)
+                cur = cur.__cause__ or cur.__context__
+            return chain
+
+        def _is_materialize_oom_error(exc: BaseException) -> bool:
+            patterns = (
+                "out of memory",
+                "cudaerrormemoryallocation",
+                "failed uma gpu allocation",
+                "resource_exhausted",
+            )
+            for err in _iter_exc_chain(exc):
+                msg = str(err).lower()
+                if any(token in msg for token in patterns):
+                    return True
+            return False
+
+        class _TensorcastMaterializeError(TensorcastArtifactError):
+            pass
+
+        def _load_one_version(key: str) -> None:
+            ensure_tensorcast_runtime_initialized(extra_config)
+            artifact = open_tensorcast_artifact_by_key(extra_config, artifact_key=key)
+            descriptor = artifact.describe()
+
+            trace_plan = self._tensorcast_trace_plan
+            if trace_plan is None:
+                cache_dir = get_trace_plan_cache_dir(extra_config)
+                cache_key = build_trace_plan_cache_key(
+                    model_config=self.model_config,
+                    load_config=self.load_config,
+                    extra_config=extra_config,
+                )
+                if cache_dir is not None:
+                    trace_plan = load_trace_plan_from_cache(cache_dir, cache_key)
+                    if trace_plan is not None:
+                        missing = trace_plan.expected_src_names - set(descriptor.tensor_names)
+                        if missing:
+                            logger.warning(
+                                "Ignoring cached tensorcast trace plan due to missing tensors in artifact. "
+                                "cache_key=%s missing_tensors=%s",
+                                cache_key,
+                                sorted(missing),
+                            )
+                            trace_plan = None
+
+                if trace_plan is None:
+                    with set_default_torch_dtype(self.model_config.dtype):
+                        with torch.device("meta"):
+                            meta_model = _initialize_model(
+                                self.model_config, self.load_config
+                            )
+                    trace_plan = trace_model_load(
+                        meta_model,
+                        ordered_names=list(descriptor.tensor_names),
+                        meta_by_name=descriptor.tensor_metas,
+                    )
+                    _evict_meta_rotary_cache()
+                    if cache_dir is not None:
+                        save_trace_plan_to_cache(cache_dir, cache_key, trace_plan)
+                self._tensorcast_trace_plan = trace_plan
+            else:
+                missing = trace_plan.expected_src_names - set(descriptor.tensor_names)
+                if missing:
+                    raise RuntimeError(
+                        "Tensorcast trace plan does not match artifact. "
+                        f"missing_tensors={sorted(missing)}"
+                    )
+
+            tensor_dict: dict[str, torch.Tensor] | None = None
+            try:
+                tensor_dict = _materialize_tensor_dict(
+                    artifact=artifact,
+                    trace_plan=trace_plan,
+                    target_device=target_device,
+                    extra_config=extra_config,
+                )
+            except Exception as exc:  # noqa: BLE001
+                if (
+                    allow_materialize_cpu_fallback
+                    and target_device.type == "cuda"
+                    and _is_materialize_oom_error(exc)
+                ):
+                    logger.warning(
+                        "Tensorcast GPU materialization OOM; retrying on CPU. key=%s",
+                        key,
+                    )
+                    try:
+                        tensor_dict = _materialize_tensor_dict(
+                            artifact=artifact,
+                            trace_plan=trace_plan,
+                            target_device=torch.device("cpu"),
+                            extra_config=extra_config,
+                        )
+                    except Exception as fallback_exc:  # noqa: BLE001
+                        raise _TensorcastMaterializeError(
+                            f"Failed to materialize tensor dict for key={key!r} "
+                            "(GPU attempt OOM; CPU fallback also failed)."
+                        ) from fallback_exc
+                else:
+                    raise _TensorcastMaterializeError(
+                        f"Failed to materialize tensor dict for key={key!r}"
+                    ) from exc
+            try:
+                assert tensor_dict is not None
+                _apply_copy_plan(self.model, trace_plan, tensor_dict)
+            except TensorcastLoaderError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise TensorcastApplyError(
+                    f"Failed to apply tensorcast copy plan for key={key!r}"
+                ) from exc
+            finally:
+                if tensor_dict is not None:
+                    del tensor_dict
+                gc.collect()
+                if target_device.type == "cuda":
+                    torch.cuda.empty_cache()
+            _postprocess_after_loading(self.model, self.model_config, target_device)
+
+        device_module = torch.get_device_module(self.device)
+        if self.device != "cpu":
+            device_module.synchronize()
+            if recapture_cuda_graph:
+                released_graphs: list[str] = []
+                if self.graph_runner is not None:
+                    self.graph_runner = None
+                    self.graph_mem_usage = 0
+                    released_graphs.append("cuda_graph")
+                if self.piecewise_cuda_graph_runner is not None:
+                    self.piecewise_cuda_graph_runner = None
+                    released_graphs.append("piecewise_cuda_graph")
+                if released_graphs:
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    device_module.synchronize()
+                    logger.info(
+                        "Released graph memory before tensorcast update: components=%s avail_mem=%.2f GB",
+                        ",".join(released_graphs),
+                        get_available_gpu_memory(self.device, self.gpu_id),
+                    )
+
+        try:
+            prev_version = int(str(self.server_args.weight_version))
+        except Exception as exc:  # noqa: BLE001
+            return (
+                False,
+                "Tensorcast mode requires a numeric weight_version for rollback safety. "
+                f"got {self.server_args.weight_version!r}: {exc}",
+            )
+
+        # Preflight rollback key readability to ensure we can restore previous
+        # weights on failure. This is configurable: strict mode rejects update
+        # when preflight fails; default mode proceeds best-effort.
+        rollback_key: str | None = None
+        rollback_preflight_ok = False
+        try:
+            rollback_key = resolve_tensorcast_versioned_artifact_key(
+                extra_config, weight_version=prev_version
+            )
+            open_tensorcast_artifact_by_key(extra_config, artifact_key=rollback_key)
+            rollback_preflight_ok = True
+        except Exception as exc:  # noqa: BLE001
+            if require_rollback_preflight:
+                logger.warning(
+                    "Reject tensorcast update due to rollback preflight failure. "
+                    "current_version=%s rollback_key=%s error=%s",
+                    prev_version,
+                    rollback_key,
+                    exc,
+                )
+                return (
+                    False,
+                    "Rollback preflight failed; refusing tensorcast update because "
+                    "tensorcast_update_require_rollback_preflight=true. "
+                    f"current_version={prev_version} rollback_key={rollback_key!r} error={exc}",
+                )
+
+            if rollback_key is not None and is_tensorcast_key_not_found(exc):
+                logger.warning(
+                    "Rollback preflight key not found; continuing without rollback safety. "
+                    "current_version=%s rollback_key=%s",
+                    prev_version,
+                    rollback_key,
+                )
+            else:
+                logger.warning(
+                    "Rollback preflight failed; continuing without rollback safety. "
+                    "current_version=%s rollback_key=%s error=%s",
+                    prev_version,
+                    rollback_key,
+                    exc,
+                )
+
+        try:
+            _load_one_version(str(artifact_key))
+        except _TensorcastMaterializeError as exc:
+            logger.exception(
+                "Tensorcast update failed before apply; skipping rollback attempt"
+            )
+            return (
+                False,
+                f"Tensorcast update failed before apply: {exc}. Old weights remain active.",
+            )
+        except Exception as exc:  # noqa: BLE001
+            if rollback_preflight_ok and rollback_key is not None:
+                logger.exception("Tensorcast update failed; attempting rollback")
+                try:
+                    _load_one_version(rollback_key)
+                    return (
+                        False,
+                        f"Tensorcast update failed: {exc}. Rolled back to weight_version={prev_version}.",
+                    )
+                except Exception as rollback_exc:  # noqa: BLE001
+                    logger.exception("Tensorcast rollback failed")
+                    return (
+                        False,
+                        f"Tensorcast update failed: {exc}. Rollback failed: {rollback_exc}. Weights may be partially updated.",
+                    )
+
+            logger.exception(
+                "Tensorcast update failed and rollback preflight was unavailable; "
+                "cannot guarantee automatic rollback"
+            )
+            return (
+                False,
+                "Tensorcast update failed and automatic rollback was unavailable "
+                f"(current_version={prev_version}, rollback_key={rollback_key!r}). "
+                f"error={exc}. Weights may be partially updated.",
+            )
+        finally:
+            if self.device != "cpu":
+                device_module.synchronize()
+
+        if recapture_cuda_graph and self.device == "cuda":
+            logger.info("Recapturing cuda graphs after tensorcast update")
+            self.init_device_graphs()
+            self.init_piecewise_cuda_graphs()
+
+        logger.info("Update weights end.")
+        return True, "Succeeded to update model weights from tensorcast."
 
     def init_weights_send_group_for_remote_instance(
         self,

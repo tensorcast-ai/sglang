@@ -1,6 +1,6 @@
 # Tensorcast Loader and Online Weight Updates (SGLang)
 
-This document describes the intended **Tensorcast integration design** for SGLang:
+This document describes the **Tensorcast integration** for SGLang:
 
 - **Bootstrap / initial load (startup)** from a Tensorcast artifact representing a *canonical checkpoint*.
 - **Online weight updates (post-startup)** driven by `weight_version` and immutable, versioned Tensorcast keys.
@@ -10,8 +10,22 @@ Protocol contract:
 - `sglang/docs/tensorcast/tensorcast_weight_update_protocol.md`
 
 Status:
-- This is a design/proposal document. Concrete filenames/classes may differ once implemented, but the call flows and invariants here are the target behavior.
+- Implemented in the SGLang codebase (bootstrap + pull-by-key online updates).
 - This document intentionally **does not** cover binding-based swap APIs (e.g. `bind_into` / `binding.swap`).
+
+Installation prerequisite:
+- Install Tensorcast support with `uv pip install "sglang[tensorcast]"` (or `pip install "sglang[tensorcast]"`).
+- Without this extra, `--load-format tensorcast` will fail at runtime when importing `tensorcast`.
+
+Code references (main entrypoints):
+- `sglang/python/sglang/srt/model_loader/tensorcast_loader.py`
+- `sglang/python/sglang/srt/model_loader/tensorcast_trace.py`
+- `sglang/python/sglang/srt/model_loader/tensorcast_trace_cache.py`
+- `sglang/python/sglang/srt/model_loader/tensorcast_runtime.py`
+- `sglang/python/sglang/srt/entrypoints/http_server.py` (`POST /update_weights_from_tensorcast`)
+- `sglang/python/sglang/srt/managers/tokenizer_communicator_mixin.py` (control plane + version semantics)
+- `sglang/python/sglang/srt/managers/scheduler_update_weights_mixin.py` (scheduler routing + TP barrier)
+- `sglang/python/sglang/srt/model_executor/model_runner.py` (worker-side apply + rollback)
 
 ---
 
@@ -22,6 +36,7 @@ Status:
 1. **Bootstrap / initial load (startup)**
    - SGLang starts and loads model weights into an initialized model instance.
    - In Tensorcast mode, bootstrap may allow `tc.from_disk(hf_folder)` (import path) as a convenience, but should prefer `tc.artifact(key=...)` when a key is configured.
+   - If bootstrap falls back to `tc.from_disk(...)`, SGLang continues using the returned `artifact_id` (it does **not** require the key mapping to exist immediately).
 
 2. **Online updates (post-initialization)**
    - A publisher (e.g. a trainer or a serving instance acting as publisher) publishes a new canonical checkpoint under a *new immutable* Tensorcast key.
@@ -67,6 +82,12 @@ Recommended `--model-loader-extra-config` keys (Tensorcast):
   "tensorcast_get_prefer": "auto",
   "tensorcast_export_policy": "auto",
 
+  "tensorcast_disk_fallback_auto_put": true,
+  "tensorcast_put_policy": "durable",
+  "tensorcast_put_stage_on_gpu": false,
+  "tensorcast_update_require_rollback_preflight": false,
+  "tensorcast_update_allow_cpu_fallback": true,
+
   "tensorcast_trace_tp_slices": true,
   "tensorcast_tp_slice_plan_cache_dir": "/tmp/sglang_tensorcast_trace_cache"
 }
@@ -77,6 +98,7 @@ Resolution rules:
 - **Bootstrap**:
   - If `tensorcast_artifact_key` is provided, load from that key via `tc.artifact(key=...)`.
   - Otherwise, bootstrap can fall back to `tc.from_disk(hf_folder)` if disk fallback is enabled and a local checkpoint is available.
+- If disk fallback is used and `tensorcast_disk_fallback_auto_put==true`, SGLang may **best-effort** publish canonical key mapping via `WeightPublisher.publish_from_disk(model_path, version)` after materialization/apply. This keeps artifact tensor names HF-canonical and avoids publishing runtime `state_dict` names.
 - **Online update**:
   - The worker resolves `artifact_key` from `weight_version` using `tensorcast_key_template` and injects it as `tensorcast_artifact_key` for that reload attempt.
   - Online updates must fail if neither `weight_version` nor an explicit `tensorcast_artifact_key` is available.
@@ -114,6 +136,9 @@ The design follows vLLM’s approach:
 
 1. Construct a **meta/no-init model** (or a “dry-run model”) that has the correct parameter *shapes* for the current TP/PP rank.
 2. Run `model.load_weights(...)` under a `TorchDispatchMode` (“TraceMode”) using **meta tensors** as sources.
+   - Important: SGLang’s `get_rope(...)` caches rotary modules globally (`sglang.srt.layers.rotary_embedding._ROPE_DICT`).
+     If a meta model is initialized first, those cached RoPE modules may retain `cos_sin_cache` on meta and then be reused
+     by the real model init. The Tensorcast loader must evict meta RoPE cache entries before constructing the real model.
 3. Record a **copy plan** at `aten::copy_` / `aten::fill_` boundaries:
    - `(ckpt_name, ckpt_slice) -> (dst_name, dst_slice)` plus constant fills.
 4. Derive:
@@ -130,6 +155,7 @@ Once a trace plan exists:
 1. Open the Tensorcast artifact:
    - Bootstrap: allow `tc.from_disk(hf_folder)` if configured.
    - Online update: use `tc.artifact(key=..., fallback=...)` and call `artifact.describe()`.
+   - When disk fallback is used, do **not** block bootstrap on key mapping publication; proceed with the imported `artifact_id`.
 2. Select and slice:
    - `artifact_tp = artifact.subset(materialize_names).view(slices=tensorcast_slices)`
 3. Materialize the per-rank tensor dict on the target device:
@@ -140,6 +166,9 @@ Once a trace plan exists:
 5. Run post-load processing:
    - per-module `quant_method.process_weights_after_loading(module)` on the correct device
    - `post_load_weights(model, model_config)` when the model defines `post_load_weights()`
+
+Optional (bootstrap-only) publish:
+- If disk fallback was used and auto-publish is enabled, SGLang can attempt a **best-effort** `WeightPublisher.publish_from_disk(model_path, version)` after step (4) and before step (5), so key mapping points to a canonical HF-name artifact.
 
 ### 3.4 Post-load semantics alignment (SGLang)
 
@@ -208,6 +237,10 @@ So in v1 Tensorcast uses one clear pull-by-key management interface:
 2. Existing `/update_weights_from_disk` remains local-checkpoint oriented and is not the
    primary Tensorcast control path.
 
+Compatibility invariant:
+- Tensorcast update MUST NOT mutate `server_args.model_path` or `server_args.load_format`
+  (only `weight_version` advances on success).
+
 Tensorcast online updates should follow the same operational model:
 
 - **Gate inference** (pause/drain/abort) and **serialize** reload attempts.
@@ -249,7 +282,11 @@ Version note (Tensorcast mode):
    - updates `server_args.weight_version` on success (and leaves it unchanged on failure).
 
 Online-update invariant:
-- After startup, Tensorcast reloads must not import from explicit local disk paths (`tc.from_disk`). If the artifact key cannot be opened, the reload fails atomically and the previous weights remain active.
+- After startup, Tensorcast reloads must not import from explicit local disk paths (`tc.from_disk`).
+- v1 performs rollback preflight for safety, but by default it is **best-effort**:
+  - if current-version key is readable, rollback is available on update failure;
+  - if current-version key is not readable, update can still proceed, with a warning that automatic rollback is unavailable.
+- Set `tensorcast_update_require_rollback_preflight=true` to enforce strict rejection when rollback preflight fails.
 
 ---
 
@@ -257,7 +294,11 @@ Online-update invariant:
 
 ### 5.1 Trace plan caching
 
-Trace can be expensive and should be cached per rank. A cache key should include at least:
+Trace can be expensive and is cached per rank when enabled via:
+
+- `model_loader_extra_config.tensorcast_tp_slice_plan_cache_dir`
+
+Implementation uses a deterministic key (see `build_trace_plan_cache_key(...)`) that includes at least:
 
 - model identity (e.g. `model_path`, `revision`, architecture),
 - dtype / quantization settings affecting parameter layout,
@@ -277,6 +318,20 @@ TraceMode v1 MUST assume the following may appear in real model loaders:
 - `transpose` / `permute`
 - dtype casts (`to(dtype=...)`)
 - `contiguous()` / `clone()` (sometimes indirectly)
+
+Implementation notes:
+
+- TraceMode records a per-copy `ViewSpec` (shape/stride/storage_offset) for the
+  checkpoint-side tensor at the `copy_` / `fill_` boundary; apply uses
+  `as_strided` so common view transforms (e.g. `transpose`, `view/reshape`) are
+  reproduced without re-running model-specific loader code.
+- Unsupported-op fallback is **view-only**:
+  - If an unsupported op consumes a single checkpoint tensor and its outputs
+    still share storage with that checkpoint tensor (i.e. it is effectively a
+    view), TraceMode marks that source name as **unsliceable** and disables
+    Tensorcast `artifact.view(slices=...)` for that name (full materialize).
+  - If an unsupported op combines multiple tracked tensors or produces new
+    storage, tracing fails (explicit error) to avoid silent incorrect weights.
 
 Tensorcast tracing must either:
 
@@ -318,6 +373,24 @@ If SGLang is using CUDA graph capture, weight reload may require:
   - Each rank MUST `torch.cuda.synchronize()` (or equivalent device sync) before
     and after the apply phase to avoid releasing the lock while async copies are
     still in flight.
+
+### 5.4 Known limits / fallback mode (v1)
+
+- Trace unsupported-op fallback is **view-only** (see §5.2); ops that combine
+  multiple tracked tensors or allocate new storage will fail tracing explicitly.
+- Some plans (e.g. `cat`/`stack`-split copy entries) may not carry `ViewSpec`
+  metadata and therefore rely on range-based slicing in the apply phase.
+- Trace plan caching is best-effort and rank-specific; disable by omitting
+  `tensorcast_tp_slice_plan_cache_dir`.
+- Online update rejects:
+  - `flush_cache=false`
+  - CUDA-graph enabled without `recapture_cuda_graph=true`
+  - rollback preflight failure **only when** `tensorcast_update_require_rollback_preflight=true`
+- On GPU materialization OOM, v1 can retry on CPU when
+  `tensorcast_update_allow_cpu_fallback=true` (default). This improves update
+  robustness but increases update latency.
+- If update fails in the **materialization stage** (before copy-plan apply),
+  SGLang treats old weights as still active and skips rollback attempt.
 
 ---
 

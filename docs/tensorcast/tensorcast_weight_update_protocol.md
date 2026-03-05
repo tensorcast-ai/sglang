@@ -7,6 +7,11 @@ Publisher `tc.put` (publish) -> SGLang `tc.artifact` (consume) -> SGLang reload 
 Implementation details (trace/copy plan + `subset()`/`view()` materialization) live in:
 - `sglang/docs/tensorcast/tensorcast_loader_and_weight_updates.md`
 
+Installation prerequisite:
+- Inference Server must have Tensorcast installed. Recommended:
+  - `uv pip install "sglang[tensorcast]"`
+  - or `pip install "sglang[tensorcast]"`
+
 ---
 
 ## 0) Roles and Terms
@@ -180,6 +185,25 @@ Notes:
 ### 3.6 No `from_disk` fallback in the online update path (MUST NOT)
 
 After startup/initialization, Publisher-triggered online updates MUST NOT fall back to importing from a local folder (`tc.from_disk(...)`). If `weight_version` cannot be resolved to a key or the key cannot be opened, reload MUST fail atomically.
+
+### 3.7 Rollback safety preflight (v1, SHOULD/MAY)
+
+To reduce partial-update risk, an SGLang worker MAY refuse an update attempt unless it can also open the *current* version key (used for rollback) via `tc.artifact(...).describe()` before applying the new version. If this preflight fails, the server SHOULD return `500` for the update attempt and keep serving the previous version.
+
+SGLang policy note:
+- Default behavior is best-effort preflight (continue update if current-version key is unreadable, but without guaranteed automatic rollback).
+- Strict behavior can be enabled with `model_loader_extra_config.tensorcast_update_require_rollback_preflight=true`, which rejects update when preflight fails.
+
+### 3.8 Materialization OOM fallback (v1, MAY)
+
+If GPU materialization fails with OOM/resource-exhausted signals, IS MAY retry
+materialization on CPU and then copy into model parameters.
+
+SGLang policy note:
+- Default behavior enables this fallback via
+  `model_loader_extra_config.tensorcast_update_allow_cpu_fallback=true`.
+- This improves reliability under low GPU free memory, but increases update
+  latency.
 
 ---
 

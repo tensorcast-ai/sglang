@@ -15,6 +15,12 @@ pip install uv
 uv pip install "sglang"
 ```
 
+To enable Tensorcast model loading and online updates, install the Tensorcast extra:
+
+```bash
+uv pip install "sglang[tensorcast]"
+```
+
 **Quick fixes to common problems**
 - In some cases (e.g., GB200), the above command might install a wrong torch version (e.g., the CPU version) due to dependency resolution. To fix this, you can first run the above command and then force-reinstall the correct [PyTorch](https://pytorch.org/get-started/locally/) with the following:
   ```
@@ -42,6 +48,12 @@ cd sglang
 # Install the python packages
 pip install --upgrade pip
 pip install -e "python"
+```
+
+If you are developing Tensorcast integration from source:
+
+```bash
+pip install -e "python[tensorcast]"
 ```
 
 **Quick fixes to common problems**

@@ -2692,6 +2692,11 @@ def get_model_loader(
     if load_config.load_format == LoadFormat.DUMMY:
         return DummyModelLoader(load_config)
 
+    if load_config.load_format == LoadFormat.TENSORCAST:
+        from sglang.srt.model_loader.tensorcast_loader import TensorcastModelLoader
+
+        return TensorcastModelLoader(load_config)
+
     if model_config and (
         (hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant)
         or model_config.quantization in ["modelopt_fp8", "modelopt_fp4", "modelopt"]

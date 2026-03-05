@@ -33,6 +33,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    UpdateWeightsFromTensorcastReqInput,
+    UpdateWeightsFromTensorcastReqOutput,
 )
 
 if TYPE_CHECKING:
@@ -113,6 +115,34 @@ class SchedulerUpdateWeightsMixin:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromIPCReqOutput(success, message)
+
+    def update_weights_from_tensorcast(
+        self: Scheduler, recv_req: UpdateWeightsFromTensorcastReqInput
+    ):
+        """Update the online model parameters from Tensorcast (pull-by-key)."""
+        # Tensorcast updates materialize new tensors before apply, so flush cache
+        # up-front to maximize available memory and reduce OOM risk.
+        if recv_req.flush_cache:
+            flush_cache_success = self.flush_cache()
+            if not flush_cache_success:
+                message = (
+                    "Cache flush failed before tensorcast update. "
+                    "Abort update to avoid higher OOM risk."
+                )
+                logger.error(message)
+                torch.distributed.barrier(group=self.tp_cpu_group)
+                return UpdateWeightsFromTensorcastReqOutput(False, message)
+
+        success, message = self.tp_worker.update_weights_from_tensorcast(recv_req)
+        if success:
+            # Keep post-update flush as a best-effort cleanup after weight swap.
+            if recv_req.flush_cache:
+                flush_cache_success = self.flush_cache()
+                assert flush_cache_success, "Cache flush failed after updating weights"
+        else:
+            logger.error(message)
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        return UpdateWeightsFromTensorcastReqOutput(success, message)
 
     def get_weights_by_name(self: Scheduler, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)

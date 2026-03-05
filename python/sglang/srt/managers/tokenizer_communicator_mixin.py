@@ -7,6 +7,7 @@ import time
 import uuid
 from collections import deque
 from contextlib import nullcontext
+from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -74,6 +75,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    UpdateWeightsFromTensorcastReqInput,
+    UpdateWeightsFromTensorcastReqOutput,
 )
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import get_bool_env_var
@@ -181,6 +184,9 @@ class TokenizerCommunicatorMixin:
         self.update_weights_from_ipc_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.update_weights_from_tensorcast_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.get_weights_by_name_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -256,6 +262,10 @@ class TokenizerCommunicatorMixin:
                 (
                     UpdateWeightsFromIPCReqOutput,
                     self.update_weights_from_ipc_communicator.handle_recv,
+                ),
+                (
+                    UpdateWeightsFromTensorcastReqOutput,
+                    self.update_weights_from_tensorcast_communicator.handle_recv,
                 ),
                 (
                     GetWeightsByNameReqOutput,
@@ -529,6 +539,188 @@ class TokenizerCommunicatorMixin:
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message
+
+    async def update_weights_from_tensorcast(
+        self: TokenizerManager,
+        obj: UpdateWeightsFromTensorcastReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str, int]:
+        """Update weights from Tensorcast (pull-by-key), synchronously.
+
+        Returns: (success, message, http_status_code)
+        """
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for update weights from tensorcast"
+
+        if str(self.server_args.load_format).lower() != "tensorcast":
+            return (
+                False,
+                "Tensorcast update requires server started with --load-format tensorcast.",
+                int(HTTPStatus.BAD_REQUEST),
+            )
+
+        try:
+            requested_version = int(obj.weight_version)
+        except Exception as exc:  # noqa: BLE001
+            return (
+                False,
+                f"Invalid weight_version={obj.weight_version!r}: {exc}",
+                int(HTTPStatus.BAD_REQUEST),
+            )
+        if requested_version < 0:
+            return (
+                False,
+                f"Invalid weight_version={requested_version}: must be non-negative.",
+                int(HTTPStatus.BAD_REQUEST),
+            )
+
+        try:
+            current_version = int(str(self.server_args.weight_version))
+        except Exception as exc:  # noqa: BLE001
+            return (
+                False,
+                "Tensorcast mode requires a numeric --weight-version for monotonic update semantics. "
+                f"got {self.server_args.weight_version!r}: {exc}",
+                int(HTTPStatus.BAD_REQUEST),
+            )
+
+        if requested_version < current_version:
+            logger.warning(
+                "Reject tensorcast rollback: requested=%s current=%s",
+                requested_version,
+                current_version,
+            )
+            return (
+                False,
+                f"Reject rollback: requested weight_version={requested_version} < current={current_version}.",
+                int(HTTPStatus.CONFLICT),
+            )
+
+        if not obj.flush_cache:
+            return (
+                False,
+                "Tensorcast update requires flush_cache=true in v1.",
+                int(HTTPStatus.BAD_REQUEST),
+            )
+
+        if (
+            (not self.server_args.disable_cuda_graph)
+            or self.server_args.enable_piecewise_cuda_graph
+        ) and (not obj.recapture_cuda_graph):
+            logger.warning(
+                "Reject tensorcast update without recapture_cuda_graph while cuda graph enabled. "
+                "disable_cuda_graph=%s enable_piecewise_cuda_graph=%s",
+                self.server_args.disable_cuda_graph,
+                self.server_args.enable_piecewise_cuda_graph,
+            )
+            return (
+                False,
+                "CUDA graph is enabled; Tensorcast update requires recapture_cuda_graph=true in v1.",
+                int(HTTPStatus.BAD_REQUEST),
+            )
+        if (not self.server_args.disable_cuda_graph) or self.server_args.enable_piecewise_cuda_graph:
+            logger.info(
+                "Tensorcast update cuda-graph policy: enabled; recapture_cuda_graph=%s",
+                obj.recapture_cuda_graph,
+            )
+        else:
+            logger.info(
+                "Tensorcast update cuda-graph policy: disabled; recapture_cuda_graph=%s",
+                obj.recapture_cuda_graph,
+            )
+
+        try:
+            from sglang.srt.configs.load_config import LoadConfig
+            from sglang.srt.model_loader.tensorcast_runtime import (
+                resolve_tensorcast_versioned_artifact_key,
+            )
+
+            load_config = LoadConfig(
+                load_format=self.server_args.load_format,
+                model_loader_extra_config=self.server_args.model_loader_extra_config,
+            )
+            extra_config = load_config.model_loader_extra_config or {}
+            if not isinstance(extra_config, dict):
+                raise ValueError(
+                    "model_loader_extra_config must be a JSON object (dict) in tensorcast mode."
+                )
+            derived_key = resolve_tensorcast_versioned_artifact_key(
+                extra_config,
+                weight_version=requested_version,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return (
+                False,
+                f"Tensorcast key resolution failed: {exc}",
+                int(HTTPStatus.BAD_REQUEST),
+            )
+
+        if obj.artifact_key is not None and str(obj.artifact_key) != derived_key:
+            logger.warning(
+                "Reject tensorcast update due to artifact_key mismatch: expected=%r got=%r",
+                derived_key,
+                obj.artifact_key,
+            )
+            return (
+                False,
+                f"artifact_key mismatch: expected {derived_key!r}, got {obj.artifact_key!r}.",
+                int(HTTPStatus.BAD_REQUEST),
+            )
+        obj.artifact_key = derived_key
+
+        if requested_version == current_version:
+            logger.info("Tensorcast update no-op: already at weight_version=%s", current_version)
+            return (
+                True,
+                f"No-op: already at weight_version={current_version}.",
+                int(HTTPStatus.OK),
+            )
+
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
+
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
+
+        lock_context = (
+            self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        )
+        try:
+            async with lock_context:
+                logger.info(
+                    "Tensorcast update begin: requested_version=%s artifact_key=%s",
+                    requested_version,
+                    obj.artifact_key,
+                )
+                results = await self.update_weights_from_tensorcast_communicator(obj)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Tensorcast update failed in control plane")
+            return (
+                False,
+                f"Tensorcast update failed: {exc}",
+                int(HTTPStatus.INTERNAL_SERVER_ERROR),
+            )
+
+        success, message = _Communicator.merge_results(results)
+        if success:
+            logger.info(
+                "Tensorcast update succeeded: new_version=%s artifact_key=%s",
+                requested_version,
+                obj.artifact_key,
+            )
+            self._update_weight_version_if_provided(str(requested_version))
+            message += f" Weight version updated to {requested_version}."
+            return True, message, int(HTTPStatus.OK)
+
+        logger.error(
+            "Tensorcast update failed: requested_version=%s artifact_key=%s message=%s",
+            requested_version,
+            obj.artifact_key,
+            message,
+        )
+        return False, message, int(HTTPStatus.INTERNAL_SERVER_ERROR)
 
     async def _unload_lora_adapter_locked(
         self: TokenizerManager,

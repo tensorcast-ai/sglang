@@ -1,0 +1,17 @@
+{
+  "tensorcast_init_mode": "connect",
+  "tensorcast_daemon_address": "127.0.0.1:50052",
+  "tensorcast_show_daemon_logs": false,
+  "tensorcast_key_template": "model:{model_name}:v{weight_version}",
+  "tensorcast_model_name": "qwen3-14b",
+  "tensorcast_allow_disk_fallback": true,
+  "tensorcast_fallback_prefer": "auto",
+  "tensorcast_get_prefer": "auto",
+  "tensorcast_export_policy": "auto",
+  "tensorcast_disk_fallback_auto_put": true,
+  "tensorcast_put_policy": "durable",
+  "tensorcast_put_stage_on_gpu": false,
+  "tensorcast_trace_tp_slices": true,
+  "tensorcast_update_require_rollback_preflight": false,
+  "tensorcast_tp_slice_plan_cache_dir": "/tmp/sglang_tensorcast_trace_cache"
+}
