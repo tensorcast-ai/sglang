@@ -104,6 +104,12 @@ class TensorcastModelLoader(BaseModelLoader):
             ) from exc
 
         target_device = torch.device(device_config.device)
+        if (
+            target_device.type == "cuda"
+            and device_config.gpu_id is not None
+            and device_config.gpu_id >= 0
+        ):
+            target_device = torch.device("cuda", device_config.gpu_id)
 
         trace_plan: TracePlan | None = None
         cache_dir = get_trace_plan_cache_dir(self.extra_config)
@@ -430,6 +436,7 @@ def _apply_copy_plan(
                     src_base,
                     entry.ckpt_name,
                     entry.ckpt_view,
+                    entry.ckpt_range,
                     trace_plan.src_hull,
                 )
             else:
@@ -467,6 +474,7 @@ def _apply_copy_plan(
                         src_base,
                         entry.ckpt_name,
                         entry.ckpt_view,
+                        entry.ckpt_range,
                         trace_plan.src_hull,
                     )
                 else:
@@ -525,13 +533,81 @@ def _as_strided_src_view(
     src_base: torch.Tensor,
     ckpt_name: str,
     ckpt_view: ViewSpec,
+    ckpt_range: RangeSpec | None,
     src_hull: dict[str, Range],
 ) -> torch.Tensor:
+    def _required_storage_numel(
+        size: tuple[int, ...], stride: tuple[int, ...], storage_offset: int
+    ) -> int:
+        if len(size) != len(stride):
+            raise TensorcastApplyError(
+                f"Invalid ViewSpec for {ckpt_name}: size/stride rank mismatch "
+                f"{len(size)} vs {len(stride)}"
+            )
+        if not size:
+            return storage_offset + 1
+        max_index = storage_offset
+        for dim_size, dim_stride in zip(size, stride):
+            if dim_size <= 0:
+                return storage_offset + 1
+            max_index += (int(dim_size) - 1) * int(dim_stride)
+        return max_index + 1
+
+    def _numel(size: tuple[int, ...]) -> int:
+        total = 1
+        for dim_size in size:
+            total *= int(dim_size)
+        return total
+
     offset = int(ckpt_view.storage_offset)
     hull = src_hull.get(ckpt_name)
     if hull is not None:
         stride_dim = src_base.stride()[hull.dim]
         offset -= int(hull.start) * int(stride_dim)
+
+    available_numel = int(src_base.untyped_storage().nbytes() // src_base.element_size())
+    required_numel = _required_storage_numel(
+        ckpt_view.size, ckpt_view.stride, offset
+    )
+
+    # Tensorcast may have already materialized a sliced hull as a compact tensor.
+    # In that case, ViewSpec strides recorded from the original full checkpoint
+    # can exceed compact storage bounds. Prefer a hull-relative narrow fallback
+    # before failing hard.
+    if offset < 0 or required_numel > available_numel:
+        if ckpt_range is not None:
+            try:
+                narrowed = _narrow_src_view(src_base, ckpt_name, ckpt_range, src_hull)
+                if tuple(narrowed.shape) == tuple(ckpt_view.size):
+                    logger.debug(
+                        "Tensorcast as_strided fallback to narrow for %s: "
+                        "required_numel=%d available_numel=%d offset=%d",
+                        ckpt_name,
+                        required_numel,
+                        available_numel,
+                        offset,
+                    )
+                    return narrowed
+            except Exception:  # noqa: BLE001
+                pass
+
+        if src_base.numel() == _numel(ckpt_view.size):
+            logger.debug(
+                "Tensorcast as_strided fallback to reshape for %s: "
+                "required_numel=%d available_numel=%d offset=%d",
+                ckpt_name,
+                required_numel,
+                available_numel,
+                offset,
+            )
+            return src_base.reshape(ckpt_view.size)
+
+        raise TensorcastApplyError(
+            "Tensorcast source view is out of bounds after slice materialization: "
+            f"name={ckpt_name!r} size={ckpt_view.size} stride={ckpt_view.stride} "
+            f"storage_offset={offset} required_numel={required_numel} "
+            f"available_numel={available_numel}"
+        )
 
     return src_base.as_strided(
         size=ckpt_view.size,
