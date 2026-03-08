@@ -138,23 +138,85 @@ This is the executable TODO list for implementing `load_format=tensorcast` + pul
 - [x] Confirm request routing and locking behavior for both PP and TP ranks.
 - [ ] Verify admin and non-admin response behavior in all new branches: **skip** (no runnable SGLang test environment available in this repo context).
 
-## Phase 7 - Validation and Documentation Closeout
+## Phase 7 - Benchmark Load Weight
 
-- [ ] Dry run checklist: **skip** (no runnable SGLang test environment available in this repo context).
-  - [ ] Bootstrap with qwen3 and tensorcast key.
-  - [ ] Trigger new weight version from publisher simulation.
-  - [ ] Confirm `model_info.weight_version` increments on success.
-- [ ] Runtime safety checklist: **skip** (no runnable SGLang test environment available in this repo context).
-  - [ ] Validate cache flush and graph recapture settings.
-  - [ ] Validate rollback is rejected and older versions retained.
-- [ ] Failure-case checklist: **skip** (no runnable SGLang test environment available in this repo context).
-  - [ ] Artifact key missing.
-  - [ ] Version rollback.
-  - [ ] Trace unsupported-op fallback.
-  - [ ] Daemon unreachable.
-- [x] Update docs:
-  - [x] Keep protocol + loader docs in sync with any API or validation changes.
-  - [x] Add explicit "known limits / fallback mode" section.
+- [x] Create self-contained benchmark package under `sglang/benchmark/tensorcast/load_weight/`:
+  - [x] Add `README.md` with prerequisites, one-command usage, and examples.
+  - [x] Add runner/config scripts only inside this folder (no dependency on `../scripts/start_tensorcast.sh` or other out-of-tree helpers).
+  - [x] Add `outputs/` directory contract and file naming rules for logs/results.
+- [x] Define benchmark configuration surface (single entrypoint):
+  - [x] Required knobs: `model_path`, `model_name`, `tp_size`, `weight_version`, `trials`, `port`, `load_format`.
+  - [x] `load_format` supports `tensorcast` and `default`; results must include `load_format` column.
+  - [x] Keep runs serial with fixed single port (e.g. `30000`), no parallel trials.
+- [x] Implement Tensorcast lifecycle handling in benchmark scripts:
+  - [x] Start Global Store + Store Daemon for `load_format=tensorcast`.
+  - [x] Stop/cleanup and verify clean state after each benchmark run (`global status` unknown, `daemon status` no local session).
+  - [x] Enforce NVRTC/CUDA library env wiring before daemon/server launch to avoid runtime mismatch regressions.
+- [x] Implement artifact publish policy for Tensorcast mode:
+  - [x] Publish once per unique benchmark config.
+  - [x] Reuse the same published artifact across all trials of that config.
+  - [x] Do not unload artifact or clear caches between trials (hot-cache effect is intentional).
+- [x] Implement launch + timing collection:
+  - [x] Start timer at SGLang launch command execution.
+  - [x] `load_time`: from launch start to weight-load completion marker.
+  - [x] `ready_time`: from launch start to first successful `/health` 200 response.
+  - [x] Parse markers from server logs:
+    - [x] `default`: `Load weight end.` (use last TP completion as config-level load completion).
+    - [x] `tensorcast`: `store.tensor_dict.materialized` (use last TP completion as config-level load completion).
+- [x] Implement trial loop and failure policy:
+  - [x] On trial failure, record error details and continue subsequent trials.
+  - [x] Always attempt process cleanup on both success and failure paths.
+  - [x] Preserve per-trial raw stdout/stderr logs under `outputs/` for postmortem.
+- [x] Implement append-only CSV reporting:
+  - [x] Append all trial records to `sglang/benchmark/tensorcast/load_weight/outputs/benchmark_results.csv`.
+  - [x] Include at least: timestamp, model_path, model_name, tp_size, weight_version, load_format, trial_id, load_time_s, ready_time_s, status, error_message.
+  - [x] Keep schema stable across reruns; never overwrite historical rows.
+- [x] Add baseline-vs-tensorcast comparability guidance in README:
+  - [x] Document identical knobs for fair comparison (same model/tp/mem settings, only `load_format` differs).
+  - [x] Document that `default` baseline uses normal SGLang loader path and no Tensorcast runtime.
+
+## Phase 8 - Benchmark Update Weight
+
+- [x] Create self-contained benchmark package under `sglang/benchmark/tensorcast/update_weight/`:
+  - [x] Add `README.md` with prerequisites, one-command usage, and examples.
+  - [x] Add runner/config scripts only inside this folder (no dependency on out-of-tree helper scripts).
+  - [x] Add `outputs/` directory contract and file naming rules for logs/results.
+- [x] Define benchmark configuration surface (single entrypoint):
+  - [x] Required knobs: `model_path`, `model_name`, `tp_size`, `weight_version_start`, `trials`, `port`, `load_format`.
+  - [x] `load_format` supports `tensorcast` and `default`; results must include `load_format` column.
+  - [x] Keep runs serial with fixed single port (e.g. `30000`), no parallel trials.
+- [x] Implement Tensorcast lifecycle handling for update benchmark (same baseline as Phase 7):
+  - [x] Start Global Store + Store Daemon for `load_format=tensorcast`.
+  - [x] Stop/cleanup and verify clean state after benchmark run (`global status` unknown, `daemon status` no local session).
+  - [x] Enforce NVRTC/CUDA library env wiring before daemon/server launch.
+- [x] Implement Tensorcast publish policy for update trials:
+  - [x] For `trials=N`, publish `N+1` versions ahead of time: `v0..vN`.
+  - [x] Use `WeightPublisher.publish(...)` (tensor dict path), not `publish_from_disk(...)`.
+  - [x] Publish time is setup-only and must not be counted in benchmark metrics.
+- [x] Implement server bootstrap before update trials:
+  - [x] Launch SGLang once per benchmark run.
+  - [x] Tensorcast mode: launch with `--load-format tensorcast` and initial `--weight-version 0`.
+  - [x] Default baseline mode: launch with normal loader path and initial `--weight-version 0`.
+- [x] Implement per-trial update request execution:
+  - [x] Trial index `k` updates to version `k` (starting from `k=1`).
+  - [x] Tensorcast endpoint:
+    - [x] `POST /update_weights_from_tensorcast` with `weight_version=k`, `artifact_key=model:{model_name}:v{k}`, `flush_cache=true`, `abort_all_requests=true`, `recapture_cuda_graph=true`.
+  - [x] Default baseline endpoint:
+    - [x] `POST /update_weights_from_disk` with same operational flags and `model_path` fixed; use `weight_version=str(k)`.
+- [x] Implement update timing collection:
+  - [x] `load_time`: from TP log marker `Update engine weights online from ... begin` to `Update weights end.` (use last TP completion as trial completion).
+  - [x] `ready_time`: from update HTTP request send time to HTTP 200 response receive time.
+- [x] Implement failure policy for update benchmark:
+  - [x] Any trial failure immediately aborts the remaining trials.
+  - [x] CSV only appends successful trial records.
+  - [x] Preserve per-trial raw stdout/stderr logs under `outputs/` for postmortem.
+- [x] Implement append-only CSV reporting:
+  - [x] Append successful trial rows to `sglang/benchmark/tensorcast/update_weight/outputs/benchmark_results.csv`.
+  - [x] Include at least: timestamp, model_path, model_name, tp_size, target_weight_version, load_format, trial_id, load_time_s, ready_time_s, status, endpoint, log_path.
+  - [x] Keep schema stable across reruns; never overwrite historical rows.
+- [x] Add baseline-vs-tensorcast comparability guidance in README:
+  - [x] Keep launch knobs identical except update endpoint/load path differences.
+  - [x] Document that baseline uses `/update_weights_from_disk` and Tensorcast uses `/update_weights_from_tensorcast`.
 
 ## Code Map
 
