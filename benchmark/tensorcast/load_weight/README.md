@@ -66,7 +66,8 @@ uv run python run_benchmark.py \
   --trials 5 \
   --port 30000 \
   --mem-fraction-static 0.7 \
-  --log-level debug
+  --log-level debug \
+  --tensorcast-nvidia-lib-dirs /usr/local/cuda-12.9/compat:/usr/local/nvidia/lib64
 ```
 
 Notes:
@@ -75,6 +76,8 @@ Notes:
 - Script publishes weight artifact once per run/config, then reuses it for all trials.
 - Script does not clear caches between trials (hot-cache effect is intentional).
 - Script enforces CUDA/NVRTC runtime library env before Tensorcast startup.
+- If `--tensorcast-nvidia-lib-dirs` is provided, keep
+  `/usr/local/cuda-12.9/compat` before `/usr/local/nvidia/lib64`.
 - Default tensorcast configs are loaded from `./configs/`.
 
 ### 2) Default baseline benchmark

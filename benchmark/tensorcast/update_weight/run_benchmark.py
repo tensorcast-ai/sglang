@@ -24,6 +24,9 @@ from urllib import request as urllib_request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 TP_RANK_PATTERN = re.compile(r"\bTP(\d+)\b")
+LOG_TIMESTAMP_PATTERN = re.compile(
+    r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)"
+)
 
 
 class BenchmarkConfig(BaseModel):
@@ -67,7 +70,7 @@ class BenchmarkConfig(BaseModel):
     tensorcast_stop_timeout_s: float = Field(default=60.0, gt=0.0)
     tensorcast_status_poll_interval_s: float = Field(default=2.0, gt=0.0)
     tensorcast_cuda_home: str = "/usr/local/cuda-12.4"
-    tensorcast_nvidia_lib_dir: str = "/usr/local/nvidia/lib64"
+    tensorcast_nvidia_lib_dirs: str = "/usr/local/cuda-12.9/compat:/usr/local/nvidia/lib64"
     tensorcast_append_nvidia_lib_dir: bool = True
 
     @model_validator(mode="after")
@@ -173,6 +176,18 @@ def _log(message: str) -> None:
     print(f"[{now}] {message}", flush=True)
 
 
+def _parse_log_timestamp(line: str) -> datetime | None:
+    match = LOG_TIMESTAMP_PATTERN.match(line)
+    if match is None:
+        return None
+    raw = match.group(1)
+    with contextlib.suppress(ValueError):
+        return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S.%f")
+    with contextlib.suppress(ValueError):
+        return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+    return None
+
+
 def _discover_uv_project_root(benchmark_root: Path) -> Path:
     search_roots = [Path.cwd().resolve(), benchmark_root]
     for root in search_roots:
@@ -268,11 +283,18 @@ def _apply_cuda_runtime_env(config: BenchmarkConfig) -> None:
     os.environ["PATH"] = f"{cuda_home / 'bin'}:{os.environ.get('PATH', '')}"
 
     lib_dirs = [str(nvrtc_lib_dir)]
-    if (
-        config.tensorcast_append_nvidia_lib_dir
-        and Path(config.tensorcast_nvidia_lib_dir).is_dir()
-    ):
-        lib_dirs.append(config.tensorcast_nvidia_lib_dir)
+    if config.tensorcast_append_nvidia_lib_dir:
+        for raw_dir in config.tensorcast_nvidia_lib_dirs.split(":"):
+            lib_dir = raw_dir.strip()
+            if not lib_dir:
+                continue
+            if Path(lib_dir).is_dir():
+                lib_dirs.append(lib_dir)
+            else:
+                _log(
+                    "Skipping non-existent tensorcast nvidia lib dir: "
+                    f"{lib_dir}"
+                )
     os.environ["LD_LIBRARY_PATH"] = ":".join(lib_dirs)
 
     _log(f"CUDA runtime configured: CUDA_HOME={os.environ['CUDA_HOME']}")
@@ -669,30 +691,56 @@ def _compute_load_time_from_events(
     begin_marker = _update_begin_marker(load_format)
     end_marker = "Update weights end."
 
-    begin_ts: float | None = None
-    end_ts: float | None = None
+    begin_mono: float | None = None
+    end_mono: float | None = None
+    begin_wall: datetime | None = None
+    end_wall: datetime | None = None
     end_ranks: set[int] = set()
+    end_rank_walls: dict[int, datetime] = {}
     end_without_rank = 0
+    last_no_rank_end_wall: datetime | None = None
 
     for ts, line in events:
-        if begin_ts is None and begin_marker in line:
-            begin_ts = ts
+        line_wall = _parse_log_timestamp(line)
+
+        if begin_mono is None and begin_marker in line:
+            begin_mono = ts
+            if line_wall is not None:
+                begin_wall = line_wall
         if end_marker not in line:
             continue
         rank_match = TP_RANK_PATTERN.search(line)
         if rank_match:
-            end_ranks.add(int(rank_match.group(1)))
+            rank = int(rank_match.group(1))
+            end_ranks.add(rank)
+            if line_wall is not None:
+                prev_wall = end_rank_walls.get(rank)
+                if prev_wall is None or line_wall > prev_wall:
+                    end_rank_walls[rank] = line_wall
         else:
             end_without_rank += 1
+            if line_wall is not None:
+                last_no_rank_end_wall = line_wall
         if len(end_ranks) >= tp_size or end_without_rank >= tp_size:
-            end_ts = ts
+            end_mono = ts
+            if len(end_ranks) >= tp_size and end_rank_walls:
+                end_wall = max(end_rank_walls.values())
+            elif last_no_rank_end_wall is not None:
+                end_wall = last_no_rank_end_wall
+            elif line_wall is not None:
+                end_wall = line_wall
             break
 
-    if begin_ts is None:
+    if begin_mono is None:
         raise RuntimeError(f"Missing begin marker: {begin_marker!r}")
-    if end_ts is None:
+    if end_mono is None:
         raise RuntimeError(f"Missing complete end marker set: {end_marker!r}, tp_size={tp_size}")
-    return end_ts - begin_ts
+
+    if begin_wall is not None and end_wall is not None:
+        wall_delta_s = (end_wall - begin_wall).total_seconds()
+        if wall_delta_s >= 0:
+            return wall_delta_s
+    return end_mono - begin_mono
 
 
 def _wait_for_trial_markers(
@@ -857,7 +905,16 @@ def _build_parser(default_global_cfg: Path, default_daemon_cfg: Path) -> argpars
     parser.add_argument("--tensorcast-stop-timeout-s", type=float, default=60.0)
     parser.add_argument("--tensorcast-status-poll-interval-s", type=float, default=2.0)
     parser.add_argument("--tensorcast-cuda-home", default="/usr/local/cuda-12.4")
-    parser.add_argument("--tensorcast-nvidia-lib-dir", default="/usr/local/nvidia/lib64")
+    parser.add_argument(
+        "--tensorcast-nvidia-lib-dirs",
+        default="/usr/local/cuda-12.9/compat:/usr/local/nvidia/lib64",
+        help="Additional library dirs appended to LD_LIBRARY_PATH (':' separated).",
+    )
+    parser.add_argument(
+        "--tensorcast-nvidia-lib-dir",
+        dest="tensorcast_nvidia_lib_dirs",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--tensorcast-no-append-nvidia-lib-dir", action="store_true")
     return parser
 
@@ -924,7 +981,7 @@ def main() -> int:
         tensorcast_stop_timeout_s=args.tensorcast_stop_timeout_s,
         tensorcast_status_poll_interval_s=args.tensorcast_status_poll_interval_s,
         tensorcast_cuda_home=args.tensorcast_cuda_home,
-        tensorcast_nvidia_lib_dir=args.tensorcast_nvidia_lib_dir,
+        tensorcast_nvidia_lib_dirs=args.tensorcast_nvidia_lib_dirs,
         tensorcast_append_nvidia_lib_dir=not args.tensorcast_no_append_nvidia_lib_dir,
     )
 

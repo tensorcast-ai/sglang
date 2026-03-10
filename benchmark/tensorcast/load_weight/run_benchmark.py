@@ -23,6 +23,9 @@ from urllib import request as urllib_request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 TP_RANK_PATTERN = re.compile(r"\bTP(\d+)\b")
+LOG_TIMESTAMP_PATTERN = re.compile(
+    r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)"
+)
 
 
 class BenchmarkConfig(BaseModel):
@@ -61,7 +64,7 @@ class BenchmarkConfig(BaseModel):
     tensorcast_stop_timeout_s: float = Field(default=60.0, gt=0.0)
     tensorcast_status_poll_interval_s: float = Field(default=2.0, gt=0.0)
     tensorcast_cuda_home: str = "/usr/local/cuda-12.4"
-    tensorcast_nvidia_lib_dir: str = "/usr/local/nvidia/lib64"
+    tensorcast_nvidia_lib_dirs: str = "/usr/local/cuda-12.9/compat:/usr/local/nvidia/lib64"
     tensorcast_append_nvidia_lib_dir: bool = True
 
     @model_validator(mode="after")
@@ -110,6 +113,18 @@ class TrialResult:
 def _log(message: str) -> None:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{now}] {message}", flush=True)
+
+
+def _parse_log_timestamp(line: str) -> datetime | None:
+    match = LOG_TIMESTAMP_PATTERN.match(line)
+    if match is None:
+        return None
+    raw = match.group(1)
+    with contextlib.suppress(ValueError):
+        return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S.%f")
+    with contextlib.suppress(ValueError):
+        return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+    return None
 
 
 def _discover_uv_project_root(benchmark_root: Path) -> Path:
@@ -208,11 +223,18 @@ def _apply_cuda_runtime_env(config: BenchmarkConfig) -> None:
     os.environ["PATH"] = f"{cuda_home / 'bin'}:{os.environ.get('PATH', '')}"
 
     lib_dirs = [str(nvrtc_lib_dir)]
-    if (
-        config.tensorcast_append_nvidia_lib_dir
-        and Path(config.tensorcast_nvidia_lib_dir).is_dir()
-    ):
-        lib_dirs.append(config.tensorcast_nvidia_lib_dir)
+    if config.tensorcast_append_nvidia_lib_dir:
+        for raw_dir in config.tensorcast_nvidia_lib_dirs.split(":"):
+            lib_dir = raw_dir.strip()
+            if not lib_dir:
+                continue
+            if Path(lib_dir).is_dir():
+                lib_dirs.append(lib_dir)
+            else:
+                _log(
+                    "Skipping non-existent tensorcast nvidia lib dir: "
+                    f"{lib_dir}"
+                )
     os.environ["LD_LIBRARY_PATH"] = ":".join(lib_dirs)
 
     _log(f"CUDA runtime configured: CUDA_HOME={os.environ['CUDA_HOME']}")
@@ -519,9 +541,13 @@ def _monitor_server_until_ready(
     start_mono = time.monotonic()
     load_begin_mono: float | None = None
     load_done_mono: float | None = None
+    load_begin_wall: datetime | None = None
+    load_done_wall: datetime | None = None
     ready_mono: float | None = None
     marker_ranks: set[int] = set()
+    marker_rank_times: dict[int, datetime] = {}
     marker_count_without_rank = 0
+    last_no_rank_marker_time: datetime | None = None
     status = "failed"
     error_message = ""
 
@@ -557,19 +583,35 @@ def _monitor_server_until_ready(
                     if not line:
                         continue
                     log_file.write(line)
+                    line_ts = _parse_log_timestamp(line)
                     if load_begin_mono is None and load_begin_marker in line:
                         load_begin_mono = time.monotonic()
+                        if line_ts is not None:
+                            load_begin_wall = line_ts
                     if load_marker in line and load_done_mono is None:
                         rank_match = TP_RANK_PATTERN.search(line)
                         if rank_match:
-                            marker_ranks.add(int(rank_match.group(1)))
+                            rank = int(rank_match.group(1))
+                            marker_ranks.add(rank)
+                            if line_ts is not None:
+                                previous_ts = marker_rank_times.get(rank)
+                                if previous_ts is None or line_ts > previous_ts:
+                                    marker_rank_times[rank] = line_ts
                         else:
                             marker_count_without_rank += 1
+                            if line_ts is not None:
+                                last_no_rank_marker_time = line_ts
                         if (
                             len(marker_ranks) >= config.tp_size
                             or marker_count_without_rank >= config.tp_size
                         ):
                             load_done_mono = time.monotonic()
+                            if len(marker_ranks) >= config.tp_size and marker_rank_times:
+                                load_done_wall = max(marker_rank_times.values())
+                            elif last_no_rank_marker_time is not None:
+                                load_done_wall = last_no_rank_marker_time
+                            elif line_ts is not None:
+                                load_done_wall = line_ts
                     log_file.flush()
 
                 if ready_mono is None and _is_server_healthy(config.port, config.health_path):
@@ -604,7 +646,15 @@ def _monitor_server_until_ready(
             _terminate_process_group(proc)
 
     load_time_s = None
-    if load_done_mono is not None and load_begin_mono is not None:
+    if load_begin_wall is not None and load_done_wall is not None:
+        wall_delta = (load_done_wall - load_begin_wall).total_seconds()
+        if wall_delta >= 0:
+            load_time_s = wall_delta
+    if (
+        load_time_s is None
+        and load_done_mono is not None
+        and load_begin_mono is not None
+    ):
         load_time_s = load_done_mono - load_begin_mono
     ready_time_s = None
     if ready_mono is not None:
@@ -722,7 +772,16 @@ def _build_parser(default_global_cfg: Path, default_daemon_cfg: Path) -> argpars
     parser.add_argument("--tensorcast-stop-timeout-s", type=float, default=60.0)
     parser.add_argument("--tensorcast-status-poll-interval-s", type=float, default=2.0)
     parser.add_argument("--tensorcast-cuda-home", default="/usr/local/cuda-12.4")
-    parser.add_argument("--tensorcast-nvidia-lib-dir", default="/usr/local/nvidia/lib64")
+    parser.add_argument(
+        "--tensorcast-nvidia-lib-dirs",
+        default="/usr/local/cuda-12.9/compat:/usr/local/nvidia/lib64",
+        help="Additional library dirs appended to LD_LIBRARY_PATH (':' separated).",
+    )
+    parser.add_argument(
+        "--tensorcast-nvidia-lib-dir",
+        dest="tensorcast_nvidia_lib_dirs",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--tensorcast-no-append-nvidia-lib-dir", action="store_true")
     return parser
 
@@ -781,7 +840,7 @@ def main() -> int:
         tensorcast_stop_timeout_s=args.tensorcast_stop_timeout_s,
         tensorcast_status_poll_interval_s=args.tensorcast_status_poll_interval_s,
         tensorcast_cuda_home=args.tensorcast_cuda_home,
-        tensorcast_nvidia_lib_dir=args.tensorcast_nvidia_lib_dir,
+        tensorcast_nvidia_lib_dirs=args.tensorcast_nvidia_lib_dirs,
         tensorcast_append_nvidia_lib_dir=not args.tensorcast_no_append_nvidia_lib_dir,
     )
 

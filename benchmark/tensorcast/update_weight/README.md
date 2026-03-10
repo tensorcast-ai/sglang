@@ -71,7 +71,8 @@ uv run python run_benchmark.py \
   --trials 3 \
   --port 30000 \
   --mem-fraction-static 0.7 \
-  --log-level debug
+  --log-level debug \
+  --tensorcast-nvidia-lib-dirs /usr/local/cuda-12.9/compat:/usr/local/nvidia/lib64
 ```
 
 Tensorcast mode behavior:
@@ -80,6 +81,8 @@ Tensorcast mode behavior:
 - Pre-publishes versions `v0..vN` (`N=trials`) with `WeightPublisher.publish(...)`.
 - Launches server with `--weight-version 0`.
 - Runs trial updates to `v1..vN` through `/update_weights_from_tensorcast`.
+- If `--tensorcast-nvidia-lib-dirs` is provided, keep
+  `/usr/local/cuda-12.9/compat` before `/usr/local/nvidia/lib64`.
 - Default tensorcast configs are loaded from `./configs/`.
 
 ### 2) Baseline update benchmark
