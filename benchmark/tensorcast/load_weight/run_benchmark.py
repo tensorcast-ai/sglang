@@ -58,6 +58,7 @@ class BenchmarkConfig(BaseModel):
     tensorcast_fallback_prefer: str = "auto"
     tensorcast_get_prefer: str = "auto"
     tensorcast_export_policy: str = "auto"
+    tensorcast_disk_fallback_auto_put: bool = False
     tensorcast_trace_tp_slices: bool = False
     tensorcast_tp_slice_plan_cache_dir: str = "/tmp/sglang_tensorcast_trace_cache"
     tensorcast_start_timeout_s: float = Field(default=60.0, gt=0.0)
@@ -458,6 +459,7 @@ def _build_model_loader_extra_config(config: BenchmarkConfig) -> str:
         "tensorcast_fallback_prefer": config.tensorcast_fallback_prefer,
         "tensorcast_get_prefer": config.tensorcast_get_prefer,
         "tensorcast_export_policy": config.tensorcast_export_policy,
+        "tensorcast_disk_fallback_auto_put": config.tensorcast_disk_fallback_auto_put,
         "tensorcast_trace_tp_slices": config.tensorcast_trace_tp_slices,
         "tensorcast_tp_slice_plan_cache_dir": config.tensorcast_tp_slice_plan_cache_dir,
     }
@@ -766,6 +768,7 @@ def _build_parser(default_global_cfg: Path, default_daemon_cfg: Path) -> argpars
     parser.add_argument("--tensorcast-fallback-prefer", default="auto")
     parser.add_argument("--tensorcast-get-prefer", default="auto")
     parser.add_argument("--tensorcast-export-policy", default="auto")
+    parser.add_argument("--tensorcast-disk-fallback-auto-put", default=False)
     parser.add_argument("--tensorcast-trace-tp-slices", action="store_true")
     parser.add_argument("--tensorcast-tp-slice-plan-cache-dir", default="/tmp/sglang_tensorcast_trace_cache")
     parser.add_argument("--tensorcast-start-timeout-s", type=float, default=60.0)
@@ -834,6 +837,7 @@ def main() -> int:
         tensorcast_fallback_prefer=args.tensorcast_fallback_prefer,
         tensorcast_get_prefer=args.tensorcast_get_prefer,
         tensorcast_export_policy=args.tensorcast_export_policy,
+        tensorcast_disk_fallback_auto_put=args.tensorcast_disk_fallback_auto_put,
         tensorcast_trace_tp_slices=args.tensorcast_trace_tp_slices,
         tensorcast_tp_slice_plan_cache_dir=args.tensorcast_tp_slice_plan_cache_dir,
         tensorcast_start_timeout_s=args.tensorcast_start_timeout_s,

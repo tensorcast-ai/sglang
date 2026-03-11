@@ -681,6 +681,10 @@ def _update_begin_marker(load_format: str) -> str:
         return "Update engine weights online from tensorcast begin."
     return "Update engine weights online from disk begin."
 
+def _update_end_marker(load_format: str) -> str:
+    if load_format == "tensorcast":
+        return "store.tensor_dict.materialized"
+    return "Capture cuda graph begin."
 
 def _compute_load_time_from_events(
     *,
@@ -689,7 +693,7 @@ def _compute_load_time_from_events(
     tp_size: int,
 ) -> float:
     begin_marker = _update_begin_marker(load_format)
-    end_marker = "Update weights end."
+    end_marker = _update_end_marker(load_format)
 
     begin_mono: float | None = None
     end_mono: float | None = None
