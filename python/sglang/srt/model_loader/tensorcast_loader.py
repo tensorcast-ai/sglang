@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 from typing import Any
 
@@ -16,6 +17,7 @@ from sglang.srt.model_loader.loader import (
 )
 from sglang.srt.model_loader.tensorcast_runtime import (
     ensure_tensorcast_runtime_initialized,
+    is_materialize_oom_error,
     open_tensorcast_artifact_by_key,
     open_tensorcast_artifact_for_bootstrap,
     parse_tensorcast_extra_config,
@@ -90,6 +92,7 @@ class TensorcastModelLoader(BaseModelLoader):
             self.extra_config,
             weight_version=bootstrap_weight_version,
         )
+        allow_materialize_cpu_fallback = bool(cfg.tensorcast_load_allow_cpu_fallback)
         logger.info("Tensorcast bootstrap: opening artifact key=%s", artifact_key)
         try:
             artifact, used_disk_fallback = open_tensorcast_artifact_for_bootstrap(
@@ -162,6 +165,7 @@ class TensorcastModelLoader(BaseModelLoader):
                 model = _initialize_model(model_config, self.load_config)
                 _assert_no_meta_rotary_cache(model)
 
+            tensor_dict: dict[str, torch.Tensor] | None = None
             try:
                 tensor_dict = _materialize_tensor_dict(
                     artifact=artifact,
@@ -170,11 +174,38 @@ class TensorcastModelLoader(BaseModelLoader):
                     extra_config=self.extra_config,
                 )
             except Exception as exc:  # noqa: BLE001
-                raise TensorcastArtifactError(
-                    f"Failed to materialize tensor dict from tensorcast artifact: key={artifact_key!r}"
-                ) from exc
+                if (
+                    allow_materialize_cpu_fallback
+                    and target_device.type == "cuda"
+                    and is_materialize_oom_error(exc)
+                ):
+                    logger.warning(
+                        "Tensorcast GPU materialization OOM during bootstrap; retrying on CPU. key=%s",
+                        artifact_key,
+                    )
+                    try:
+                        tensor_dict = _materialize_tensor_dict(
+                            artifact=artifact,
+                            trace_plan=trace_plan,
+                            target_device=torch.device("cpu"),
+                            extra_config=self.extra_config,
+                        )
+                    except Exception as fallback_exc:  # noqa: BLE001
+                        raise TensorcastArtifactError(
+                            "Failed to materialize tensor dict from tensorcast artifact "
+                            f"after GPU OOM and CPU fallback retry: key={artifact_key!r}"
+                        ) from fallback_exc
+                    logger.warning(
+                        "Tensorcast CPU fallback materialization succeeded during bootstrap. key=%s",
+                        artifact_key,
+                    )
+                else:
+                    raise TensorcastArtifactError(
+                        f"Failed to materialize tensor dict from tensorcast artifact: key={artifact_key!r}"
+                    ) from exc
 
             try:
+                assert tensor_dict is not None
                 _apply_copy_plan(model, trace_plan, tensor_dict)
             except TensorcastLoaderError:
                 raise
@@ -182,6 +213,12 @@ class TensorcastModelLoader(BaseModelLoader):
                 raise TensorcastApplyError(
                     f"Failed to apply tensorcast copy plan: key={artifact_key!r}"
                 ) from exc
+            finally:
+                if tensor_dict is not None:
+                    del tensor_dict
+                gc.collect()
+                if target_device.type == "cuda":
+                    torch.cuda.empty_cache()
 
             _best_effort_publish_after_disk_fallback(
                 used_disk_fallback=used_disk_fallback,
@@ -262,6 +299,8 @@ def _get_numeric_weight_version_for_bootstrap(cfg: Any) -> int | None:
         ) from exc
 
 
+
+
 def _materialize_tensor_dict(
     *,
     artifact: Any,
@@ -281,6 +320,7 @@ def _materialize_tensor_dict(
     options = tc.GetArtifactOptions(
         prefer=cfg.tensorcast_get_prefer,
         export_policy=cfg.tensorcast_export_policy,
+        need_view_data_hash=cfg.tensorcast_need_view_data_hash,
     )
     return artifact_tp.tensor_dict(device=str(target_device), options=options)
 

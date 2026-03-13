@@ -1184,31 +1184,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         allow_materialize_cpu_fallback = bool(tc_cfg.tensorcast_update_allow_cpu_fallback)
 
-        def _iter_exc_chain(exc: BaseException) -> list[BaseException]:
-            chain: list[BaseException] = []
-            seen: set[int] = set()
-            cur: BaseException | None = exc
-            while cur is not None:
-                cur_id = id(cur)
-                if cur_id in seen:
-                    break
-                seen.add(cur_id)
-                chain.append(cur)
-                cur = cur.__cause__ or cur.__context__
-            return chain
-
-        def _is_materialize_oom_error(exc: BaseException) -> bool:
-            patterns = (
-                "out of memory",
-                "cudaerrormemoryallocation",
-                "failed uma gpu allocation",
-                "resource_exhausted",
-            )
-            for err in _iter_exc_chain(exc):
-                msg = str(err).lower()
-                if any(token in msg for token in patterns):
-                    return True
-            return False
+        from sglang.srt.model_loader.tensorcast_runtime import (
+            is_materialize_oom_error,
+        )
 
         class _TensorcastMaterializeError(TensorcastArtifactError):
             pass
@@ -1274,7 +1252,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if (
                     allow_materialize_cpu_fallback
                     and target_device.type == "cuda"
-                    and _is_materialize_oom_error(exc)
+                    and is_materialize_oom_error(exc)
                 ):
                     logger.warning(
                         "Tensorcast GPU materialization OOM; retrying on CPU. key=%s",

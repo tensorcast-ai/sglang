@@ -45,6 +45,7 @@ class TensorcastExtraConfig(BaseModel):
 
     tensorcast_get_prefer: Literal["auto", "local", "p2p", "disk"] = "auto"
     tensorcast_export_policy: Literal["never", "auto", "force"] = "auto"
+    tensorcast_need_view_data_hash: bool = False
 
     # Disk fallback publisher behavior (best-effort)
     tensorcast_disk_fallback_auto_put: bool = True
@@ -64,6 +65,12 @@ class TensorcastExtraConfig(BaseModel):
     # True (default): on GPU materialization OOM, retry materialization on CPU.
     # This improves reliability at the cost of slower updates.
     tensorcast_update_allow_cpu_fallback: bool = True
+
+    # Bootstrap load materialization fallback policy.
+    # True (default): on GPU materialization OOM during initial model load,
+    # retry materialization on CPU and then copy into the already-initialized
+    # model storages.
+    tensorcast_load_allow_cpu_fallback: bool = True
 
 
 def parse_tensorcast_extra_config(extra_config: dict[str, Any]) -> TensorcastExtraConfig:
@@ -246,7 +253,7 @@ def open_tensorcast_artifact_by_key(
     return artifact
 
 
-def _iter_exception_chain(exc: BaseException) -> list[BaseException]:
+def iter_exception_chain(exc: BaseException) -> list[BaseException]:
     chain: list[BaseException] = []
     seen: set[int] = set()
     cur: BaseException | None = exc
@@ -260,13 +267,27 @@ def _iter_exception_chain(exc: BaseException) -> list[BaseException]:
     return chain
 
 
+def is_materialize_oom_error(exc: BaseException) -> bool:
+    patterns = (
+        "out of memory",
+        "cudaerrormemoryallocation",
+        "failed uma gpu allocation",
+        "resource_exhausted",
+    )
+    for err in iter_exception_chain(exc):
+        msg = str(err).lower()
+        if any(token in msg for token in patterns):
+            return True
+    return False
+
+
 def _is_tensorcast_key_not_found(exc: BaseException) -> bool:
     try:
         import grpc  # type: ignore[import-not-found]
     except Exception:  # noqa: BLE001
         grpc = None  # type: ignore[assignment]
 
-    for err in _iter_exception_chain(exc):
+    for err in iter_exception_chain(exc):
         msg = str(err).lower()
         if "key not found" in msg and "statuscode.not_found" in msg:
             return True
