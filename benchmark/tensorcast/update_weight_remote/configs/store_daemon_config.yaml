@@ -128,13 +128,14 @@ pinned_memory:
       # 4 GPUs * streaming_buffer_chunks(16) = 64 slices required at startup.
       # 64 * 256MB = 16GB minimum engine pinned pool.
       pool_bytes: 16GB
+      numa_prefault: true
     - name: comm_gpu
       slice_bytes: 16MB
       pool_bytes: 8GB
       rdma_preregister: true
     - name: comm_cpu
-      slice_bytes: 4MB
-      pool_bytes: 1GB
+      slice_bytes: 16MB
+      pool_bytes: 4GB
       rdma_preregister: true
 
 # Post-seal policies for assembly -> mi2 alias resolution.
@@ -211,6 +212,9 @@ lifecycle:
   sessions_ttl: 60s
   # Transport lock TTL; long enough for worst-case transfers but short enough to recover from leaks.
   locks_ttl: 120s
+  derived_view_exports:
+    ttl: 15m
+    retry_retire_ttl: 30s
   # Local-only Unix domain socket for handle FD handoff and lease release.
   handle_leases:
     # Optional override. Leave empty to let the daemon auto-select

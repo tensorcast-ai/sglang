@@ -16,6 +16,7 @@ from sglang.srt.model_loader.loader import (
     device_loading_context,
 )
 from sglang.srt.model_loader.tensorcast_runtime import (
+    build_tensorcast_call_context,
     ensure_tensorcast_runtime_initialized,
     is_materialize_oom_error,
     open_tensorcast_artifact_by_key,
@@ -322,7 +323,8 @@ def _materialize_tensor_dict(
         export_policy=cfg.tensorcast_export_policy,
         need_view_data_hash=cfg.tensorcast_need_view_data_hash,
     )
-    return artifact_tp.tensor_dict(device=str(target_device), options=options)
+    ctx = build_tensorcast_call_context(extra_config)
+    return artifact_tp.tensor_dict(device=str(target_device), options=options, ctx=ctx)
 
 
 def _postprocess_after_loading(

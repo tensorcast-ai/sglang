@@ -64,11 +64,6 @@ engine:
   artifact_chunk_bytes: 256MB
   # Default depth for StreamingPinnedBuffer instances created by StoreEngine.
   streaming_buffer_chunks: 16
-  # Byte-range mapping policy for view materialization.
-  byte_mapping:
-    # Lower this so tp=4 narrow row-parallel slices such as o_proj (2560B/row on Qwen3-14B)
-    # can still be compiled as strided runs and hit daemon-side direct_gather.
-    strided_min_row_len_bytes: 2048
   # Enable external target verification for MaterializeIntoTarget (off by default).
   enable_external_target_verification: false
   # Enable memfd-backed UMA CPU allocations for zero-copy CPU tensor materialization.
@@ -128,13 +123,14 @@ pinned_memory:
       # 4 GPUs * streaming_buffer_chunks(16) = 64 slices required at startup.
       # 64 * 256MB = 16GB minimum engine pinned pool.
       pool_bytes: 16GB
+      numa_prefault: true
     - name: comm_gpu
       slice_bytes: 16MB
       pool_bytes: 8GB
       rdma_preregister: true
     - name: comm_cpu
-      slice_bytes: 4MB
-      pool_bytes: 1GB
+      slice_bytes: 16MB
+      pool_bytes: 4GB
       rdma_preregister: true
 
 # Post-seal policies for assembly -> mi2 alias resolution.
@@ -211,6 +207,9 @@ lifecycle:
   sessions_ttl: 60s
   # Transport lock TTL; long enough for worst-case transfers but short enough to recover from leaks.
   locks_ttl: 120s
+  derived_view_exports:
+    ttl: 15m
+    retry_retire_ttl: 30s
   # Local-only Unix domain socket for handle FD handoff and lease release.
   handle_leases:
     # Optional override. Leave empty to let the daemon auto-select
@@ -241,7 +240,7 @@ communicator:
     # Stage CPU tensors for RDMA; disable only if you rely on direct GPU RDMA paths.
     stage_cpu_for_rdma: true
     # Buffers per flow; more buffers increase overlap but require a larger pool.
-    buffers_per_flow: 4
+    buffers_per_flow: 16
     # Cap concurrent in-flight segments; 0 inherits buffers_per_flow.
     max_window_segments: 0
     # Cap concurrent GPU channels so pool sizing is predictable (8 for 8-GPU defaults; 0 = auto).
@@ -288,7 +287,7 @@ observability:
     # Minimum severity emitted; higher levels reduce noise at the cost of debugging detail.
     level: DEBUG
     # Optional plain-text logfile; empty logs only to stderr.
-    file: "/data/daemon.log"
+    file: ""
     # When true, include trace/span IDs in logs (if tracing is enabled).
     otel_context_enabled: false
     # Optional enriched sink file with trace/span IDs; leave empty to disable.

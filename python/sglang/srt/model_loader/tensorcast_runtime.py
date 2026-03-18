@@ -46,6 +46,7 @@ class TensorcastExtraConfig(BaseModel):
     tensorcast_get_prefer: Literal["auto", "local", "p2p", "disk"] = "auto"
     tensorcast_export_policy: Literal["never", "auto", "force"] = "auto"
     tensorcast_need_view_data_hash: bool = False
+    tensorcast_materialize_timeout_s: float | None = 180.0
 
     # Disk fallback publisher behavior (best-effort)
     tensorcast_disk_fallback_auto_put: bool = True
@@ -172,6 +173,17 @@ def build_tensorcast_fallback_options(extra_config: dict[str, Any]) -> "Fallback
         allow_disk=cfg.tensorcast_allow_disk_fallback,
         verify_checksums=cfg.tensorcast_verify_checksums,
     )
+
+
+def build_tensorcast_call_context(extra_config: dict[str, Any]) -> Any | None:
+    import tensorcast as tc
+
+    cfg = parse_tensorcast_extra_config(extra_config)
+    timeout_s = cfg.tensorcast_materialize_timeout_s
+    if timeout_s is None:
+        return None
+    deadline_ms = max(1, int(float(timeout_s) * 1000.0))
+    return tc.context(deadline_ms=deadline_ms)
 
 
 def resolve_tensorcast_artifact_key(
