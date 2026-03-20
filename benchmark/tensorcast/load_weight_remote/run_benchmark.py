@@ -484,6 +484,19 @@ def build_service_remote_cmd(paths: BenchmarkPaths, subcommand: str, *args: str)
     )
 
 
+def reset_runtime_state(
+    config: BenchmarkConfig,
+    paths: BenchmarkPaths,
+    worker: WorkerInfo,
+) -> None:
+    exec_user(
+        config,
+        worker.process_name,
+        build_service_remote_cmd(paths, "reset-runtime-state"),
+        check=True,
+    )
+
+
 def start_global_store(
     config: BenchmarkConfig,
     paths: BenchmarkPaths,
@@ -491,6 +504,7 @@ def start_global_store(
     config_path: Path,
 ) -> None:
     stop_global_store(config, paths, worker)
+    reset_runtime_state(config, paths, worker)
     exec_user(
         config,
         worker.process_name,
@@ -545,21 +559,18 @@ def start_daemon(
         ),
         check=True,
     )
-    wait_for_condition(
-        timeout_s=config.tensorcast_service_ready_timeout_s,
-        poll_interval_s=config.tensorcast_service_poll_interval_s,
-        description="daemon running",
-        check_fn=lambda: (
-            daemon_is_running(
-                status := exec_user(
-                    config,
-                    worker.process_name,
-                    build_service_remote_cmd(paths, "status-daemon"),
-                    check=False,
-                ).stdout
-            ),
-            status,
+    exec_user(
+        config,
+        worker.process_name,
+        build_service_remote_cmd(
+            paths,
+            "wait-daemon-ready",
+            build_local_daemon_address(config),
+            str(config.tensorcast_service_ready_timeout_s),
+            str(config.tensorcast_service_poll_interval_s),
         ),
+        timeout_s=config.tensorcast_service_ready_timeout_s + 30.0,
+        check=True,
     )
 
 
@@ -698,6 +709,7 @@ def publish_artifact(
     publish_json = paths.logs_dir / "worker_a_publish.json"
     history_path = f"/data/{run_id}_weights_history.json"
     remote_cmd = (
+        "set -euo pipefail; "
         f"cd {shlex.quote(str(paths.uv_project_root))}; "
         "source .venv/bin/activate; "
         f"/home/i-zhouyuhan/tot/.venv/bin/python {shlex.quote(str(publish_script))} "
@@ -734,6 +746,7 @@ def run_remote_trial(
     trial_json = paths.logs_dir / f"trial{trial_id:03d}_result.json"
     trial_script = paths.scripts_dir / "run_sglang_load_trial.py"
     remote_cmd = (
+        "set -euo pipefail; "
         f"cd {shlex.quote(str(paths.uv_project_root))}; "
         "source .venv/bin/activate; "
         f"/home/i-zhouyuhan/tot/.venv/bin/python {shlex.quote(str(trial_script))} "
@@ -1134,6 +1147,7 @@ def main() -> None:
                     trial_id,
                 )
                 log(f"Starting daemon B on worker B for trial {trial_id}")
+                reset_runtime_state(config, paths, worker_b)
                 start_daemon(
                     config,
                     paths,

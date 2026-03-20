@@ -319,7 +319,6 @@ def _materialize_tensor_dict(
     artifact_tp = artifact.subset(materialize_names).view(slices=tensorcast_slices)
     cfg = parse_tensorcast_extra_config(extra_config)
     options = tc.GetArtifactOptions(
-        prefer=cfg.tensorcast_get_prefer,
         export_policy=cfg.tensorcast_export_policy,
         need_view_data_hash=cfg.tensorcast_need_view_data_hash,
     )

@@ -410,8 +410,13 @@ def build_service_remote_cmd(paths: BenchmarkPaths, subcommand: str, *args: str)
     )
 
 
+def reset_runtime_state(config: BenchmarkConfig, paths: BenchmarkPaths, worker: WorkerInfo) -> None:
+    exec_user(config, worker.process_name, build_service_remote_cmd(paths, "reset-runtime-state"))
+
+
 def start_global_store(config: BenchmarkConfig, paths: BenchmarkPaths, worker: WorkerInfo, config_path: Path) -> None:
     stop_global_store(config, paths, worker)
+    reset_runtime_state(config, paths, worker)
     exec_user(config, worker.process_name, build_service_remote_cmd(paths, "start-global", str(config_path)))
     wait_for_condition(
         timeout_s=config.tensorcast_service_ready_timeout_s,
@@ -435,14 +440,17 @@ def start_daemon(config: BenchmarkConfig, paths: BenchmarkPaths, worker: WorkerI
         worker.process_name,
         build_service_remote_cmd(paths, "start-daemon", str(config_path), global_store_address, config.tensorcast_cuda_home, config.tensorcast_nvidia_lib_dirs),
     )
-    wait_for_condition(
-        timeout_s=config.tensorcast_service_ready_timeout_s,
-        poll_interval_s=config.tensorcast_service_poll_interval_s,
-        description="daemon running",
-        check_fn=lambda: (
-            daemon_is_running(status := exec_user(config, worker.process_name, build_service_remote_cmd(paths, "status-daemon"), check=False).stdout),
-            status,
+    exec_user(
+        config,
+        worker.process_name,
+        build_service_remote_cmd(
+            paths,
+            "wait-daemon-ready",
+            build_local_daemon_address(config),
+            str(config.tensorcast_service_ready_timeout_s),
+            str(config.tensorcast_service_poll_interval_s),
         ),
+        timeout_s=config.tensorcast_service_ready_timeout_s + 30.0,
     )
 
 
@@ -520,6 +528,7 @@ def publish_artifact_versions(config: BenchmarkConfig, paths: BenchmarkPaths, wo
     publish_json = paths.logs_dir / "worker_a_publish_versions.json"
     history_path = f"/data/{run_id}_weights_history.json"
     remote_cmd = (
+        "set -euo pipefail; "
         f"cd {shlex.quote(str(paths.uv_project_root))}; "
         "source .venv/bin/activate; "
         f"/home/i-zhouyuhan/.local/bin/uv run --active --no-project --offline python {shlex.quote(str(publish_script))} "
@@ -544,6 +553,7 @@ def run_remote_benchmark(config: BenchmarkConfig, paths: BenchmarkPaths, worker_
     result_json = paths.logs_dir / "worker_b_result.json"
     trial_prefix = f"{run_id}_{config.load_format}_{config.topology_mode}_tp{config.tp_size}"
     remote_cmd = (
+        "set -euo pipefail; "
         f"cd {shlex.quote(str(paths.uv_project_root))}; "
         "source .venv/bin/activate; "
         f"/home/i-zhouyuhan/.local/bin/uv run --active --no-project --offline python {shlex.quote(str(remote_script))} "
@@ -899,6 +909,7 @@ def main() -> None:
             log(f"Published versions: {sorted(artifact_ids)}")
             if config.topology_mode == "relay":
                 log("Starting daemon B on worker B")
+                reset_runtime_state(config, paths, worker_b)
                 start_daemon(config, paths, worker_b, paths.generated_configs_dir / "daemon_b.yaml", global_store_address)
                 daemon_b_address = build_local_daemon_address(config)
             else:

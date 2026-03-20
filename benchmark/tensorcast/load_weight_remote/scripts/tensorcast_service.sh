@@ -49,6 +49,24 @@ case "$subcommand" in
   status-global)
     uv_cmd tensorcast-cli global status
     ;;
+  reset-runtime-state)
+    python - <<'PY'
+from __future__ import annotations
+
+from pathlib import Path
+
+from tensorcast.cli_utils.paths import current_global_session_path, runtime_state_path
+
+for raw_path in (runtime_state_path(), current_global_session_path()):
+    path = Path(raw_path)
+    try:
+        path.unlink()
+        print(f"removed {path}")
+    except FileNotFoundError:
+        pass
+print("runtime state reset")
+PY
+    ;;
   start-daemon)
     config_path="${1:?missing config path}"
     global_store_address="${2:?missing global store address}"
@@ -65,6 +83,25 @@ case "$subcommand" in
     ;;
   status-daemon)
     uv_cmd tensorcast-cli daemon status
+    ;;
+  wait-daemon-ready)
+    daemon_address="${1:?missing daemon address}"
+    timeout_s="${2:?missing timeout seconds}"
+    interval_s="${3:?missing interval seconds}"
+    python - "$daemon_address" "$timeout_s" "$interval_s" <<'PY'
+from __future__ import annotations
+
+import sys
+
+from tensorcast.cli_utils.health import wait_for_daemon
+
+address = sys.argv[1]
+timeout_s = float(sys.argv[2])
+interval_s = float(sys.argv[3])
+if not wait_for_daemon(address, timeout=timeout_s, interval=interval_s):
+    raise SystemExit(f"daemon did not reach rpc-ready state within {timeout_s}s: {address}")
+print(f"daemon rpc ready: {address}")
+PY
     ;;
   *)
     echo "unknown subcommand: $subcommand" >&2
