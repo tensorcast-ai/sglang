@@ -15,6 +15,13 @@ Status:
 - This is a design target for the upcoming KV integration work.
 - It is intentionally aligned with current Tensorcast programmability
   capabilities and current SGLang HiCache architecture.
+- Current Tensorcast core already exposes the legacy request-transfer surface
+  `publish(engine_request_id=...)`, `hydrate(engine_request_id=...)`,
+  `evict_local(...)`, and generic `ManifestResult`.
+- The target SGLang KV design additionally requires
+  `PublishResult.publish_manifest`, opaque `EngineOwnedManifest`, and
+  `hydrate(publish_manifest=...)`. Those surfaces are not implemented in
+  Tensorcast core today and must be added as part of the KV integration work.
 
 ---
 
@@ -134,10 +141,15 @@ The shared substrate owns:
 
 - page-level identity,
 - publication and retrieval of KV page artifacts,
-- bundle metadata for prefix bundles and request bundles,
+- prefix-bundle metadata,
+- generic artifact-manifest data for request-level transfer,
 - consistency between storage-backed prefix share and request-level transfer.
 
 The substrate MUST be the single source of truth for distributed KV objects.
+
+Engine-owned request-resume metadata is intentionally not modeled as a separate
+Tensorcast dataplane artifact. It is carried in the request-transfer control
+plane as `EngineOwnedManifest`.
 
 ### 3.3 Upper interface responsibilities
 
@@ -222,6 +234,79 @@ flowchart LR
     B["Request-level transfer"] --> B1["Caller runs publish / warmup / hydrate plans"]
     B1 --> B2["Coordinator fans out to required ranks"]
     B2 --> B3["Shared substrate reused for the same page artifacts"]
+```
+
+### 3.6 Coordinator-owned directory registration and liveness
+
+For request-level transfer, the rank-0 coordinator SHOULD own the Tensorcast
+directory-facing lifecycle of the logical SGLang instance.
+
+Why this ownership is recommended:
+
+- the coordinator is the public control-plane ingress for the logical instance,
+- the coordinator also owns the in-process instance-agent execution endpoint,
+- the coordinator and the logical SGLang serving instance are intended to share
+  one lifecycle boundary,
+- and if rank 0 dies, the logical instance should stop being routable for
+  Tensorcast instance-step execution.
+
+Recommended route-registration schema:
+
+```yaml
+tensorcast_directory:
+  instance_id: sgl-inst-17
+  daemon_id: daemon-a
+  engine: sglang
+  execution_host_kind: sglang_inproc_instance_agent.v1
+  execution_endpoint: 10.0.0.5:7310
+  capability_flags:
+    - instance_publish
+    - instance_hydrate
+    - instance_evict_local
+    - execution_signals
+
+sglang_side_metadata:
+  serving_http_endpoint: http://10.0.0.5:30000
+  tp_size: 8
+  pp_size: 1
+  coordinator_rank: 0
+  coordinator_epoch: 0195c9d4-6e7a-7b91-b3b5-8f91f9d90d62
+  lifecycle_state: ready
+```
+
+Recommended ownership rules:
+
+- only rank 0 registers and heartbeats the logical Tensorcast `instance_id`,
+- other TP ranks remain internal workers behind that one logical instance,
+- `execution_endpoint` points at the coordinator-hosted in-process
+  instance-agent ingress,
+- and `serving_http_endpoint` remains SGLang-owned discovery metadata rather
+  than a required Tensorcast directory field.
+
+Recommended lifecycle state machine:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Booting
+    Booting --> Registering: coordinator bound local services
+    Registering --> Ready: Tensorcast route registered and heartbeats active
+    Ready --> Draining: stop accepting new transfer work
+    Draining --> Stopped: heartbeat stops and route expires
+    Ready --> Stopped: coordinator crash / rank-0 failure
+    Stopped --> Registering: coordinator restart with new epoch
+```
+
+Recommended registration flow:
+
+```mermaid
+flowchart TD
+    A["Rank-0 coordinator starts"] --> B["Bind HTTP serving endpoint"]
+    B --> C["Bind in-process InstanceAgent endpoint"]
+    C --> D["Register instance route into Tensorcast directory"]
+    D --> E["Send periodic instance heartbeats"]
+    E --> F["Caller resolves instance_id -> execution_endpoint"]
+    E --> G["If rank-0 exits, heartbeats stop"]
+    G --> H["Directory marks instance inactive / unroutable"]
 ```
 
 ---
@@ -364,7 +449,7 @@ flowchart LR
     D["OpenByteArtifact<br/>(artifact_id, layout_id, payload)"]
     E["SealedByteArtifact<br/>(payload digest + invariants)"]
     F["Tensorcast shared pool<br/>byte artifact"]
-    G["Prefix / request bundle metadata"]
+    G["Prefix bundle metadata / PublishManifest"]
 
     A -->|"backup / offload"| B
     B -->|"freeze for publication attempt"| C
@@ -399,29 +484,147 @@ prefix-chain hints:
 
 This avoids inventing a second identity system for the same KV content.
 
-### 4.4 Bundle metadata
+### 4.4 Bundle metadata and transfer-handle metadata
 
-The substrate SHOULD support at least two kinds of bundle metadata:
+The integration SHOULD support two distinct metadata families:
 
 - **Prefix bundle metadata**
   - maps a prefix identity to an ordered set of page artifacts.
-- **Request bundle metadata**
-  - maps a request-level snapshot to an ordered set of page artifacts plus any
-    engine-specific resume metadata required for decode continuation.
+- **Request-transfer metadata**
+  - consists of:
+    - a generic Tensorcast artifact manifest over page artifacts, and
+    - an opaque engine-owned resume manifest needed for decode continuation.
 
-Request bundles and prefix bundles MAY share pages.
+Prefix-share bundles and request-level transfer snapshots MAY share the same
+page artifacts.
+
+The engine-owned request-resume payload MUST NOT be represented as a separate
+Tensorcast byte artifact in the dataplane.
+
+#### 4.4.1 Prefix bundle metadata record schema
+
+The integration SHOULD define one canonical prefix bundle metadata schema so
+prefix prewarm, inspection, and repair logic do not invent incompatible record
+shapes.
+
+Recommended minimal schema:
+
+```yaml
+schema: sglang.tensorcast.prefix_bundle.v1
+prefix_bundle_id: pfxb:v1:sha256(...)
+created_at_ms: 1774223000123
+expires_at_ms: 1774223600123
+state: ready
+
+identity:
+  model_fingerprint: llama3_70b_fp16
+  kv_layout_id: sglang.kv.mha.page16k.v1
+  tp_size: 8
+  pp_size: 1
+  attention_arch: mha
+  prefix_keys_digest: sha256(...)
+  terminal_prefix_hash: "..."
+  matched_tokens: 1024
+  logical_page_count: 64
+
+rank_shards:
+  - tp_rank: 0
+    pp_rank: 0
+    ordered_pages:
+      - logical_page_index: 0
+        artifact_id: cgid:byte_artifact~...
+        page_hash: "..."
+        layout_id: sglang.kv.page_shard.v1
+      - logical_page_index: 1
+        artifact_id: cgid:byte_artifact~...
+        page_hash: "..."
+        layout_id: sglang.kv.page_shard.v1
+  - tp_rank: 1
+    pp_rank: 0
+    ordered_pages: [...]
+
+constituent_digest:
+  alg: sha256
+  hex: "..."
+```
+
+Recommended validation rules:
+
+- `prefix_bundle_id` is deterministic for the same logical prefix identity and
+  layout/topology contract,
+- `ordered_pages` is strictly ordered by `logical_page_index` within each rank
+  shard,
+- all referenced `artifact_id` values point to the same page byte artifacts
+  used by the shared substrate,
+- and `state=ready` means the referenced page closure is readable and
+  layout/topology compatible for that bundle identity.
+
+#### 4.4.2 Prefix bundle invalidation rules
+
+A prefix bundle SHOULD be treated as stale if any of the following becomes
+true:
+
+- a referenced page artifact is missing or unreadable,
+- a referenced page's layout is incompatible with `identity.kv_layout_id`,
+- the observed TP/PP topology is incompatible with the bundle identity,
+- the referenced page set no longer matches `constituent_digest`,
+- or the bundle has passed `expires_at_ms`.
+
+#### 4.4.3 PublishManifest and EngineOwnedManifest schema
+
+For request-level transfer, the exported metadata shape SHOULD be:
+
+```yaml
+publish_manifest:
+  schema: tensorcast.publish_manifest.v1
+  artifact_manifest: <ManifestResult>
+  engine_owned_manifest:
+    engine: sglang
+    schema: sglang.engine_owned_manifest.v1
+    version: 1
+    encoding: json
+    created_at_ms: 1774223000123
+    expires_at_ms: 1774223060123
+    artifact_manifest_digest: "<artifact_manifest.key_set_digest_hex>"
+    payload_sha256: "..."
+    payload: "<opaque engine-owned resume payload>"
+```
+
+Recommended interpretation:
+
+- `artifact_manifest` is the generic Tensorcast-visible description of the page
+  artifact closure for the published snapshot.
+- `engine_owned_manifest` is the engine-owned resume payload. Tensorcast core
+  should transport it but not interpret its payload.
+- the entire `publish_manifest` object is the external transfer handle; there
+  is no second controller-facing string `transfer_handle`.
+- `payload` is control-plane data, not a Tensorcast dataplane object.
+
+Recommended rules:
+
+- `engine_owned_manifest.artifact_manifest_digest` MUST bind the opaque resume
+  payload to exactly one generic artifact manifest.
+- if the engine wants a string `publish_id` / `snapshot_id` for observability
+  or debugging, it SHOULD place that identifier inside the opaque
+  `engine_owned_manifest` payload or envelope rather than inventing a second
+  authoritative transfer handle.
+- `PublishResult.publish_manifest` and `hydrate(publish_manifest=...)` are
+  target integration surfaces and are not implemented in Tensorcast core today.
 
 ### 4.5 Manifest alignment
 
 Tensorcast `ManifestResult` and `ManifestArtifactSetBridge` should be treated as
-the public/exported representation of bundle metadata when leaving the engine
+the generic/exported artifact-manifest representation when leaving the engine
 boundary.
 
 That means:
 
-- the EngineAdapter should not invent an incompatible manifest format,
-- request-level `publish()` should return manifests that point back to the same
-  underlying page artifacts used by prefix share.
+- the EngineAdapter should not invent an incompatible second artifact-manifest
+  format,
+- request-level `publish()` should return an `artifact_manifest` that points
+  back to the same underlying page artifacts used by prefix share,
+- and `EngineOwnedManifest` should bind to that same artifact manifest rather
+  than duplicating the page-artifact truth independently.
 
 ### 4.6 TP>1 shard ownership and rank-qualified storage identity
 
@@ -688,12 +891,41 @@ SGLang instance-agent / EngineAdapter integration.
 This is the right place for:
 
 - `publish(engine_request_id=...)`
-- `hydrate(engine_request_id=...)`
+- preferred `hydrate(publish_manifest=...)`
+- compatibility `hydrate(engine_request_id=...)`
 - `evict_local(engine_request_id=...)`
 - optional `prefetch_manifest_result(...)`
 
 For the current Tensorcast caller surface, request-bundle retention intent is
 carried by the `ttl_ms` argument on `publish(...)`, not by `CallContext`.
+
+The explicit-handle rule is:
+
+- `engine_request_id` identifies source-side live request state,
+- successful publish returns `PublishManifest`,
+- worker warmup uses `PublishManifest.artifact_manifest`,
+- target hydrate SHOULD consume that same `PublishManifest`,
+- `evict_local(engine_request_id=...)` continues to operate on live local
+  request state rather than on immutable transfer handles.
+
+```mermaid
+flowchart LR
+    A["publish(engine_request_id, ttl_ms)"] --> B["PublishManifest"]
+    B --> C["artifact_manifest<br/>for prefetch_manifest_result(...)"]
+    B --> D["engine_owned_manifest<br/>opaque resume payload"]
+    B --> E["hydrate(publish_manifest=...)"]
+    F["evict_local(engine_request_id)"] --> G["local live-request cleanup"]
+```
+
+Compatibility note:
+
+- current Tensorcast core exposes only the legacy
+  `hydrate(engine_request_id=...)` surface,
+- the SGLang KV integration should add `PublishResult.publish_manifest` and
+  `hydrate(publish_manifest=...)`,
+- and any legacy `hydrate(engine_request_id=...)` convenience should be
+  implemented at the controller/helper layer rather than by making the target
+  instance resolve transfer snapshots by request id.
 
 ### 6.2 Logical instance mapping for TP>1
 
@@ -770,7 +1002,86 @@ flowchart TD
     F --> G["Return one group-level result to EngineAdapter"]
 ```
 
-### 6.5 Data reuse rule
+Recommended typed internal schema:
+
+```yaml
+KvTransferControlRequest:
+  schema: sglang.tensorcast.kv_transfer_control_request.v1
+  op_type: publish | hydrate | evict_local
+  op_id: uuid
+  logical_request_id: string
+  instance_id: string
+
+  tp_world:
+    tp_size: int
+    pp_size: int
+    required_ranks:
+      - tp_rank: int
+        pp_rank: int
+
+  snapshot:
+    cutoff_token_count: int
+    last_page_index: int
+    page_size: int
+    radix_last_hash: string | null
+    bundle_digest: string
+
+  publish_args:
+    publication_mode: substrate_finalize
+    allow_force_flush_missing_tail: true
+    ttl_ms: int | null
+
+  hydrate_args:
+    publish_manifest_digest: string
+    artifact_manifest_digest: string
+    engine_owned_manifest_sha256: string
+    install_mode: prepare_only
+
+  evict_args:
+    scope: prepared_bundle | live_request
+```
+
+```yaml
+KvTransferRankResult:
+  schema: sglang.tensorcast.kv_transfer_rank_result.v1
+  op_id: uuid
+  logical_request_id: string
+  tp_rank: int
+  pp_rank: int
+  status: success | failed | partial
+
+  publish_result:
+    snapshot_cutoff_token_count: int
+    longest_present_prefix_pages: int
+    forced_flush_pages: int
+    published_page_count: int
+    missing_page_count: int
+
+  hydrate_result:
+    hydrated_page_count: int
+    install_ready: bool
+    prepared_bundle_key: string | null
+
+  evict_result:
+    evicted_live_pages: int
+    evicted_prepared_pages: int
+
+  error:
+    code: string | null
+    message: string | null
+```
+
+Recommended coordinator semantics:
+
+- `publish` succeeds only when all required ranks have closed the same fixed
+  snapshot cutoff and the coordinator can commit one immutable
+  `PublishManifest`.
+- `hydrate` succeeds only when all required ranks report `install_ready=true`
+  for the same `PublishManifest` generation.
+- `evict_local` is group-scoped across the logical instance even when physical
+  cleanup work happens per rank.
+
+### 6.5 Transfer-handle and data reuse rule
 
 Request-level transfer MUST reuse the shared KV substrate, not create a second
 separate storage universe.
@@ -782,6 +1093,39 @@ That means:
 - target-side `hydrate()` should reconstruct engine-local runtime state from
   those same page artifacts,
 - optional worker warmup should prefetch those same artifacts.
+
+It MUST also preserve the handle split:
+
+- `engine_request_id` locates mutable live request state on the source or
+  during local cleanup,
+- `PublishManifest` identifies one immutable published snapshot for transfer.
+
+The controller SHOULD pass the entire `PublishManifest` by value to the target
+hydrate phase.
+
+The integration SHOULD NOT invent:
+
+- a second controller-visible string transfer handle,
+- or a standalone request-metadata byte artifact in Tensorcast dataplane.
+
+It SHOULD instead rely on one SGLang-owned request-bundle metadata record per
+live logical request. That metadata stays inside the SGLang integration and is
+used to:
+
+- identify the fixed publish cutoff,
+- enumerate the authoritative ordered page set for that cutoff,
+- bind one `PublishManifest` generation to one logical request generation,
+- and later prepare target-side decode admission.
+
+Retention implementation rule:
+
+- the `ttl_ms` carried on `publish(engine_request_id=..., ttl_ms=...)` SHOULD
+  be translated into the minimum retention lease for all required page
+  artifacts of that published snapshot,
+- if a page is already present with shorter remaining lifetime, publish should
+  retain / touch / re-publish as needed before declaring closure satisfied,
+- stronger durable/policy-backed retention is an optional later extension, not
+  the baseline v1 request-transfer assumption.
 
 ### 6.6 Mixed-state handling between passive page writes and active publish
 
@@ -805,14 +1149,18 @@ It MUST mean:
 
 Concretely, source-side `publish()` should:
 
-1. freeze the request snapshot boundary,
-2. enumerate the full required page set,
-3. for each page:
+1. resolve the live request plus its SGLang-owned request-bundle metadata,
+2. freeze one fixed snapshot boundary expressed at least as token/page cutoff,
+3. enumerate the full required page set for exactly that cutoff,
+4. for each page:
    - reuse it if already ready,
    - join or adopt compatible in-flight publication when possible,
    - publish it if missing,
+   - if it belongs to the chosen cutoff but has not yet reached the shared
+     substrate, force or wait for the missing tail flush without chasing newer
+     tokens beyond the chosen cutoff,
    - and upgrade retention when mere existence is not sufficient,
-4. commit the request-bundle manifest only after closure is satisfied.
+5. commit the `PublishManifest` only after closure is satisfied.
 
 This gives the two upper interfaces different semantic strength:
 
@@ -825,25 +1173,32 @@ This gives the two upper interfaces different semantic strength:
   - closure-establishing,
   - responsible for completeness and transfer retention.
 
+The request-bundle metadata used in step 1 is an SGLang integration concern:
+
+- it is not a Tensorcast-core registry,
+- it is not a standalone Tensorcast dataplane artifact,
+- and it is the source of truth for "what exactly belongs to this published
+  snapshot generation".
+
 ### 6.7 Request-level publish flow
 
 The recommended source-side publish flow is:
 
 ```mermaid
 flowchart TD
-    A["Tensorcast publish(engine_request_id, ttl_ms)"] --> B["Coordinator resolves logical request"]
-    B --> C["Freeze request snapshot boundary"]
-    C --> D["Enumerate required ranks and required page shards"]
+    A["Tensorcast publish(engine_request_id, ttl_ms)"] --> B["Coordinator resolves logical request<br/>and SGLang-owned request-bundle metadata"]
+    B --> C["Freeze one fixed snapshot cutoff<br/>(token/page frontier)"]
+    C --> D["Enumerate required ranks and required page shards<br/>for exactly that cutoff"]
     D --> E["For each required page shard: ready / inflight / missing?"]
     E --> F["Reuse ready pages"]
     E --> G["Adopt or wait on compatible inflight publication"]
-    E --> H["Publish missing host-page shards as byte artifacts"]
-    F --> I["All required page shards satisfy closure"]
+    E --> H["Force or wait for missing tail flush<br/>then publish missing host-page shards"]
+    F --> I["All required page shards for cutoff satisfy closure"]
     G --> I
     H --> I
-    I --> J["Assemble request-bundle metadata"]
-    J --> K["Commit group-level manifest"]
-    K --> L["Return PublishResult(manifest, put_outcomes)"]
+    I --> J["Assemble artifact_manifest + EngineOwnedManifest<br/>bound to cutoff digest"]
+    J --> K["Commit immutable PublishManifest"]
+    K --> L["Return PublishResult(publish_manifest, put_outcomes)"]
 ```
 
 Failure boundary:
@@ -858,16 +1213,102 @@ The recommended target-side hydrate flow is:
 
 ```mermaid
 flowchart TD
-    A["Tensorcast hydrate(engine_request_id)"] --> B["Coordinator resolves authoritative request bundle"]
-    B --> C["Compute per-rank hydrate work items"]
-    C --> D["Optional worker warmup already made some artifacts local_replica_ready"]
-    D --> E["Each required rank materializes missing page artifacts into host pages"]
-    E --> F["Each required rank reconstructs local decode-usable state"]
-    F --> G["Coordinator gathers per-rank success / failure"]
-    G -->|All required ranks succeeded| H["Return group-level HydrateResult"]
-    G -->|Any required rank failed| I["Best-effort group cleanup / mark tainted"]
-    I --> J["Return hydrate failure"]
+    A["Tensorcast hydrate(publish_manifest)"] --> B["Coordinator validates PublishManifest"]
+    B --> C["Bind engine_owned_manifest to artifact_manifest_digest"]
+    C --> D["Compute per-rank hydrate work items"]
+    D --> E["Optional worker warmup already made some artifacts local_replica_ready"]
+    E --> F["Each required rank materializes missing page artifacts into host pages"]
+    F --> G["Each required rank reconstructs local decode-usable state"]
+    G --> H["Coordinator gathers per-rank success / failure"]
+    H -->|All required ranks succeeded| I["Install prepared local request bundle<br/>keyed by logical_request_id"]
+    H -->|Any required rank failed| J["Best-effort group cleanup / mark tainted"]
+    I --> K["Return group-level HydrateResult"]
+    J --> L["Return hydrate failure"]
 ```
+
+Recommended hydrate semantics:
+
+- artifact fetch/materialization may be internally best-effort at the
+  per-artifact level,
+- `HydrateResult` may therefore carry partial `get_outcomes` /
+  `missing_artifact_ids`-style diagnostic information,
+- but the external group-level `hydrate()` call remains fail-closed,
+- and success is reported only when the EngineAdapter has installed one
+  runnable prepared local request bundle that ordinary decode admission can
+  consume.
+
+In other words:
+
+- partial artifact transport is a diagnostic fact,
+- runnable decode preparation is the success criterion.
+
+#### 6.8.1 Target-side ingress after hydrate
+
+The preferred target-side ingress for decode continuation is:
+
+- `hydrate(publish_manifest=...)` prepares target-local request state,
+- the controller then sends the ordinary SGLang generate/decode request through
+  the normal serving endpoint,
+- and that ordinary request carries the same logical request id in the
+  caller-visible SGLang `rid` field.
+
+Recommended target-side contract:
+
+1. successful `hydrate()` stores one prepared local request bundle keyed by the
+   logical request id carried through the publish/hydrate flow,
+2. the prepared bundle is local SGLang integration state rather than a
+   Tensorcast directory object,
+3. when the controller later sends the ordinary `/generate` request with the
+   same `rid`, the target coordinator binds that request admission to the
+   prepared bundle instead of re-running prefill,
+4. if no prepared bundle exists for that `rid`, the normal SGLang path applies
+   and no hidden transfer recovery occurs.
+
+This keeps the external serving ingress minimally invasive:
+
+- no new public "resume by manifest" HTTP endpoint is required for v1,
+- the existing ordinary SGLang request path remains the decode-entry surface,
+- and Tensorcast-driven `hydrate()` remains a separate control-plane
+  preparation step.
+
+```mermaid
+flowchart TD
+    A["Controller runs hydrate(publish_manifest=...)"] --> B["Target coordinator installs prepared bundle"]
+    B --> C["Controller sends ordinary /generate with same rid"]
+    C --> D["SGLang request admission resolves rid -> prepared bundle"]
+    D -->|found| E["Resume decode without re-running prefill"]
+    D -->|not found| F["Fall back to ordinary SGLang admission semantics"]
+```
+
+#### 6.8.2 Legacy compatibility hydrate resolution
+
+If we keep `hydrate(engine_request_id=...)` for compatibility, it SHOULD be a
+controller-side shim rather than a target-instance-side resolution mechanism.
+
+The controller-side cache / registry:
+
+- belongs to the controller or router control plane,
+- stores previously returned `PublishManifest` objects keyed by logical request
+  id,
+- is not a Tensorcast-core registry feature,
+- and is not an SGLang target-instance runtime responsibility.
+
+This compatibility mode SHOULD be explicitly limited to single-controller
+deployments. If multiple independent controllers can publish or hydrate the
+same logical request id, the compatibility shim should be considered unsafe and
+disabled.
+
+Recommended compatibility-resolution flow:
+
+```mermaid
+flowchart TD
+    A["controller helper hydrate(engine_request_id)"] --> B["Lookup cached PublishManifest by logical_request_id"]
+    B -->|exactly one match| C["Emit remote hydrate(publish_manifest) plan"]
+    B -->|zero or many matches| D["Fail closed"]
+```
+
+The target SGLang instance SHOULD receive only the explicit-handle form
+`hydrate(publish_manifest=...)`.
 
 ### 6.9 Instance-agent and EngineAdapter role
 
@@ -880,15 +1321,17 @@ The SGLang EngineAdapter is responsible for translating Tensorcast instance
 steps into SGLang operations:
 
 - `publish`
-  - identify the group-scoped request KV live state,
+  - identify the group-scoped request plus its request-bundle metadata,
   - invoke coordinator fan-out when the logical instance has multiple ranks,
   - ensure relevant pages exist in the shared KV substrate,
-  - produce one group-level request-bundle manifest output.
+  - produce one group-level `PublishManifest` output.
 - `hydrate`
-  - resolve the authoritative request bundle,
+  - resolve the authoritative `PublishManifest`,
   - invoke coordinator fan-out when the logical instance has multiple ranks,
   - fetch or locate required pages,
-  - reconstruct target-side decode-usable KV state across all required ranks.
+  - reconstruct target-side decode-usable KV state across all required ranks,
+  - install the prepared local request bundle that ordinary `/generate(rid)`
+    admission will consume.
 - `evict_local`
   - remove local engine-side request state after handoff or cleanup across the
     whole logical instance.
@@ -931,6 +1374,8 @@ This component would own:
 
 - page publication and retrieval,
 - bundle metadata assembly and resolution,
+- SGLang-owned request-bundle metadata for live logical requests,
+- prepared-bundle admission state for hydrated target requests,
 - Tensorcast-specific keying and artifact operations,
 - translation between SGLang page hashes and Tensorcast artifact identity.
 
@@ -944,8 +1389,9 @@ The shared runtime should expose internal operations such as:
 - ensure page artifacts are published,
 - fetch page artifacts into host pages,
 - build prefix bundle metadata,
-- build request bundle metadata,
-- resolve request bundle by transfer handle or request handle,
+- build `PublishManifest` from generic artifact-manifest data plus opaque
+  `EngineOwnedManifest`,
+- resolve request transfer by `PublishManifest`,
 - resolve prefix bundle by prefix identity.
 
 For request-level transfer, this shared runtime SHOULD also provide a
@@ -953,8 +1399,9 @@ coordinator-facing API that can:
 
 - freeze a request snapshot boundary,
 - enumerate required ranks and shard contributions,
-- assemble one group-level request bundle manifest,
-- resolve one group-level request bundle back into per-rank hydrate work items.
+- assemble one group-level `PublishManifest`,
+- resolve one group-level `PublishManifest` back into per-rank hydrate work
+  items.
 
 It SHOULD also own a **page publication registry** or equivalent deduplication
 mechanism for SGLang-side publication work.
@@ -986,11 +1433,296 @@ independently across:
 
 without a shared source of truth.
 
+#### 7.2.1 Source-side `RequestBundleState` record
+
+To make source-side `publish()` deterministic, the shared runtime SHOULD keep
+one coordinator-owned record per live logical request. This record is the
+authoritative local source of truth for:
+
+- the current live request frontier,
+- the fixed cutoff chosen for one publish generation,
+- the ordered page membership of that generation,
+- and the publish manifest generation last committed for that request.
+
+Conceptual Pydantic-style schema:
+
+```python
+from pydantic import BaseModel
+from typing import Literal
+
+
+class RankCoord(BaseModel):
+    tp_rank: int
+    pp_rank: int
+
+
+class PageClosureEntry(BaseModel):
+    logical_page_index: int
+    page_hash: str
+    publication_state: Literal["absent", "inflight", "ready", "failed"]
+    artifact_id: str | None = None
+    host_resident: bool
+    last_error: str | None = None
+
+
+class RankSnapshotCursor(BaseModel):
+    tp_rank: int
+    pp_rank: int
+    latest_token_count: int
+    latest_last_page_index: int
+    frozen_cutoff_token_count: int | None = None
+    frozen_last_page_index: int | None = None
+    force_flush_cursor: int | None = None
+    ordered_pages: list[PageClosureEntry]
+
+
+class RequestBundleState(BaseModel):
+    logical_request_id: str
+    instance_id: str
+    engine_request_id: str
+    model_fingerprint: str
+    kv_layout_id: str
+    tp_size: int
+    pp_size: int
+    state: Literal[
+        "live_tracking",
+        "snapshot_closing",
+        "closing_tail_flush",
+        "closure_ready",
+        "published",
+        "publish_failed",
+        "cleaned",
+    ]
+    snapshot_seq: int
+    publish_op_id: str | None = None
+    frozen_cutoff_token_count: int | None = None
+    frozen_last_page_index: int | None = None
+    bundle_digest: str | None = None
+    latest_publish_manifest_digest: str | None = None
+    required_ranks: list[RankCoord]
+    rank_snapshots: list[RankSnapshotCursor]
+    created_at_ms: int
+    updated_at_ms: int
+```
+
+Interpretation notes:
+
+- `ordered_pages` is a conceptual schema. Real implementations MAY store this
+  in a more compact array-oriented form because page cardinality can be high.
+- `publication_state` should be derived from or reconciled with the shared
+  page publication registry; it does not replace that registry.
+- `snapshot_seq` is monotonically increasing per logical request and gives the
+  coordinator a local generation number even before a `PublishManifest` exists.
+- `latest_publish_manifest_digest` records the last committed external transfer
+  handle generation for observability and idempotent retry.
+
+Recommended ownership:
+
+- rank 0 owns mutation of `RequestBundleState`,
+- non-coordinator ranks contribute per-rank cursors and page membership data,
+- and only the coordinator may transition the record into `published`.
+
+#### 7.2.2 Source-side `RequestBundleState` state machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> LiveTracking
+    LiveTracking --> SnapshotClosing: publish(op_id) accepted
+    SnapshotClosing --> ClosingTailFlush: fixed cutoff sealed on all required ranks
+    ClosingTailFlush --> ClosureReady: all required page shards up to cutoff are ready
+    ClosureReady --> Published: PublishManifest committed
+    ClosingTailFlush --> PublishFailed: any required rank/page terminal failure
+    PublishFailed --> SnapshotClosing: retry publish with new snapshot_seq
+    Published --> LiveTracking: newer live progress continues beyond published cutoff
+    Published --> Cleaned: source local request cleanup
+    LiveTracking --> Cleaned: request released without further publish
+```
+
+Recommended semantics:
+
+- `LiveTracking`: request is still advancing and the coordinator records the
+  latest visible frontier.
+- `SnapshotClosing`: one publish generation has claimed a fixed cutoff and
+  ranks are sealing page membership for exactly that cutoff.
+- `ClosingTailFlush`: the system is forcing or waiting for missing tail pages
+  up to the chosen cutoff, but it is not chasing newer tokens.
+- `ClosureReady`: all pages required for the chosen cutoff satisfy the publish
+  contract and the coordinator can assemble `PublishManifest`.
+- `Published`: one immutable generation exists; the live request may still
+  continue and later publish a newer generation.
+- `PublishFailed`: the chosen cutoff could not be closed and no external
+  success was reported.
+
+#### 7.2.3 Source-side snapshot closure algorithm
+
+Recommended coordinator algorithm:
+
+1. Resolve `RequestBundleState` by `logical_request_id`.
+2. Increment `snapshot_seq` and assign `publish_op_id`.
+3. Freeze one cutoff:
+   - `frozen_cutoff_token_count`
+   - `frozen_last_page_index`
+4. Broadcast that cutoff to all required ranks.
+5. Each rank seals its `RankSnapshotCursor` to that cutoff and returns the
+   ordered page list for exactly that cutoff.
+6. For each page shard in cutoff order:
+   - adopt if `publication_state=ready`,
+   - join/wait if `publication_state=inflight`,
+   - if `absent`, call a rank-local `force_flush_to_cutoff()` path that pushes
+     the missing host-page shard into the shared substrate,
+   - fail if `failed` or if host/L2 materialization for the cutoff cannot be
+     recovered.
+7. Compute `bundle_digest` from the ordered per-rank page identities bound to
+   that cutoff.
+8. Only after all required ranks report closure satisfied, assemble and commit
+   `PublishManifest`.
+
+Recommended implementation rules:
+
+- `force_flush_to_cutoff()` MUST be bounded by the chosen cutoff.
+- A page for token frontier `N+1` MUST NOT be pulled into the current publish
+  generation if the frozen cutoff is `N`.
+- Source request execution MAY continue after the cutoff is frozen; newer tokens
+  simply belong to a future `snapshot_seq`.
+- If the live request is released before the chosen cutoff can be closed,
+  `publish()` should fail rather than invent a partial bundle.
+
+#### 7.2.4 Target-side `PreparedBundleRecord`
+
+To make ordinary `/generate(rid)` admission deterministic after `hydrate()`,
+the shared runtime SHOULD keep one target-local record per hydrated transfer
+generation.
+
+Conceptual Pydantic-style schema:
+
+```python
+from pydantic import BaseModel
+from typing import Literal
+
+
+class RankInstallRecord(BaseModel):
+    tp_rank: int
+    pp_rank: int
+    state: Literal["preparing", "ready", "failed", "cleaned"]
+    hydrated_page_count: int
+    runnable_prefix_tokens: int
+    local_install_handle: str | None = None
+    last_error: str | None = None
+
+
+class PreparedBundleRecord(BaseModel):
+    logical_request_id: str
+    target_instance_id: str
+    publish_manifest_digest: str
+    artifact_manifest_digest: str
+    engine_owned_manifest_sha256: str
+    state: Literal[
+        "preparing",
+        "prepared",
+        "claimed",
+        "attached",
+        "consumed",
+        "failed",
+        "evicted",
+    ]
+    required_ranks: list[RankCoord]
+    rank_installs: list[RankInstallRecord]
+    claim_token: str | None = None
+    active_scheduler_rid: str | None = None
+    prepared_bundle_key: str | None = None
+    created_at_ms: int
+    prepared_at_ms: int | None = None
+    claimed_at_ms: int | None = None
+    cleaned_at_ms: int | None = None
+```
+
+Interpretation notes:
+
+- `PreparedBundleRecord` is local SGLang integration state, not a Tensorcast
+  directory object and not a distributed registry entry.
+- `publish_manifest_digest` is the primary generation key. The same
+  `logical_request_id` may see more than one generation over time.
+- `claim_token` is an admission-time compare-and-swap token used to prevent two
+  concurrent `/generate(rid)` requests from consuming the same prepared bundle.
+
+Recommended table key:
+
+- primary key: `(logical_request_id, publish_manifest_digest)`
+- secondary admission index: `logical_request_id -> latest prepared generation`
+
+#### 7.2.5 Target-side `PreparedBundleRecord` state machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> Preparing
+    Preparing --> Prepared: all required ranks install runnable state
+    Preparing --> Failed: hydrate group failure
+    Prepared --> Claimed: ordinary /generate(rid) atomically claims bundle
+    Claimed --> Attached: scheduler creates live request from prepared state
+    Claimed --> Prepared: admission rollback before live request is created
+    Attached --> Consumed: live request owns the state
+    Prepared --> Evicted: cleanup without use
+    Failed --> Evicted: cleanup
+    Consumed --> Evicted: request finished / local cleanup
+```
+
+Recommended semantics:
+
+- `Preparing`: hydrate is still materializing/installing state.
+- `Prepared`: one runnable bundle exists and is available for exactly one decode
+  admission claim.
+- `Claimed`: admission has won the race for this bundle but has not yet
+  attached it to an SGLang live request object.
+- `Attached`: scheduler/live-request construction is in progress using this
+  prepared bundle.
+- `Consumed`: ownership has moved to the live request; the prepared-bundle
+  record is no longer reusable for another decode admission.
+
+#### 7.2.6 Target-side admission binding algorithm
+
+Recommended coordinator algorithm for ordinary `/generate(rid)` after hydrate:
+
+1. Request admission receives caller-provided `rid=logical_request_id`.
+2. Coordinator checks for an existing live request with the same logical id.
+3. Coordinator checks the prepared-bundle table for that logical id.
+4. If no prepared bundle exists:
+   - follow the normal SGLang path.
+5. If exactly one `PreparedBundleRecord(state="prepared")` exists:
+   - atomically transition it to `claimed`,
+   - mint `claim_token`,
+   - construct the live request from the prepared bundle,
+   - transition to `attached` and then `consumed`.
+6. If the prepared bundle is present but in `claimed`, `attached`, `consumed`,
+   or `failed`:
+   - fail closed rather than silently falling back to a second hidden resume.
+
+Recommended conflict rules:
+
+- If a live request already exists for `logical_request_id`, `hydrate()` SHOULD
+  reject installing a new prepared bundle for that id.
+- If a prepared bundle already exists with a different
+  `publish_manifest_digest`, a second hydrate SHOULD fail closed unless the
+  existing record has already been cleaned.
+- Repeated hydrate with the same `publish_manifest_digest` MAY be treated as an
+  idempotent retry.
+- Prepared-bundle consumption SHOULD be one-shot. Reusing the same prepared
+  bundle for multiple decode admissions should not be the default v1 behavior.
+
 ### 7.3 Bundle state models
 
 The shared runtime SHOULD define explicit lifecycle states for both prefix
 bundles and request bundles. These state machines are not Tensorcast-core
 objects; they are SGLang integration state.
+
+These lifecycle models are intentionally higher-level than the concrete
+coordinator-owned records in:
+
+- `7.2.1 Source-side RequestBundleState`
+- `7.2.4 Target-side PreparedBundleRecord`
+
+The concrete records describe implementation state for one coordinator/runtime.
+The lifecycle models below describe the broader semantic phases that the
+integration exposes and reasons about.
 
 #### 7.3.1 Prefix bundle state
 
@@ -1014,6 +1746,8 @@ Recommended semantics:
 - `Ready` means the bundle can answer prefix-share existence / fetch queries.
 - `Stale` means the bundle name may still exist logically, but its page closure
   is no longer trusted.
+- `Stale` should be entered whenever the validation rules in
+  `4.4.2 Prefix bundle invalidation rules` are violated.
 
 #### 7.3.2 Request bundle state
 
@@ -1025,7 +1759,7 @@ stateDiagram-v2
     [*] --> LiveOnly
     LiveOnly --> SnapshotClosing: publish begins and snapshot boundary freezes
     SnapshotClosing --> PublishingPages: required page closure is being satisfied
-    PublishingPages --> Published: group-level manifest committed
+    PublishingPages --> Published: immutable PublishManifest committed
     PublishingPages --> PublishFailed: closure failed
     Published --> Hydrating: target hydrate begins
     Hydrating --> Hydrated: all required ranks installed runnable state
@@ -1040,6 +1774,8 @@ Recommended interpretation:
 
 - `Published` is the first state in which a request bundle is externally
   authoritative for request-level transfer.
+- every successful transition into `Published` SHOULD mint one immutable
+  `PublishManifest` generation.
 - `Hydrated` is target-local success, not global workflow completion.
 - `CleanupPending` keeps request-level transfer semantics separate from source
   or target local eviction policy.
@@ -1055,22 +1791,32 @@ request-level control plane:
 
 - runtime-bound `Plan`,
 - worker `prefetch_set` / `prefetch_manifest_result`,
-- instance `publish` / `hydrate` / `evict_local`,
+- instance `publish(engine_request_id=...)`,
+- legacy `hydrate(engine_request_id=...)`,
+- `evict_local(engine_request_id=...)`,
 - `ManifestResult` and `ManifestArtifactSetBridge`.
 
-This is sufficient to define the public request-transfer protocol.
+These are necessary building blocks, but not yet the complete target
+request-transfer surface.
 
 ### 8.2 What Tensorcast does not yet directly provide
 
 Current Tensorcast does not yet directly provide all the primitives needed for
-the prefix-share hot path.
+either:
+
+- the prefix-share hot path, or
+- the final explicit-handle request-transfer surface.
 
 The main gaps are:
 
 - a public page-store-style batch API tailored for high-cardinality KV page IO,
 - an existing Tensorcast-backed HiCache storage implementation,
 - explicit public prefix-bundle programmability,
-- a public hydrate-by-manifest or hydrate-by-artifact-set instance-step surface.
+- `PublishResult.publish_manifest`,
+- opaque `EngineOwnedManifest` carriage in the instance-step result path,
+- `hydrate(publish_manifest=...)`,
+- and a public hydrate-by-manifest or hydrate-by-artifact-set instance-step
+  surface.
 
 ### 8.3 Design consequence
 
@@ -1105,14 +1851,26 @@ Implement:
 - SGLang in-process instance-agent / EngineAdapter `publish`,
 - SGLang in-process instance-agent / EngineAdapter `hydrate`,
 - SGLang in-process instance-agent / EngineAdapter `evict_local`,
+- `PublishManifest` / `EngineOwnedManifest` plumbing across the Tensorcast
+  result and instance-step boundary,
+- explicit-handle `hydrate(publish_manifest=...)` support,
+- coordinator-owned Tensorcast directory registration / heartbeat for the
+  in-process instance-agent execution endpoint,
 - coordinator-side typed internal control requests for KV publish / manifest /
   hydrate / evict,
-- request-bundle manifest construction on top of the same page artifacts.
+- `PublishManifest` construction on top of the same page artifacts.
+- target-side prepared-bundle admission binding from ordinary `/generate(rid)`
+  into hydrated decode state.
 
 Goal:
 
 - enable PD transfer using the protocol in
   `tensorcast_kv_protocol.md`.
+
+Optional controller-side helper work, if we decide to keep a convenience
+`hydrate(engine_request_id=...)` entrypoint, should stay outside the SGLang
+target-instance runtime and simply resolve a cached `PublishManifest` before
+emitting the canonical remote `hydrate(publish_manifest=...)` plan.
 
 ### 9.3 Phase 3: optional programmable prefix bundle operations
 
