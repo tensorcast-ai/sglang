@@ -140,7 +140,7 @@ This is the executable TODO list for implementing `load_format=tensorcast` + pul
 
 ## Phase 7 - Benchmark Load Weight
 
-- [x] Create self-contained benchmark package under `sglang/benchmark/tensorcast/load_weight/`:
+- [x] Create self-contained benchmark package under `sglang/benchmark/tensorcast_benchmark/load_weight/`:
   - [x] Add `README.md` with prerequisites, one-command usage, and examples.
   - [x] Add runner/config scripts only inside this folder (no dependency on `../scripts/start_tensorcast.sh` or other out-of-tree helpers).
   - [x] Add `outputs/` directory contract and file naming rules for logs/results.
@@ -168,7 +168,7 @@ This is the executable TODO list for implementing `load_format=tensorcast` + pul
   - [x] Always attempt process cleanup on both success and failure paths.
   - [x] Preserve per-trial raw stdout/stderr logs under `outputs/` for postmortem.
 - [x] Implement append-only CSV reporting:
-  - [x] Append all trial records to `sglang/benchmark/tensorcast/load_weight/outputs/benchmark_results.csv`.
+  - [x] Append all trial records to `sglang/benchmark/tensorcast_benchmark/load_weight/outputs/benchmark_results.csv`.
   - [x] Include at least: timestamp, model_path, model_name, tp_size, weight_version, load_format, trial_id, load_time_s, ready_time_s, status, error_message.
   - [x] Keep schema stable across reruns; never overwrite historical rows.
 - [x] Add baseline-vs-tensorcast comparability guidance in README:
@@ -177,7 +177,7 @@ This is the executable TODO list for implementing `load_format=tensorcast` + pul
 
 ## Phase 8 - Benchmark Update Weight
 
-- [x] Create self-contained benchmark package under `sglang/benchmark/tensorcast/update_weight/`:
+- [x] Create self-contained benchmark package under `sglang/benchmark/tensorcast_benchmark/update_weight/`:
   - [x] Add `README.md` with prerequisites, one-command usage, and examples.
   - [x] Add runner/config scripts only inside this folder (no dependency on out-of-tree helper scripts).
   - [x] Add `outputs/` directory contract and file naming rules for logs/results.
@@ -211,7 +211,7 @@ This is the executable TODO list for implementing `load_format=tensorcast` + pul
   - [x] CSV only appends successful trial records.
   - [x] Preserve per-trial raw stdout/stderr logs under `outputs/` for postmortem.
 - [x] Implement append-only CSV reporting:
-  - [x] Append successful trial rows to `sglang/benchmark/tensorcast/update_weight/outputs/benchmark_results.csv`.
+  - [x] Append successful trial rows to `sglang/benchmark/tensorcast_benchmark/update_weight/outputs/benchmark_results.csv`.
   - [x] Include at least: timestamp, model_path, model_name, tp_size, target_weight_version, load_format, trial_id, load_time_s, ready_time_s, status, endpoint, log_path.
   - [x] Keep schema stable across reruns; never overwrite historical rows.
 - [x] Add baseline-vs-tensorcast comparability guidance in README:

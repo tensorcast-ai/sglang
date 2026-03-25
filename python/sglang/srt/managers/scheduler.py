@@ -1612,6 +1612,26 @@ class Scheduler(
                     last_hash,
                     prefix_keys,
                 )
+                logger.debug(
+                    "HiCache storage prefetch considered for rid=%s backuped=%s "
+                    "prefix_tokens=%d host_hit_tokens=%d new_input_tokens=%d "
+                    "last_hash=%s",
+                    req.rid,
+                    req.last_node.backuped,
+                    len(req.prefix_indices),
+                    req.host_hit_length,
+                    len(new_input_tokens),
+                    last_hash,
+                )
+            else:
+                logger.debug(
+                    "HiCache storage prefetch skipped for rid=%s because last_node.backuped=%s "
+                    "prefix_tokens=%d host_hit_tokens=%d",
+                    req.rid,
+                    req.last_node.backuped,
+                    len(req.prefix_indices),
+                    req.host_hit_length,
+                )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.NULL:
@@ -1917,6 +1937,10 @@ class Scheduler(
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
+        if self.enable_hierarchical_cache:
+            # Keep HiCache background IO progressing even when no new prefill batch is admitted.
+            self.tree_cache.check_hicache_events()
+
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -1945,9 +1969,6 @@ class Scheduler(
         ):
             self.running_batch.batch_is_full = True
             return None
-
-        if self.enable_hierarchical_cache:
-            self.tree_cache.check_hicache_events()
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)

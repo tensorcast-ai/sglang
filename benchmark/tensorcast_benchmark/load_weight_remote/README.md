@@ -1,6 +1,6 @@
 # Tensorcast Remote Load-Weight Benchmark
 
-This benchmark is self-contained under `sglang/benchmark/tensorcast/load_weight_remote/`.
+This benchmark is self-contained under `sglang/benchmark/tensorcast_benchmark/load_weight_remote/`.
 It measures SGLang load latency when the model loader runs on a remote GPU worker.
 
 Supported modes:
@@ -53,7 +53,7 @@ Marker rules:
 Run from this folder:
 
 ```bash
-cd sglang/benchmark/tensorcast/load_weight_remote
+cd sglang/benchmark/tensorcast_benchmark/load_weight_remote
 uv run python run_benchmark.py --help
 ```
 

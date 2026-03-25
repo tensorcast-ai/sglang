@@ -1,6 +1,6 @@
 # Tensorcast Update-Weight Benchmark
 
-This benchmark is self-contained under `sglang/benchmark/tensorcast/update_weight/`.
+This benchmark is self-contained under `sglang/benchmark/tensorcast_benchmark/update_weight/`.
 It measures online weight update latency after a server has already been launched.
 
 ## What it benchmarks
@@ -55,7 +55,7 @@ CSV columns:
 Run directly inside this folder:
 
 ```bash
-cd sglang/benchmark/tensorcast/update_weight
+cd sglang/benchmark/tensorcast_benchmark/update_weight
 uv run python run_benchmark.py --help
 ```
 

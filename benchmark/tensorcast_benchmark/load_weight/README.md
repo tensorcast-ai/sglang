@@ -1,6 +1,6 @@
 # Tensorcast Load-Weight Benchmark
 
-This benchmark is self-contained under `sglang/benchmark/tensorcast/load_weight/`.
+This benchmark is self-contained under `sglang/benchmark/tensorcast_benchmark/load_weight/`.
 It compares SGLang startup latency for:
 
 - `load_format=tensorcast`
@@ -50,7 +50,7 @@ CSV columns:
 Run directly inside this folder:
 
 ```bash
-cd sglang/benchmark/tensorcast/load_weight
+cd sglang/benchmark/tensorcast_benchmark/load_weight
 uv run python run_benchmark.py --help
 ```
 

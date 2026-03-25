@@ -28,7 +28,7 @@ This split is the right one for the current codebase because:
   pages represented in Tensorcast as high-cardinality byte artifacts.
 - Make `--hicache-storage-backend tensorcast` a real SGLang HiCache backend
   rather than a benchmark placeholder.
-- Make `benchmark/tensorcast/kv/share_local` run end-to-end with
+- Make `benchmark/tensorcast_benchmark/kv/share_local` run end-to-end with
   `hicache-storage-backend=tensorcast` on `charged-group=codesign`.
 - Preserve the architectural split from the KV docs:
   - prefix share stays an internal SGLang hot path,
@@ -48,7 +48,7 @@ This split is the right one for the current codebase because:
   - [ ] `Phase 2` must not require an external controller or request handoff.
   - [ ] `Phase 3` is the only phase allowed to extend Tensorcast request-transfer semantics.
 - [ ] Freeze the Phase-2 success criterion:
-  - [ ] `benchmark/tensorcast/kv/share_local` must run with
+  - [ ] `benchmark/tensorcast_benchmark/kv/share_local` must run with
     `hicache-storage-backend=tensorcast`.
   - [ ] The benchmark must start Tensorcast services automatically.
   - [ ] The benchmark must preserve the same output contract as the Mooncake path.
@@ -64,48 +64,48 @@ This phase creates the smallest useful unit: a Tensorcast-backed HiCache
 storage backend that can publish and retrieve page data correctly.
 
 - [ ] Add a built-in SGLang HiCache backend named `tensorcast`:
-  - [ ] Extend `--hicache-storage-backend` validation to include `tensorcast`.
-  - [ ] Register a Tensorcast backend in `StorageBackendFactory`.
-  - [ ] Add a dedicated backend package under
+  - [x] Extend `--hicache-storage-backend` validation to include `tensorcast`.
+  - [x] Register a Tensorcast backend in `StorageBackendFactory`.
+  - [x] Add a dedicated backend package under
     `sglang/python/sglang/srt/mem_cache/storage/tensorcast_store/`.
 - [ ] Define the SGLang-side Tensorcast backend config surface:
-  - [ ] Parse backend extra config from `--hicache-storage-backend-extra-config`.
-  - [ ] Include daemon/global-store addresses, local daemon association, durable policy,
+  - [x] Parse backend extra config from `--hicache-storage-backend-extra-config`.
+  - [x] Include daemon/global-store addresses, local daemon association, durable policy,
     and any benchmark-only overrides.
-  - [ ] Validate missing or inconsistent fields with clear errors.
+  - [x] Validate missing or inconsistent fields with clear errors.
 - [ ] Implement page identity and namespacing rules:
-  - [ ] Use SGLang page hash / prefix-chain-derived identity as the logical page key.
-  - [ ] Add TP-rank namespacing for MHA so different TP shards do not collide.
-  - [ ] Preserve MLA ownership rules instead of blindly duplicating all ranks.
-  - [ ] Keep page identity shared between prefix share and future request transfer.
+  - [x] Use SGLang page hash / prefix-chain-derived identity as the logical page key.
+  - [x] Add TP-rank namespacing for MHA so different TP shards do not collide.
+  - [x] Preserve MLA ownership rules instead of blindly duplicating all ranks.
+  - [x] Keep page identity shared between prefix share and future request transfer.
 - [ ] Implement Tensorcast-backed page operations:
-  - [ ] `batch_exists(...)`
-  - [ ] `batch_get_v1(...)`
-  - [ ] `batch_set_v1(...)`
-  - [ ] Map each SGLang page to a Tensorcast byte artifact payload boundary.
-  - [ ] Keep v1 at the host/L2-facing boundary rather than requiring direct L1 GPU zero-copy semantics.
+  - [x] `batch_exists(...)`
+  - [x] `batch_get_v1(...)`
+  - [x] `batch_set_v1(...)`
+  - [x] Map each SGLang page to a Tensorcast byte artifact payload boundary.
+  - [x] Keep v1 at the host/L2-facing boundary rather than requiring direct L1 GPU zero-copy semantics.
 - [ ] Define substrate publication semantics:
-  - [ ] Default KV-page publication policy should be durable-but-evictable.
-  - [ ] Duplicate page publication must be idempotent at the SGLang integration layer.
-  - [ ] Partial backend visibility must be tolerated so later publish/snapshot code can reason over mixed already-published and newly-published pages.
+  - [x] Default KV-page publication policy should be durable-but-evictable.
+  - [x] Duplicate page publication must be idempotent at the SGLang integration layer.
+  - [x] Partial backend visibility must be tolerated so later publish/snapshot code can reason over mixed already-published and newly-published pages.
 - [ ] Integrate with current HiCache control flow without changing hot-path ownership:
-  - [ ] Keep per-rank radix tree ownership in SGLang.
-  - [ ] Keep TP synchronization in `HiCacheController` / `HiRadixCache`.
-  - [ ] Do not introduce a request-level coordinator hop for ordinary prefix share.
+  - [x] Keep per-rank radix tree ownership in SGLang.
+  - [x] Keep TP synchronization in `HiCacheController` / `HiRadixCache`.
+  - [x] Do not introduce a request-level coordinator hop for ordinary prefix share.
 - [ ] Add observability:
-  - [ ] Backend init logs for daemon/store endpoints and rank suffix rules.
-  - [ ] Counters or debug logs for page `exists/get/set`, duplicate put skip, and backend failures.
+  - [x] Backend init logs for daemon/store endpoints and rank suffix rules.
+  - [x] Counters or debug logs for page `exists/get/set`, duplicate put skip, and backend failures.
 - [ ] Add unit-level verification:
-  - [ ] Key/schema tests for TP/MLA namespacing.
-  - [ ] Storage round-trip tests for page put/get.
-  - [ ] Duplicate publication tests.
-  - [ ] Partial batch hit tests for prefix existence queries.
+  - [x] Key/schema tests for TP/MLA namespacing.
+  - [x] Storage round-trip tests for page put/get.
+  - [x] Duplicate publication tests.
+  - [x] Partial batch hit tests for prefix existence queries.
 
 ### Phase 1 Exit Criteria
 
-- [ ] One SGLang process can store and retrieve HiCache pages through Tensorcast.
-- [ ] TP>1 ranks do not key-collide in the shared substrate.
-- [ ] No external controller or Tensorcast instance-step logic is required yet.
+- [x] One SGLang process can store and retrieve HiCache pages through Tensorcast.
+- [x] TP>1 ranks do not key-collide in the shared substrate.
+- [x] No external controller or Tensorcast instance-step logic is required yet.
 
 ## Phase 2 - Prefix Share Interface and Benchmark Bring-up
 
@@ -115,54 +115,83 @@ the `share_local` benchmark the primary validation harness.
 ### Phase 2A - Benchmark Harness Completion
 
 - [ ] Finish the `share_local` Tensorcast backend path in
-  `benchmark/tensorcast/kv/share_local/run_benchmark.py`:
-  - [ ] Replace the current hard failure for `backend=tensorcast`.
-  - [ ] Generate Tensorcast config files into `outputs/<run_id>/generated_configs/`
+  `benchmark/tensorcast_benchmark/kv/share_local/run_benchmark.py`:
+  - [x] Replace the current hard failure for `backend=tensorcast`.
+  - [x] Generate Tensorcast config files into `outputs/<run_id>/generated_configs/`
     from `share_local/configs/`.
-  - [ ] Support `tensorcast-daemon-mode=share`.
-  - [ ] Support `tensorcast-daemon-mode=separate`.
-  - [ ] Start and stop Tensorcast global store and daemon(s) on the remote worker.
-  - [ ] Wait for service readiness and fail early on readiness timeout.
-  - [ ] Copy Tensorcast logs from `/data` into the benchmark output directory.
+  - [x] Support `tensorcast-daemon-mode=share`.
+  - [x] Support `tensorcast-daemon-mode=separate`.
+  - [x] Start and stop Tensorcast global store and daemon(s) on the remote worker.
+  - [x] Wait for service readiness and fail early on readiness timeout.
+  - [x] Copy Tensorcast logs from `/data` into the benchmark output directory.
 - [ ] Reuse the proven benchmark service lifecycle pattern:
-  - [ ] Follow the service lifecycle model already used by
-    `benchmark/tensorcast/load_weight_remote/scripts/tensorcast_service.sh`.
-  - [ ] Decide whether to reuse that helper directly or extract a shared KV benchmark helper.
+  - [x] Follow the service lifecycle model already used by
+    `benchmark/tensorcast_benchmark/load_weight_remote/scripts/tensorcast_service.sh`.
+  - [x] Decide whether to reuse that helper directly or extract a shared KV benchmark helper.
 - [ ] Add benchmark request-id control:
-  - [ ] Extend `benchmark/tensorcast/kv/sgl_client.py` so `/generate` can send an explicit `rid`.
-  - [ ] Make `request_driver.py` construct deterministic request ids for each request pair.
-  - [ ] Keep the benchmark able to compare the same logical prompt across instances.
+  - [x] Extend `benchmark/tensorcast_benchmark/kv/sgl_client.py` so `/generate` can send an explicit `rid`.
+  - [x] Make `request_driver.py` construct deterministic request ids for each request pair.
+  - [x] Keep the benchmark able to compare the same logical prompt across instances.
 - [ ] Keep benchmark result compatibility:
-  - [ ] Preserve `pair_results.jsonl`, `summary.json`, `logs/`, and append-only CSV behavior.
-  - [ ] Preserve the Mooncake path as the baseline.
+  - [x] Preserve `pair_results.jsonl`, `summary.json`, `logs/`, and append-only CSV behavior.
+  - [x] Preserve the Mooncake path as the baseline.
 - [ ] Keep the target test environment explicit:
-  - [ ] Use `--brainctl-charged-group codesign` in documentation/examples for Tensorcast validation.
-  - [ ] Keep `--existing-worker-process` supported so an already-running 8xH800 worker can be reused.
+  - [x] Use `--brainctl-charged-group codesign` in documentation/examples for Tensorcast validation.
+  - [x] Keep `--existing-worker-process` supported so an already-running 8xH800 worker can be reused.
 
 ### Phase 2B - SGLang Prefix-Share Functional Wiring
 
-- [ ] Make SGLang serve with `--hicache-storage-backend tensorcast`:
-  - [ ] Pass Tensorcast backend config into the SGLang server launch path.
-  - [ ] Ensure both instances in `share_local` can point at one shared daemon or two separate daemons.
-  - [ ] Keep the instances otherwise identical to the Mooncake benchmark topology.
-- [ ] Preserve SGLang-native prefix-share behavior:
-  - [ ] Storage queries must happen from the existing HiCache hot path.
-  - [ ] Prefix-tree insertion remains owned by `HiRadixCache`.
-  - [ ] No controller program is involved.
-- [ ] Verify functional prefix reuse:
-  - [ ] Confirm instance A writes reusable pages into the shared substrate while serving.
-  - [ ] Confirm instance B performs storage-backed prefix hits.
-  - [ ] Confirm the returned metrics show actual cache reuse signals, not only service bring-up.
-- [ ] Validate on the target benchmark:
-  - [ ] Run `share_local` on `Qwen3-32B`, `tp=2`, same-node two-instance topology.
-  - [ ] Inspect logs and CSV output to confirm the Tensorcast path behaves like a functional prefix-share backend, not just a topology harness.
+- [x] Make SGLang serve with `--hicache-storage-backend tensorcast`:
+  - [x] Pass Tensorcast backend config into the SGLang server launch path.
+  - [x] Ensure both instances in `share_local` can point at one shared daemon or two separate daemons.
+  - [x] Keep the instances otherwise identical to the Mooncake benchmark topology.
+- [x] Preserve SGLang-native prefix-share behavior:
+  - [x] Storage queries must happen from the existing HiCache hot path.
+  - [x] Prefix-tree insertion remains owned by `HiRadixCache`.
+  - [x] No controller program is involved.
+- [x] Verify functional prefix reuse:
+  - [x] Confirm instance A writes reusable pages into the shared substrate while serving.
+  - [x] Confirm instance B performs storage-backed prefix hits.
+  - [x] Confirm the validation flow exposes actual cache reuse signals for the measured prompt pair, not only startup/service bring-up.
+- [x] Validate on the target benchmark:
+  - [x] Run `share_local` on `Qwen3-32B`, `tp=2`, same-node two-instance topology.
+  - [x] Inspect logs and CSV output to confirm the Tensorcast path behaves like a functional prefix-share backend, not just a topology harness.
 
 ### Phase 2 Exit Criteria
 
-- [ ] `benchmark/tensorcast/kv/share_local` runs with `hicache-storage-backend=tensorcast`.
-- [ ] The benchmark starts Tensorcast services automatically and cleans them up reliably.
-- [ ] Prefix-share requests on instance B can reuse pages produced by instance A.
-- [ ] The benchmark remains runnable on `charged-group=codesign`.
+- [x] `benchmark/tensorcast_benchmark/kv/share_local` runs with `hicache-storage-backend=tensorcast`.
+- [x] The benchmark starts Tensorcast services automatically and cleans them up reliably.
+- [x] Prefix-share requests on instance B can reuse pages produced by instance A.
+- [x] The benchmark remains runnable on `charged-group=codesign`.
+
+Current validation note:
+
+- Validated run:
+  - `benchmark/tensorcast_benchmark/kv/share_local/outputs/20260324-213808_tensorcast_tp2_pairs1`
+- Validation shape:
+  - `Qwen3-32B`
+  - `tp=2`
+  - same-node two-instance topology
+  - dataset `LongBench/hotpotqa.jsonl`
+  - `max_prompt_chars=35000`
+  - `--extra-server-args "--log-level debug --log-requests"`
+- Source-side publication for the measured prompt is confirmed by repeated
+  `stable_dram upload` lines in instance-A logs during the formal request
+  window.
+- Target-side reuse for the same measured prompt is confirmed in instance-B
+  logs by:
+  - `HiCache storage hit query ... hit_tokens=65`
+  - `Prefetching 65 pages for request ...`
+  - repeated `Artifact loaded ...`
+- The benchmark-level TTFT summary for this run also shows lower TTFT on
+  instance B (`67.75 ms` improvement), but the primary proof of prefix reuse is
+  the request-scoped HiCache/storage log sequence above.
+- `meta_info.cached_tokens` remains `0` in this flow and must not be used as
+  the proof signal for shared-substrate reuse.
+- The explicit benchmark `rid` is only a correlation label for logs and result
+  rows. The actual HiCache reuse decision is driven by token-prefix/page-hash
+  identity, which is why the benchmark must send the exact same prompt text to
+  both instances.
 
 ## Phase 3 - Request Transfer Interface
 
@@ -290,16 +319,16 @@ The most important implementation boundary is:
 - `sglang/python/sglang/srt/entrypoints/http_server.py`
 - `sglang/python/sglang/srt/managers/scheduler.py`
 - `sglang/python/sglang/launch_server.py`
-- `sglang/benchmark/tensorcast/kv/models.py`
-- `sglang/benchmark/tensorcast/kv/outputs.py`
-- `sglang/benchmark/tensorcast/kv/remote.py`
-- `sglang/benchmark/tensorcast/kv/sgl_client.py`
-- `sglang/benchmark/tensorcast/kv/share_local/run_benchmark.py`
-- `sglang/benchmark/tensorcast/kv/share_local/request_driver.py`
-- `sglang/benchmark/tensorcast/kv/share_local/README.md`
-- `sglang/benchmark/tensorcast/kv/share_local/arch.md`
-- `sglang/benchmark/tensorcast/kv/share_local/configs/global_store_config.yaml`
-- `sglang/benchmark/tensorcast/kv/share_local/configs/store_daemon_config.yaml`
+- `sglang/benchmark/tensorcast_benchmark/kv/models.py`
+- `sglang/benchmark/tensorcast_benchmark/kv/outputs.py`
+- `sglang/benchmark/tensorcast_benchmark/kv/remote.py`
+- `sglang/benchmark/tensorcast_benchmark/kv/sgl_client.py`
+- `sglang/benchmark/tensorcast_benchmark/kv/share_local/run_benchmark.py`
+- `sglang/benchmark/tensorcast_benchmark/kv/share_local/request_driver.py`
+- `sglang/benchmark/tensorcast_benchmark/kv/share_local/README.md`
+- `sglang/benchmark/tensorcast_benchmark/kv/share_local/arch.md`
+- `sglang/benchmark/tensorcast_benchmark/kv/share_local/configs/global_store_config.yaml`
+- `sglang/benchmark/tensorcast_benchmark/kv/share_local/configs/store_daemon_config.yaml`
 
 ### New SGLang files likely needed
 
@@ -312,7 +341,7 @@ The most important implementation boundary is:
 - `sglang/python/sglang/srt/tensorcast/engine_adapter.py`
 - `sglang/python/sglang/srt/tensorcast/page_publication_registry.py`
 - `sglang/python/sglang/srt/tensorcast/request_bundle_state.py`
-- `sglang/benchmark/tensorcast/kv/share_local/scripts/tensorcast_service.sh`
+- `sglang/benchmark/tensorcast_benchmark/kv/share_local/scripts/tensorcast_service.sh`
 
 ### Tensorcast files to modify
 

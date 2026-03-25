@@ -1,6 +1,6 @@
 # Tensorcast Remote Update-Weight Benchmark
 
-This benchmark is self-contained under `sglang/benchmark/tensorcast/update_weight_remote/`.
+This benchmark is self-contained under `sglang/benchmark/tensorcast_benchmark/update_weight_remote/`.
 It measures online weight-update latency when SGLang runs on a remote GPU worker.
 
 Supported modes:
@@ -48,7 +48,7 @@ Global append-only CSV:
 Run from this folder:
 
 ```bash
-cd sglang/benchmark/tensorcast/update_weight_remote
+cd sglang/benchmark/tensorcast_benchmark/update_weight_remote
 uv run python run_benchmark.py --help
 ```
 

@@ -677,6 +677,15 @@ class HiRadixCache(RadixCache):
                 min_completed_tokens - matched_length
             )
 
+        logger.debug(
+            "HiCache prefetch finalized for rid=%s min_completed_tokens=%d matched_length=%d "
+            "inserted_host_tokens=%d",
+            req_id,
+            min_completed_tokens,
+            matched_length,
+            min_completed_tokens - matched_length,
+        )
+
         return True
 
     def terminate_prefetch(self, req_id: str):
@@ -743,6 +752,15 @@ class HiRadixCache(RadixCache):
             or prefetch_length < self.prefetch_threshold
             or self.cache_controller.prefetch_rate_limited()
         ):
+            logger.debug(
+                "HiCache prefetch not enqueued for rid=%s enable_storage=%s prefetch_length=%d "
+                "threshold=%d rate_limited=%s",
+                req_id,
+                self.enable_storage,
+                prefetch_length,
+                self.prefetch_threshold,
+                self.cache_controller.prefetch_rate_limited(),
+            )
             return
 
         last_host_node.protect_host()
@@ -756,6 +774,13 @@ class HiRadixCache(RadixCache):
             return
         operation = self.cache_controller.prefetch(
             req_id, host_indices, new_input_tokens, last_hash, prefix_keys
+        )
+        logger.debug(
+            "HiCache prefetch enqueued for rid=%s prefetch_length=%d last_hash=%s prefix_keys=%d",
+            req_id,
+            prefetch_length,
+            last_hash,
+            len(prefix_keys) if prefix_keys is not None else 0,
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,

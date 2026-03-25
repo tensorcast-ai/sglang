@@ -326,7 +326,7 @@ class HiCacheController:
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
-            if (self.storage_backend_type in ["hf3fs", "mooncake", "eic"]) or (
+            if (self.storage_backend_type in ["hf3fs", "mooncake", "tensorcast", "eic"]) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
             ):
@@ -737,6 +737,14 @@ class HiCacheController:
                         group=self.prefetch_tp_group,
                     )
                     storage_hit_count = storage_hit_count_tensor.item()
+
+                logger.debug(
+                    "HiCache storage hit query for rid=%s hit_tokens=%d queried_pages=%d threshold=%d",
+                    operation.request_id,
+                    storage_hit_count,
+                    len(hash_value),
+                    self.prefetch_threshold,
+                )
 
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
