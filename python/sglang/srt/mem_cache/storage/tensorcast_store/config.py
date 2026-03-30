@@ -22,6 +22,10 @@ class TensorcastHiCacheConfig(BaseModel):
     model_id: str = ""
     page_tensor_name: str = "page"
     policy_profile: PolicyProfile = "durable"
+    page_layout_version: str = "v1"
+    batch_exists_timeout_s: float = 30.0
+    batch_transfer_timeout_s: float = 600.0
+    staging_region_ttl_ms: int = 0
 
     @classmethod
     def from_storage_config(

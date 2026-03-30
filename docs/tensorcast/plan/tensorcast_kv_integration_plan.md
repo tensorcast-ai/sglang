@@ -11,14 +11,17 @@ It follows the target semantics frozen in:
 The implementation is intentionally split into:
 
 1. `Phase 1`: shared KV substrate
-2. `Phase 2`: prefix share interface
-3. `Phase 3`: request transfer interface
+2. `Phase 1.5`: byte-artifact-native substrate refactor
+3. `Phase 2`: prefix share interface
+4. `Phase 3`: request transfer interface
 
 This split is the right one for the current codebase because:
 
 - `Phase 1` is the smallest useful data-plane unit,
-- `Phase 2` can be validated entirely inside ordinary SGLang serving with no
-  external controller,
+- `Phase 1.5` is the first performance-critical substrate rewrite, but still
+  stays below request-level programmability,
+- `Phase 2` can still be validated entirely inside ordinary SGLang serving with
+  no external controller,
 - `Phase 3` is the first phase that requires Tensorcast programmability-facing
   API additions and in-process instance-agent work.
 
@@ -45,6 +48,7 @@ This split is the right one for the current codebase because:
   - [ ] Keep this plan file updated as implementation decisions change.
 - [ ] Freeze phase boundaries:
   - [ ] `Phase 1` must not require Tensorcast plan / instance-step changes.
+  - [ ] `Phase 1.5` must preserve the Phase-1 external substrate contract while replacing the hot-path data plane.
   - [ ] `Phase 2` must not require an external controller or request handoff.
   - [ ] `Phase 3` is the only phase allowed to extend Tensorcast request-transfer semantics.
 - [ ] Freeze the Phase-2 success criterion:
@@ -107,6 +111,156 @@ storage backend that can publish and retrieve page data correctly.
 - [x] TP>1 ranks do not key-collide in the shared substrate.
 - [x] No external controller or Tensorcast instance-step logic is required yet.
 
+## Phase 1.5 - Byte-Artifact-Native Substrate Refactor
+
+This phase replaces the current generic artifact `key=` hot path with the real
+byte-artifact-native batch path needed for scalable high-cardinality KV page IO.
+
+It has two parts:
+
+- **Phase 1.5A**
+  - immediate refactor to the current best available Tensorcast path:
+    byte-artifact-native batch IO over reusable GPU staging buffers.
+- **Phase 1.5B**
+  - medium-term follow-up to remove the temporary H2D / D2H staging copies by
+    adding host-native region support and allocator integration.
+
+### Phase 1.5A - Immediate byte-artifact-native batch refactor
+
+- [x] Freeze the refactor contract:
+  - [x] Preserve the existing external SGLang HiCache backend surface:
+    - `batch_exists(...)`
+    - `batch_get_v1(...)`
+    - `batch_set_v1(...)`
+  - [x] Preserve the existing semantic ownership boundary:
+    - SGLang still owns `L1(device) <-> L2(host)`,
+    - Tensorcast still begins at frozen L2 pages.
+  - [x] Preserve page identity compatibility with future request transfer:
+    - one rank-local page shard maps to one byte-artifact identity,
+    - future bundle metadata can continue to point to those page artifact identities.
+- [x] Finalize the byte-artifact identity and invariant schema in code:
+  - [x] Replace the current `key=`-oriented page publication contract with a
+    byte-artifact-native contract centered on:
+    - `artifact_id`
+    - `layout_id`
+    - `byte_length`
+    - payload digest / `PutIfAbsentInvariant`
+  - [x] Make the identity builder explicit and shared by the current hot path so
+    later request-transfer manifest construction can reuse it:
+    - publication,
+    - existence checks,
+    - retrieval.
+  - [x] Keep TP/PP/MLA ownership rules encoded in the same identity scheme.
+- [x] Add a dedicated SGLang-side Tensorcast byte-artifact client/runtime layer:
+  - [x] Separate the hot path from the current generic `tc.Store.put(...)` /
+    tensor fetch implementation.
+  - [x] Reuse persistent daemon client state across batches instead of
+    reconstructing page-local control objects.
+  - [x] Encapsulate byte-artifact RPCs and response decoding behind one backend
+    interface so `TensorcastStore` does not own all protocol details directly.
+- [x] Rebuild the existence path on batch byte-artifact APIs:
+  - [x] Replace per-page generic existence probing with `BatchExists(...)`.
+  - [x] Build canonical `ArtifactSelection` values from page artifact identity.
+  - [x] Preserve the current prefix semantics:
+    - return the longest consecutive hit prefix,
+    - fail closed on malformed or inconsistent batch outcomes.
+- [x] Rebuild the write path on `BatchPutIfAbsentFromRegion(...)`:
+  - [x] Introduce a reusable GPU staging-buffer manager per rank / process.
+  - [x] Define coalesced staging layout rules:
+    - one contiguous staging slice per page shard,
+    - one batch `TargetLayout` covering the whole packed region.
+  - [x] Implement host-page to staging-buffer packing:
+    - collect L2 page shards,
+    - copy or pack them into the coalesced GPU staging region,
+    - preserve deterministic per-item slice mapping.
+  - [x] Implement VRAM-region registration lifecycle:
+    - register once and reuse while the existing capacity is sufficient,
+    - clean up safely on process shutdown or backend reset,
+    - leave explicit host-region support and richer region-lifecycle policy to later Tensorcast work.
+  - [x] Build one `BatchPutIfAbsentFromRegionItem` per page shard with explicit
+    invariant metadata.
+  - [x] Interpret per-item batch outcomes into SGLang batch publication state:
+    - new success,
+    - already exists / adopt duplicate,
+    - hard failure.
+  - [x] Remove the generic outer `exists()+put()` logic from the steady-state
+    publication path.
+- [x] Rebuild the read path on `BatchGetIntoRegion(...)`:
+  - [x] Introduce a reusable GPU staging-buffer manager for retrieval batches.
+  - [x] Pack the target layout for the requested hit span.
+  - [x] Materialize hit pages into GPU staging with one batch get.
+  - [x] Copy or unpack staging slices back into SGLang L2 host-page buffers.
+  - [x] Preserve partial-hit and partial-failure semantics compatible with the
+    current HiCache controller expectations.
+- [x] Clarify daemon-mode behavior:
+  - [x] Support `tensorcast-daemon-mode=share`.
+  - [x] Support `tensorcast-daemon-mode=separate`.
+  - [x] Keep the same byte-artifact identity and publication semantics across
+    both modes even if the internal transport setup differs.
+  - [x] Keep the steady-state Tensorcast backend on the byte-artifact-native path
+    rather than silently mixing generic per-page get/put operations into the hot path.
+- [ ] Strengthen observability for the refactor:
+  - [x] Add timing breakdowns for:
+    - batch exists RPC,
+    - batch put pack / stage-copy / RPC,
+    - batch get pack / RPC / host fill.
+  - [ ] Add timing breakdowns for:
+    - region registration / reuse.
+  - [x] Add counters or cumulative debug stats for:
+    - pages published,
+    - pages adopted as duplicates,
+    - publication failures by outcome class.
+  - [ ] Add counters for:
+    - pages fetched.
+  - [x] Surface enough logging or metrics to explain publication drain time in
+    the benchmark without relying only on indirect log timing.
+- [ ] Add focused correctness tests for the new substrate path:
+  - [x] identity / invariant generation tests,
+  - [ ] coalesced layout packing tests,
+  - [x] storage outcome / duplicate publication tests at the backend layer,
+  - [x] partial retrieval / partial hit tests,
+  - [ ] region lifecycle tests where feasible.
+- [x] Add benchmark-driven validation for the refactor:
+  - [x] rerun `share_local` in `share` mode,
+  - [x] rerun `share_local` in `separate` mode,
+  - [x] compare source publication drain and TTFT deltas before and after the
+    refactor,
+  - [x] confirm prefix reuse signals still come from real page-hash-based hits.
+
+### Phase 1.5B - Medium-term host-native substrate path
+
+- [ ] Design the Tensorcast core extension needed to remove GPU staging:
+  - [ ] Add host-capable region registration such as
+    `RegisterRegion(memory_kind=VRAM|HOST_SHARED)` or equivalent.
+  - [ ] Extend batch byte-artifact ingress/egress so region-backed batch IO can
+    target host-shared regions, not only VRAM regions.
+  - [ ] Preserve the same byte-artifact identity and invariant contract so this
+    becomes a transport upgrade, not a semantic redesign.
+- [ ] Design the SGLang allocator integration:
+  - [ ] Add a Tensorcast-aware host allocator for `HostKVCache`.
+  - [ ] Make L2 pages allocatable directly from Tensorcast-shareable host memory.
+  - [ ] Keep the current HiCache ownership model intact:
+    - SGLang still owns the host pool,
+    - Tensorcast only gains a shareable transport boundary.
+- [ ] Define the migration path from GPU staging to host-native batch IO:
+  - [ ] keep the Phase-1.5A path as the first shippable implementation,
+  - [ ] introduce host-native mode behind an explicit backend capability check,
+  - [ ] remove temporary H2D / D2H staging only after host-native correctness
+    and performance are verified.
+
+### Phase 1.5 Exit Criteria
+
+- [x] The prefix-share hot path no longer relies on generic per-page
+  `tc.Store.put(...)` / CPU tensor fetch for steady-state batch IO.
+- [x] `batch_exists(...)`, `batch_get_v1(...)`, and `batch_set_v1(...)` all use
+  byte-artifact-native batch semantics.
+- [x] The benchmark remains functional in both `share` and `separate` daemon
+  modes after the refactor.
+- [x] The refactor produces enough observability to explain substrate
+  publication and retrieval cost at the batch level.
+- [x] The medium-term host-native direction is captured as an explicit follow-up
+  under the same phase, not as an undocumented idea.
+
 ## Phase 2 - Prefix Share Interface and Benchmark Bring-up
 
 This phase turns the shared substrate into a real prefix-share path and makes
@@ -166,26 +320,28 @@ the `share_local` benchmark the primary validation harness.
 
 Current validation note:
 
-- Validated run:
-  - `benchmark/tensorcast_benchmark/kv/share_local/outputs/20260324-213808_tensorcast_tp2_pairs1`
-- Validation shape:
+- Validated runs:
+  - `benchmark/tensorcast_benchmark/kv/share_local/outputs/20260330-114615_tensorcast_tp2_pairs1`
+    - `tensorcast-daemon-mode=share`
+  - `benchmark/tensorcast_benchmark/kv/share_local/outputs/20260330-184418_tensorcast_tp2_pairs1`
+    - `tensorcast-daemon-mode=separate`
+- Common validation shape:
   - `Qwen3-32B`
   - `tp=2`
   - same-node two-instance topology
   - dataset `LongBench/hotpotqa.jsonl`
   - `max_prompt_chars=35000`
-  - `--extra-server-args "--log-level debug --log-requests"`
+  - `--extra-server-args "--page-size 32 --log-level debug"`
 - Source-side publication for the measured prompt is confirmed by repeated
-  `stable_dram upload` lines in instance-A logs during the formal request
-  window.
+  `Tensorcast batch_set_v1 ... cumulative_pages=365` lines in instance-A logs.
 - Target-side reuse for the same measured prompt is confirmed in instance-B
   logs by:
-  - `HiCache storage hit query ... hit_tokens=65`
-  - `Prefetching 65 pages for request ...`
-  - repeated `Artifact loaded ...`
-- The benchmark-level TTFT summary for this run also shows lower TTFT on
-  instance B (`67.75 ms` improvement), but the primary proof of prefix reuse is
-  the request-scoped HiCache/storage log sequence above.
+  - `HiCache storage hit query ... hit_tokens=11680 queried_pages=365`
+  - `Prefetching 365 pages for request ...`
+  - repeated `Tensorcast batch_get_v1 pages=128 succeeded=128`
+- TTFT remains workload- and topology-sensitive in these runs, so the primary
+  proof of prefix reuse is the request-scoped HiCache/storage log sequence
+  above rather than any single positive TTFT delta.
 - `meta_info.cached_tokens` remains `0` in this flow and must not be used as
   the proof signal for shared-substrate reuse.
 - The explicit benchmark `rid` is only a correlation label for logs and result
@@ -301,8 +457,11 @@ inference.
 
 The most important implementation boundary is:
 
-- `Phase 1` and `Phase 2` should be primarily SGLang changes.
-- `Phase 3` is where Tensorcast core API changes become necessary.
+- `Phase 1` stayed primarily in the SGLang repo.
+- `Phase 1.5` required Tensorcast daemon/runtime work for byte-artifact batch
+  transport and performance, in addition to the SGLang-side backend.
+- `Phase 3` is where Tensorcast programmability-facing request-transfer API
+  changes still become necessary.
 
 ### SGLang files to modify
 
@@ -330,24 +489,41 @@ The most important implementation boundary is:
 - `sglang/benchmark/tensorcast_benchmark/kv/share_local/configs/global_store_config.yaml`
 - `sglang/benchmark/tensorcast_benchmark/kv/share_local/configs/store_daemon_config.yaml`
 
-### New SGLang files likely needed
+### SGLang files already added for Phase 1 / Phase 1.5 / Phase 2
 
 - `sglang/python/sglang/srt/mem_cache/storage/tensorcast_store/__init__.py`
 - `sglang/python/sglang/srt/mem_cache/storage/tensorcast_store/tensorcast_store.py`
 - `sglang/python/sglang/srt/mem_cache/storage/tensorcast_store/config.py`
 - `sglang/python/sglang/srt/mem_cache/storage/tensorcast_store/client.py`
+- `sglang/python/sglang/srt/mem_cache/storage/tensorcast_store/test_tensorcast_store.py`
+- `sglang/benchmark/tensorcast_benchmark/kv/share_local/scripts/tensorcast_service.sh`
+
+### New SGLang files still likely needed for Phase 3
+
 - `sglang/python/sglang/srt/tensorcast/instance_agent.py`
 - `sglang/python/sglang/srt/tensorcast/coordinator.py`
 - `sglang/python/sglang/srt/tensorcast/engine_adapter.py`
 - `sglang/python/sglang/srt/tensorcast/page_publication_registry.py`
 - `sglang/python/sglang/srt/tensorcast/request_bundle_state.py`
-- `sglang/benchmark/tensorcast_benchmark/kv/share_local/scripts/tensorcast_service.sh`
 
 ### Tensorcast files to modify
 
-These are primarily Phase-3 changes. Phase 1 and Phase 2 should try to reuse
-existing Tensorcast data-plane/runtime surfaces and only touch core code for
-real bugs or missing primitives.
+These are split into two categories:
+
+- Phase 1.5 / Phase 2 already required Tensorcast daemon/runtime changes for
+  byte-artifact batch transport and performance.
+- Phase 3 is where request-transfer programmability APIs still need to change.
+
+Representative Tensorcast Phase-1.5 / Phase-2 areas are:
+
+- `tensorcast/proto/daemon/v2/store_daemon.proto`
+- `tensorcast/daemon/service/controllers/byte_artifact_controller.cc`
+- `tensorcast/daemon/service/payload_transport/payload_transport_broker.cc`
+- `tensorcast/core/store/runtime/ingestion/`
+- `tensorcast/core/store/materialization/dataplane/sources/`
+- `tensorcast/daemon/service/routing/`
+
+Phase-3 request-transfer areas remain:
 
 - `tensorcast/proto/tensorcast/plan/v1/plan.proto`
 - `tensorcast/proto/tensorcast/node_agent/v1/node_agent.proto`

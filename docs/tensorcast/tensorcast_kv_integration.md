@@ -12,13 +12,21 @@ Protocol vs design split:
   internally to realize those semantics.
 
 Status:
-- This is a design target for the upcoming KV integration work.
-- It is intentionally aligned with current Tensorcast programmability
-  capabilities and current SGLang HiCache architecture.
+- This document now mixes two states:
+  - the currently implemented prefix-share substrate in this repo,
+  - and the still-target request-transfer design that is not implemented yet.
+- Implemented today in the SGLang repo:
+  - `python/sglang/srt/mem_cache/storage/tensorcast_store/`
+  - byte-artifact-native `batch_exists(...)`
+  - byte-artifact-native `batch_set_v1(...)`
+  - byte-artifact-native `batch_get_v1(...)`
+  - `benchmark/tensorcast_benchmark/kv/share_local` automation for
+    `tensorcast-daemon-mode=share|separate`, explicit benchmark `rid`, and
+    source-publication-drain tracking
 - Current Tensorcast core already exposes the legacy request-transfer surface
   `publish(engine_request_id=...)`, `hydrate(engine_request_id=...)`,
   `evict_local(...)`, and generic `ManifestResult`.
-- The target SGLang KV design additionally requires
+- Not implemented yet, and still required for request transfer:
   `PublishResult.publish_manifest`, opaque `EngineOwnedManifest`, and
   `hydrate(publish_manifest=...)`. Those surfaces are not implemented in
   Tensorcast core today and must be added as part of the KV integration work.
@@ -431,13 +439,17 @@ This is a semantic contract, not a requirement that the hottest path must
 literally instantiate Python objects page-by-page.
 
 The implementation MAY use lower-level Tensorcast region-based fast paths such
-as host / region `put-if-absent` and region `get-into` operations, provided the
+as batch region `put-if-absent` and region `get-into` operations, provided the
 result still obeys the same contract:
 
 - one page shard maps to one byte-artifact identity,
 - publication is content-checked and deduplicated at that artifact identity,
 - bundle metadata refers to those page artifact identities rather than to opaque
   engine-private buffers.
+
+For the current Tensorcast core, the high-throughput batch region path is
+VRAM-region-backed; host-region support is a medium-term extension rather than a
+current assumption.
 
 #### 4.2.2 Data-path graph for one page shard
 
@@ -472,6 +484,189 @@ flowchart RL
     B -->|"fill host page buffer"| C
     C -->|"load_back when SGLang decides"| D
 ```
+
+#### 4.2.4 v1 short-term implementation: byte-artifact-native substrate over GPU staging
+
+This is the current implementation strategy in the SGLang repo:
+
+- `batch_exists(...)` uses Tensorcast `BatchExists(...)`,
+- `batch_set_v1(...)` uses `BatchPutIfAbsentFromRegion(...)`,
+- `batch_get_v1(...)` uses `BatchGetIntoRegion(...)`,
+- reusable per-rank VRAM staging regions are managed inside
+  `tensorcast_store/client.py`,
+- and the steady-state prefix-share path no longer goes through generic
+  `tc.Store.put(..., key=...)` / tensor fetch APIs.
+
+For the immediate implementation, the shared substrate SHOULD be
+byte-artifact-native end-to-end:
+
+- page existence is checked by byte-artifact identity,
+- page publication is performed by byte-artifact put-if-absent,
+- page retrieval is performed by byte-artifact get-into,
+- and prefix/request metadata refers to page artifact identities rather than to
+  Tensor-valued `key=` artifacts.
+
+However, the current Tensorcast batch region APIs impose an important
+implementation constraint:
+
+- `BatchPutIfAbsentFromRegion(...)` and `BatchGetIntoRegion(...)` are the
+  intended high-throughput batch byte-artifact data path,
+- but today they accept only VRAM-backed registered regions,
+- not host/L2 buffers directly.
+
+Therefore the first production-oriented SGLang integration SHOULD use:
+
+- **host/L2 pages as the semantic ownership boundary**, and
+- **reusable GPU staging buffers as the transport scratch boundary**.
+
+This means:
+
+- SGLang still decides when a page becomes backup-eligible and when a host page
+  is admissible,
+- Tensorcast still stores one page shard as one byte artifact,
+- but the hottest batch ingress/egress path temporarily uses:
+  - `host page -> H2D into coalesced GPU staging region -> Tensorcast batch RPC`
+  - `Tensorcast batch RPC -> GPU staging region -> D2H into host page`
+
+The GPU staging buffer is therefore a transport adapter, not a semantic change
+to the substrate boundary.
+
+The short-term implementation SHOULD NOT treat the following as the steady-state
+hot path for prefix share:
+
+- generic `tc.Store.put(..., key=...)` / `artifact(key=...).tensor(...)`,
+- `HomeBatchPutIfAbsent(...)`,
+- `HomeBatchGet(...)`.
+
+Those paths remain useful for fallback, bring-up, and debugging, but they are
+not the intended high-cardinality page IO path because they operate through
+payload bodies rather than through client-owned region-backed batch transfer.
+
+#### 4.2.5 v1 short-term write path
+
+For one publication batch, the recommended write-side flow is:
+
+1. SGLang offloads or backs up mutable L1 device KV into stable L2 host pages.
+2. The Tensorcast-backed backend selects one ordered batch of rank-local page
+   shards to publish.
+3. For each page shard, the backend derives:
+   - byte-artifact `artifact_id`,
+   - `layout_id`,
+   - byte length,
+   - payload digest / invariant contract.
+4. The backend packs those pages into one coalesced GPU staging buffer with one
+   contiguous slice per page shard.
+5. The backend reuses or recreates a registered VRAM region for that staging
+   buffer.
+6. The backend issues one `BatchPutIfAbsentFromRegion(...)` call with:
+   - one item per page shard,
+   - one coalesced `source_layout`,
+   - explicit per-item invariants.
+7. Per-item outcomes update the SGLang-side batch publication result:
+   - `ready` for newly published or already-existing pages,
+   - `failed` for publication errors.
+
+In the current prefix-share implementation, this is realized as the
+`batch_set_v1(...)` success mask plus duplicate/failure accounting rather than
+as the full Phase-3 request-bundle publication registry.
+
+Duplicate publication SHOULD be handled at the byte-artifact level:
+
+- the backend does not need a per-page generic `exists()+put()` sequence,
+- the batch put-if-absent response itself is the authority on
+  absent/already-present/conflict outcomes.
+
+```mermaid
+flowchart LR
+    A["SGLang host pages<br/>(rank-local L2 shards)"]
+    B["Derive artifact_id / layout_id / invariant"]
+    C["Pack coalesced GPU staging buffer"]
+    D["Register or reuse VRAM region"]
+    E["BatchPutIfAbsentFromRegion<br/>one item per page shard"]
+    F["Tensorcast byte-artifact pool"]
+    G["SGLang batch publication state"]
+
+    A --> B
+    B --> C
+    C -->|"H2D"| D
+    D --> E
+    E -->|"put-if-absent outcomes"| F
+    E --> G
+```
+
+#### 4.2.6 v1 short-term read path
+
+For one retrieval batch, the recommended read-side flow is:
+
+1. SGLang computes the ordered candidate page identities for the request or
+   prefix continuation.
+2. The backend uses `BatchExists(...)` to determine the consecutive hit span.
+3. The backend allocates or reuses a coalesced GPU staging buffer large enough
+   for the hit span.
+4. The backend issues `BatchGetIntoRegion(...)` so Tensorcast materializes the
+   hit pages directly into the staging region.
+5. The backend copies each resolved page slice from GPU staging back into the
+   target L2 host pages.
+6. SGLang inserts those host pages into its radix-tree / host-cache structures
+   and later decides whether to load them back to L1 device memory.
+
+This preserves the v1 ownership rule:
+
+- Tensorcast does not mutate live L1 KV state directly for prefix share,
+- the retrieval result becomes visible to SGLang first as host/L2 pages.
+
+```mermaid
+flowchart LR
+    A["Ordered page artifact_ids"]
+    B["BatchExists<br/>find consecutive hit span"]
+    C["Allocate / reuse GPU staging buffer"]
+    D["BatchGetIntoRegion<br/>materialize hit pages"]
+    E["D2H copy into host/L2 page buffers"]
+    F["Insert into HiRadixCache / host cache"]
+    G["Optional later load_back host->device"]
+
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    E --> F
+    F --> G
+```
+
+#### 4.2.7 Medium-term plan: host-native region registration and allocator
+
+The short-term GPU staging path is a practical consequence of the current
+Tensorcast region API, not the desired final substrate shape.
+
+The medium-term direction SHOULD be:
+
+- Tensorcast adds a generalized region-registration surface such as
+  `RegisterRegion(memory_kind=VRAM|HOST_SHARED)` or equivalent,
+- Tensorcast batch byte-artifact region RPCs accept host-shared regions in
+  addition to VRAM regions,
+- SGLang adds a Tensorcast-aware host allocator for `HostKVCache`, analogous in
+  spirit to the existing Mooncake host allocator integration,
+- L2 pages are allocated directly from Tensorcast-shareable host memory rather
+  than from ordinary pinned host memory,
+- the byte-artifact identity, layout, invariant, and metadata layers remain
+  unchanged.
+
+With that medium-term shape, the data path becomes:
+
+- write side:
+  - `host/L2 page -> host shared region -> BatchPutIfAbsentFromRegion`
+- read side:
+  - `BatchGetIntoRegion -> host shared region / host page`
+
+So the extra `H2D` and `D2H` transport copies disappear without moving the
+semantic publication boundary away from SGLang's existing host/L2 layer.
+
+This medium-term plan is explicitly future work:
+
+- it requires Tensorcast core changes,
+- it requires an SGLang allocator integration change,
+- and it is not a blocker for the immediate byte-artifact-native benchmark
+  bring-up.
 
 ### 4.3 Relationship to current SGLang hashing
 
@@ -804,6 +999,15 @@ The reason is pragmatic:
   architecture,
 - preserves the existing `HiCacheController` / host-pool scheduling model,
 - and matches the existing Mooncake-like storage backend contract.
+
+Under the current Tensorcast byte-artifact fast-path constraints, the first
+implementation MAY still use reusable GPU staging buffers internally for batch
+publication and retrieval. That does not change the memory-hierarchy contract:
+
+- SGLang still owns `L1 <-> L2`,
+- Tensorcast still owns `L2 <-> distributed pool`,
+- GPU staging is only a temporary transport scratch path until host-native
+  region registration exists.
 
 Tensorcast GPU fast paths such as CUDA-IPC-backed mapped-target materialization
 remain valuable, but they should be treated as later optimizations or
@@ -1809,8 +2013,10 @@ either:
 
 The main gaps are:
 
-- a public page-store-style batch API tailored for high-cardinality KV page IO,
-- an existing Tensorcast-backed HiCache storage implementation,
+- a stable public page-store-style batch API tailored for high-cardinality KV
+  page IO, rather than today’s lower-level byte-artifact batch-region surfaces,
+- host-native batch region registration for byte-artifact ingress/egress,
+- a Tensorcast-aware SGLang host allocator for L2 page residency,
 - explicit public prefix-bundle programmability,
 - `PublishResult.publish_manifest`,
 - opaque `EngineOwnedManifest` carriage in the instance-step result path,
@@ -1831,20 +2037,41 @@ Because of these gaps, the recommended implementation strategy is:
 
 ## 9) Recommended Implementation Order
 
-### 9.1 Phase 1: shared substrate + prefix-share backend
+### 9.1 Phase 1: shared substrate
+
+Implemented in the current repo:
 
 Implement:
 
 - the shared SGLang-side Tensorcast KV runtime,
-- page publication/retrieval,
-- a Tensorcast-backed prefix-share backend compatible with
-  `HiCacheController`.
+- page publication/retrieval.
 
 Goal:
 
 - make Tensorcast usable as the distributed KV pool for prefix share.
 
-### 9.2 Phase 2: request-level EngineAdapter
+### 9.2 Phase 1.5 + Phase 2: byte-artifact-native prefix share and benchmark bring-up
+
+Implemented in the current repo:
+
+Implement:
+
+- the byte-artifact-native batch `exists/get/set` path over VRAM staging,
+- the `share_local` Tensorcast benchmark harness,
+- `tensorcast-daemon-mode=share`,
+- `tensorcast-daemon-mode=separate`,
+- explicit benchmark `rid`,
+- source-publication-drain measurement,
+- and log-based validation of real HiCache prefix reuse.
+
+Goal:
+
+- make the Tensorcast backend a real SGLang prefix-share backend rather than a
+  placeholder topology harness.
+
+### 9.3 Phase 3: request-level EngineAdapter
+
+Still target design; not implemented yet:
 
 Implement:
 
@@ -1872,7 +2099,7 @@ Optional controller-side helper work, if we decide to keep a convenience
 target-instance runtime and simply resolve a cached `PublishManifest` before
 emitting the canonical remote `hydrate(publish_manifest=...)` plan.
 
-### 9.3 Phase 3: optional programmable prefix bundle operations
+### 9.4 Future optional programmable prefix bundle operations
 
 If useful later, add coarse-grained programmability for prefix bundles, such as:
 
