@@ -151,6 +151,17 @@ It has two parts:
     - existence checks,
     - retrieval.
   - [x] Keep TP/PP/MLA ownership rules encoded in the same identity scheme.
+  - [x] Strengthen the canonical logical-page identity recipe before Phase 3:
+    - add `model_version` or served checkpoint revision,
+    - require `layout_id` to encode dtype and page size explicitly,
+    - keep TP / PP shard ownership in `engine_key`,
+    - and forbid run-local values such as `run_id` or `daemon_id`.
+  - [x] Add explicit byte-artifact verification-mode support for engine-owned
+    logical KV pages:
+    - keep strict payload-digest mode as the generic default,
+    - add `LAYOUT_AND_SIZE_ONLY` for SGLang logical page identities,
+    - and document that repeated logical-page `put` is first-writer-wins rather
+      than upsert.
 - [x] Add a dedicated SGLang-side Tensorcast byte-artifact client/runtime layer:
   - [x] Separate the hot path from the current generic `tc.Store.put(...)` /
     tensor fetch implementation.

@@ -203,6 +203,7 @@ class TensorcastStoreTest(unittest.TestCase):
 
         self.assertEqual(store._tensorcast_config.namespace, "json-test")
         self.assertEqual(store._tensorcast_config.model_id, "Qwen3-32B")
+        self.assertEqual(store._tensorcast_config.model_version, "Qwen3-32B")
 
     def test_tensorcast_store_layout_and_rank_suffix_for_mha(self) -> None:
         store = TensorcastStore(

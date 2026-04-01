@@ -20,6 +20,7 @@ class TensorcastHiCacheConfig(BaseModel):
     namespace: str = "sglang_hicache"
     engine: str = "sglang"
     model_id: str = ""
+    model_version: str = ""
     page_tensor_name: str = "page"
     policy_profile: PolicyProfile = "durable"
     page_layout_version: str = "v1"
@@ -41,5 +42,9 @@ class TensorcastHiCacheConfig(BaseModel):
         model_id = str(payload.get("model_id", "")).strip()
         if not model_id and storage_config.model_name:
             model_id = str(storage_config.model_name)
+        model_version = str(payload.get("model_version", "")).strip()
+        if not model_version:
+            model_version = "default"
         payload["model_id"] = model_id
+        payload["model_version"] = model_version
         return cls.model_validate(payload)

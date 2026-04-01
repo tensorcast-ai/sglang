@@ -232,6 +232,8 @@ class DefaultTensorcastPageClient:
         self._layout_id = _compact_cgid_segment(layout_id, prefix="ly")
         self._namespace = _compact_cgid_segment(config.namespace, prefix="ns")
         self._engine = _compact_cgid_segment(config.engine, prefix="en")
+        self._model_id = str(config.model_id)
+        self._model_version = str(config.model_version)
         self._engine_key_prefix = str(engine_key_prefix)
         self._artifact_id_cache: dict[str, str] = {}
         self._selection_cache: dict[str, object] = {}
@@ -263,6 +265,15 @@ class DefaultTensorcastPageClient:
             get_cuda_memory_handle=get_cuda_memory_handle,
             get_cuda_memory_handle_with_offset=get_cuda_memory_handle_with_offset,
         )
+        logger.info(
+            "Tensorcast page client configured verification_mode=%s namespace=%s engine=%s layout_id=%s model_id=%s model_version=%s",
+            "BYTE_ARTIFACT_VERIFICATION_MODE_LAYOUT_AND_SIZE_ONLY",
+            self._namespace,
+            self._engine,
+            self._layout_id,
+            self._model_id,
+            self._model_version,
+        )
         atexit.register(self.close)
 
     def close(self) -> None:
@@ -276,7 +287,8 @@ class DefaultTensorcastPageClient:
         artifact_id = self._build_byte_artifact_cgid(
             namespace=self._namespace,
             engine=self._engine,
-            model_id=self._config.model_id,
+            model_id=self._model_id,
+            model_version=self._model_version,
             layout_id=self._layout_id,
             engine_key=_engine_key_payload(self._engine_key_prefix, logical_key),
         )
@@ -345,22 +357,13 @@ class DefaultTensorcastPageClient:
                 host_fill_elapsed_s=0.0,
             )
         pack_started_at = time.perf_counter()
-        packed_pages: list[tuple[str, str, torch.Tensor, int, str]] = []
+        packed_pages: list[tuple[str, str, torch.Tensor, int]] = []
         total_bytes = 0
         for logical_key, page in zip(logical_keys, pages, strict=True):
             artifact_id = self.artifact_id_for(logical_key)
             page_bytes = _cpu_tensor_as_uint8_view(page)
             byte_length = int(page_bytes.numel())
-            digest_hex = hashlib.sha256(memoryview(page_bytes.numpy())).hexdigest()
-            packed_pages.append(
-                (
-                    logical_key,
-                    artifact_id,
-                    page_bytes,
-                    byte_length,
-                    digest_hex,
-                )
-            )
+            packed_pages.append((logical_key, artifact_id, page_bytes, byte_length))
             total_bytes += byte_length
         pack_elapsed_s = time.perf_counter() - pack_started_at
         staging = self._put_staging.ensure_capacity(total_bytes)
@@ -378,7 +381,7 @@ class DefaultTensorcastPageClient:
         items = []
         stage_started_at = time.perf_counter()
         cursor = 0
-        for _, artifact_id, page_bytes, byte_length, digest_hex in packed_pages:
+        for _, artifact_id, page_bytes, byte_length in packed_pages:
             staging.tensor[cursor : cursor + byte_length].copy_(
                 page_bytes,
                 non_blocking=True,
@@ -393,8 +396,9 @@ class DefaultTensorcastPageClient:
                 invariant=self._store_daemon_pb2.PutIfAbsentInvariant(
                     layout_id=self._layout_id,
                     byte_length=int(byte_length),
-                    payload_digest_alg="sha256",
-                    payload_digest_hex=digest_hex,
+                    verification_mode=(
+                        self._store_daemon_pb2.BYTE_ARTIFACT_VERIFICATION_MODE_LAYOUT_AND_SIZE_ONLY
+                    ),
                 ),
             )
             items.append(item)
@@ -420,7 +424,7 @@ class DefaultTensorcastPageClient:
         )
         success_mask: list[bool] = []
         adopted_duplicate_count = 0
-        for _, artifact_id, _, _, _ in packed_pages:
+        for _, artifact_id, _, _ in packed_pages:
             outcome = outcome_by_artifact.get(artifact_id)
             status = int(outcome.status) if outcome is not None else 0
             if status == ok_status:
@@ -439,16 +443,20 @@ class DefaultTensorcastPageClient:
         }
         if failed_statuses:
             failure_messages = []
+            invariant_mismatch_detected = False
             for artifact_id, outcome in outcome_by_artifact.items():
                 status = int(outcome.status)
                 if status == ok_status:
                     continue
+                if "invariant mismatch" in str(outcome.message).lower():
+                    invariant_mismatch_detected = True
                 failure_messages.append(
                     f"{artifact_id}:{self._store_daemon_pb2.BatchItemStatus.Name(status)}:{outcome.message}"
                 )
                 if len(failure_messages) >= 3:
                     break
-            logger.debug(
+            log_fn = logger.warning if invariant_mismatch_detected else logger.debug
+            log_fn(
                 "Tensorcast batch_put failures statuses=%s first_key=%s first_artifact_id=%s samples=%s",
                 failed_statuses,
                 logical_keys[0],

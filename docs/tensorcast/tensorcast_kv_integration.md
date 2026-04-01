@@ -377,11 +377,30 @@ Each page artifact SHOULD use:
 The exact naming scheme is integration-owned, but the artifact identity input
 SHOULD be derived from:
 
-- page hash or equivalent content-derived identity,
+- the engine-owned logical page identity rather than from payload bytes,
 - model / KV layout family,
+- model version or served checkpoint revision,
 - page size,
 - dtype / encoding contract,
 - and rank-local shard qualifiers such as TP / PP ownership when required.
+
+For SGLang KV pages, the recommended recipe is:
+
+- `artifact_id = cgid:byte_artifact~<namespace>~sglang~<model_id_enc>~<model_version_enc>~<layout_id>~<engine_key_enc>`
+- `layout_id` MUST version the byte-level page format and MUST encode:
+  - layout family,
+  - attention family,
+  - dtype,
+  - page size,
+  - and any explicit serialization-version bump,
+- `engine_key_enc` MUST encode:
+  - the logical page key derived from SGLang token-page hashing,
+  - plus TP / PP shard qualifiers,
+- `artifact_id` MUST NOT include run-local identity such as:
+  - `run_id`,
+  - `instance_id`,
+  - `daemon_id`,
+  - or host identity.
 
 The `layout_id` SHOULD version the byte-level page format so that:
 
@@ -443,9 +462,24 @@ as batch region `put-if-absent` and region `get-into` operations, provided the
 result still obeys the same contract:
 
 - one page shard maps to one byte-artifact identity,
-- publication is content-checked and deduplicated at that artifact identity,
+- publication is deduplicated at that artifact identity under the declared join
+  mode,
 - bundle metadata refers to those page artifact identities rather than to opaque
   engine-private buffers.
+
+For SGLang KV pages, the recommended join mode is:
+
+- `BYTE_ARTIFACT_VERIFICATION_MODE_LAYOUT_AND_SIZE_ONLY`
+
+This means:
+
+- the routed join key is `{artifact_id, layout_id, byte_length}`,
+- payload digests are optional debug or observability metadata rather than join
+  truth,
+- repeated publication of the same logical page is first-writer-wins or
+  adopt-existing,
+- and `batch_set_v1(...)` MUST NOT be interpreted as upsert for an already
+  published logical page.
 
 For the current Tensorcast core, the high-throughput batch region path is
 VRAM-region-backed; host-region support is a medium-term extension rather than a
@@ -553,7 +587,9 @@ For one publication batch, the recommended write-side flow is:
    - byte-artifact `artifact_id`,
    - `layout_id`,
    - byte length,
-   - payload digest / invariant contract.
+   - `PUT_IF_ABSENT` verification mode,
+   - and optional payload digest metadata when enabled for debugging or
+     observability.
 4. The backend packs those pages into one coalesced GPU staging buffer with one
    contiguous slice per page shard.
 5. The backend reuses or recreates a registered VRAM region for that staging
@@ -575,6 +611,16 @@ Duplicate publication SHOULD be handled at the byte-artifact level:
 - the backend does not need a per-page generic `exists()+put()` sequence,
 - the batch put-if-absent response itself is the authority on
   absent/already-present/conflict outcomes.
+
+For SGLang KV pages, duplicate publication semantics are intentionally:
+
+- first-writer-wins within the current routed home epoch,
+- never last-writer-wins,
+- and never implicit upsert.
+
+If an engine flow later needs rewrite or repair semantics, it MUST use an
+explicit overwrite or delete-and-reissue path rather than another logical-page
+`put-if-absent`.
 
 ```mermaid
 flowchart LR
