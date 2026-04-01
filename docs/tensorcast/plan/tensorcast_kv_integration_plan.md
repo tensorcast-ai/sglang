@@ -13,7 +13,8 @@ The implementation is intentionally split into:
 1. `Phase 1`: shared KV substrate
 2. `Phase 1.5`: byte-artifact-native substrate refactor
 3. `Phase 2`: prefix share interface
-4. `Phase 3`: request transfer interface
+4. `Phase 2.5`: host-native CPU-region path
+5. `Phase 3`: request transfer interface
 
 This split is the right one for the current codebase because:
 
@@ -22,6 +23,9 @@ This split is the right one for the current codebase because:
   stays below request-level programmability,
 - `Phase 2` can still be validated entirely inside ordinary SGLang serving with
   no external controller,
+- `Phase 2.5` extends the same prefix-share path with `HOST_SHARED` local
+  regions and allocator-backed host residency, but still requires no external
+  controller,
 - `Phase 3` is the first phase that requires Tensorcast programmability-facing
   API additions and in-process instance-agent work.
 
@@ -50,6 +54,7 @@ This split is the right one for the current codebase because:
   - [ ] `Phase 1` must not require Tensorcast plan / instance-step changes.
   - [ ] `Phase 1.5` must preserve the Phase-1 external substrate contract while replacing the hot-path data plane.
   - [ ] `Phase 2` must not require an external controller or request handoff.
+  - [ ] `Phase 2.5` must stay within the existing prefix-share hot path while replacing the local SGLang <-> daemon memory boundary.
   - [ ] `Phase 3` is the only phase allowed to extend Tensorcast request-transfer semantics.
 - [ ] Freeze the Phase-2 success criterion:
   - [ ] `benchmark/tensorcast_benchmark/kv/share_local` must run with
@@ -240,24 +245,15 @@ It has two parts:
 
 ### Phase 1.5B - Medium-term host-native substrate path
 
-- [ ] Design the Tensorcast core extension needed to remove GPU staging:
-  - [ ] Add host-capable region registration such as
-    `RegisterRegion(memory_kind=VRAM|HOST_SHARED)` or equivalent.
-  - [ ] Extend batch byte-artifact ingress/egress so region-backed batch IO can
-    target host-shared regions, not only VRAM regions.
-  - [ ] Preserve the same byte-artifact identity and invariant contract so this
-    becomes a transport upgrade, not a semantic redesign.
-- [ ] Design the SGLang allocator integration:
-  - [ ] Add a Tensorcast-aware host allocator for `HostKVCache`.
-  - [ ] Make L2 pages allocatable directly from Tensorcast-shareable host memory.
-  - [ ] Keep the current HiCache ownership model intact:
-    - SGLang still owns the host pool,
-    - Tensorcast only gains a shareable transport boundary.
-- [ ] Define the migration path from GPU staging to host-native batch IO:
-  - [ ] keep the Phase-1.5A path as the first shippable implementation,
-  - [ ] introduce host-native mode behind an explicit backend capability check,
-  - [ ] remove temporary H2D / D2H staging only after host-native correctness
-    and performance are verified.
+- [x] Freeze the medium-term direction:
+  - [x] remove GPU staging via `HOST_SHARED` region-backed batch IO,
+  - [x] preserve the byte-artifact identity and invariant contract,
+  - [x] reuse the same daemon-exported slab mechanism for both Phase A and Phase
+    B.
+- [x] Move the executable implementation plan into `Phase 2.5`:
+  - [x] `Phase 2.5A` now tracks Phase-A host staging on `HOST_SHARED`,
+  - [x] `Phase 2.5B` now tracks Phase-B allocator-backed zero-copy host
+    residency.
 
 ### Phase 1.5 Exit Criteria
 
@@ -359,6 +355,354 @@ Current validation note:
   rows. The actual HiCache reuse decision is driven by token-prefix/page-hash
   identity, which is why the benchmark must send the exact same prompt text to
   both instances.
+
+## Phase 2.5 - Host-Native CPU-Region Path
+
+This phase removes the temporary GPU staging dependency from the Tensorcast
+HiCache backend by extending the same region-backed batch API family to
+`HOST_SHARED` and then binding SGLang L2 host residency directly onto that
+exported slab model.
+
+It has two parts:
+
+- **Phase 2.5A**
+  - bring up the shared `HOST_SHARED` slab mechanism and use it as a persistent
+    host staging surface.
+- **Phase 2.5B**
+  - bind `HostKVCache` directly to allocator-managed exported slabs so L2 pages
+    live in Tensorcast-shareable host memory with slot-generation protection.
+
+Validation cadence for this phase is milestone-gated:
+
+- the first layer is Tensorcast unit/integration testing tied to internal
+  milestones `M0` through `M4`,
+- the second layer is SGLang end-to-end validation via
+  `benchmark/tensorcast_benchmark/kv/share_local/run_benchmark.py`,
+- do not defer all validation to the end of Phase 2.5; each milestone should be
+  exercised as soon as the corresponding code path is wired.
+
+Milestone definitions used below:
+
+- `M0`
+  - **What it is**:
+    the generic local-region substrate needed for host slabs.
+  - **What must be true when it is complete**:
+    a local client can register or attach a long-lived `HOST_SHARED` slab,
+    obtain a lease-scoped region handle, keep it alive, and release it cleanly.
+  - **What it does not include yet**:
+    batch byte-artifact put/get on `HOST_SHARED`.
+- `M1`
+  - **What it is**:
+    `BatchPutIfAbsentFromRegion(HOST_SHARED source)` correctness.
+  - **What must be true when it is complete**:
+    the local daemon can read bytes from a validated `HOST_SHARED` source layout
+    and publish byte artifacts with the same per-item semantics as the existing
+    `VRAM` path.
+  - **What it does not include yet**:
+    `HOST_SHARED` target materialization or allocator-backed direct residency.
+- `M2`
+  - **What it is**:
+    `BatchGetIntoRegion(HOST_SHARED target)` correctness.
+  - **What must be true when it is complete**:
+    the local daemon can materialize hits directly into a validated
+    `HOST_SHARED` target region, which is enough to switch SGLang from GPU
+    staging to Phase-A host staging.
+  - **What it does not include yet**:
+    allocator slot generation, direct L2 residency, or CPU-source direct RDMA
+    on the put path.
+- `M3`
+  - **What it is**:
+    allocator-backed slot lifetime correctness for Phase B.
+  - **What must be true when it is complete**:
+    SGLang can reserve, pin, validate, retire, and recycle exported slab slots
+    with `generation` protection, and stale completions cannot resurrect or
+    corrupt reused slots.
+  - **What it does not include yet**:
+    optional host pinning via `cudaHostRegister(...)`.
+- `M4`
+  - **What it is**:
+    host registration attach or detach plus fallback policy.
+  - **What must be true when it is complete**:
+    the SGLang-local mapping can optionally be host-registered for faster
+    `L2(host) -> L1(device)` copies, and attach or detach remains correct even
+    when host registration is unavailable.
+  - **What it does not change**:
+    the underlying byte-artifact semantics or slot-generation rules from `M3`.
+
+### Phase 2.5A - Phase A host staging on `HOST_SHARED`
+
+- [x] Freeze the Phase-2.5A contract:
+  - [x] Keep the same prefix-share hot path ownership:
+    - no external controller,
+    - no request-transfer semantics,
+    - no change to page identity or routed byte-artifact truth.
+  - [x] Replace only the local SGLang <-> daemon memory boundary:
+    - remove the mandatory GPU staging hop,
+    - allow one host-side memcpy into or out of a persistent scratch slab,
+    - keep daemon-side routed byte-artifact transport semantics unchanged.
+  - [x] Require Phase A scratch slabs to reuse the same export / attach / lease
+    model that Phase B allocator slabs will later use.
+- [ ] Implement `M0` Tensorcast host-slab export / attach / lease / keepalive:
+  - [ ] Tensorcast proto and client surface:
+    - [x] extend `tensorcast/proto/tensorcast/daemon/v2/store_daemon.proto`
+      toward the unified region model:
+      - `RegionMemoryKind`,
+      - `RegionRef`,
+      - generic region registration messages or an equivalent compatibility
+        wrapper shape,
+      - room for `HOST_SHARED` storage entries in `TargetLayout`.
+    - [x] keep `RegisterVramRegion` compatibility as a wrapper or legacy alias
+      rather than breaking existing GPU users.
+    - [x] update `tensorcast/tensorcast/daemon_ctl.py` and
+      `tensorcast/tensorcast/api/store/__init__.py` so Python callers can use
+      the new local-region surface.
+  - [ ] Tensorcast daemon region registry and lifecycle:
+    - [x] refactor `tensorcast/daemon/state/ipc_region_registry.*` into a
+      generic local-region registry or add an equivalent generic layer above it,
+      so `VRAM` and `HOST_SHARED` share:
+      - region ids,
+      - owner_pid/session metadata,
+      - lease refcounting,
+      - TTL refresh,
+      - poison state,
+      - explicit unregister.
+    - [x] add host-region descriptors for daemon-managed slabs:
+      - slab size,
+      - attach token or metadata,
+      - whether the region is daemon-managed scratch or allocator-backed.
+    - [x] implement daemon-side slab allocation and cleanup for `HOST_SHARED`.
+  - [x] Tensorcast local attach mechanism:
+    - [x] define how the local client receives a usable memfd for one exported
+      slab.
+    - [x] because plain gRPC does not transfer file descriptors, add a local-only
+      attach path that can hand the memfd to the client process, for example via
+      UDS FD passing or another explicitly local mechanism.
+    - [x] keep this attach path local-only and lease-scoped; it must never be
+      usable cross-host.
+  - [ ] Tensorcast daemon validation and ownership boundary:
+    - [x] extend `daemon/service/controllers/external_target_access_service.*`
+      so local source or target validation can reason about `HOST_SHARED`
+      regions, not only CUDA IPC regions.
+    - [x] extend
+      `daemon/service/controllers/materialization_target_storage_utils.*` and
+      `daemon/service/byte_artifact_region_layout.*` so region-backed accesses
+      can acquire host-shared layouts in addition to VRAM layouts.
+    - [ ] keep trust-boundary rules unchanged:
+      - batch region RPCs stay loopback or UDS-only,
+      - remote daemons still never write directly into caller-visible memory.
+  - [ ] Tensorcast tests for `M0`:
+    - [x] region registration tests for `HOST_SHARED`,
+    - [x] lease keepalive and expiry tests,
+    - [x] local attach or detach tests,
+    - [x] slab cleanup on explicit release and owner exit.
+- [ ] Implement `M1` `BatchPutIfAbsentFromRegion(HOST_SHARED source)` correctness:
+  - [ ] Tensorcast request validation and lowering:
+    - [x] extend
+      `ExternalTargetAccessService::validate_local_source_layout(...)` so
+      `BatchPutIfAbsentFromRegion(...)` accepts `HOST_SHARED` source entries in
+      addition to `VRAM`.
+    - [x] teach `byte_artifact_region_layout.*` to build region slices backed by
+      daemon-managed host slabs.
+    - [x] make `byte_artifact_controller.cc` open source bytes from
+      `HOST_SHARED` region slices without changing byte-artifact identity,
+      invariant, or verification-mode semantics.
+  - [x] Tensorcast data-path scope:
+    - [x] keep CPU-source direct RDMA explicitly out of scope for this
+      milestone.
+    - [x] allow the daemon-side put transport to continue using the current
+      communicator/export realization after the local source bytes have been
+      validated and opened.
+  - [ ] Tensorcast tests for `M1`:
+    - [x] correctness tests for `BatchPutIfAbsentFromRegion(HOST_SHARED source)`
+      with:
+      - [x] success,
+      - [x] duplicate adoption,
+      - [x] partial failure,
+      - [x] invalid bounds or poisoned region rejection.
+  - [ ] After `M1`, optionally do a narrow SGLang-side local integration check
+    without yet switching the main backend path.
+- [ ] Implement `M2` `BatchGetIntoRegion(HOST_SHARED target)` correctness:
+  - [ ] Tensorcast request validation and target access:
+    - [x] extend
+      `ExternalTargetAccessService::validate_local_target_layout(...)` so
+      `BatchGetIntoRegion(...)` accepts `HOST_SHARED` target entries in addition
+      to `VRAM`.
+    - [x] generalize
+      `materialization_target_storage_utils.*` so target storage leases can
+      represent host-shared targets, not only CUDA IPC mappings.
+    - [x] keep device checks fail-closed:
+      `device_uuid` remains meaningful for `VRAM` and not applicable for pure
+      `HOST_SHARED`.
+  - [ ] Tensorcast target execution path:
+    - [x] extend `byte_artifact_controller.cc` and any shared lowering helpers
+      so `BatchGetIntoRegion(...)` can materialize directly into `HOST_SHARED`
+      target slices.
+    - [ ] reuse or adapt the existing CPU direct-write sink path where possible
+      instead of inventing a second host-target data plane.
+    - [x] preserve existing batch-get semantics:
+      - [x] partial hit behavior,
+      - [x] per-item vs pack-scoped failure rules,
+      - [x] layout and verification-mode checks.
+  - [ ] Tensorcast tests for `M2`:
+    - [x] correctness tests for `BatchGetIntoRegion(HOST_SHARED target)` with:
+      - [x] full hit,
+      - [x] partial hit,
+      - [x] invalid target bounds,
+      - [x] failure propagation without whole-slab poison.
+- [x] Switch SGLang Tensorcast backend to Phase-A host staging after `M2`:
+  - [x] Add a per-rank host-slab attachment manager in the Tensorcast backend.
+  - [x] Replace `_StagingRegionManager`-style VRAM staging with persistent
+    `HOST_SHARED` scratch slabs.
+  - [x] Make `batch_set_v1(...)` copy ordinary L2 pages into the scratch slab
+    before issuing `BatchPutIfAbsentFromRegion(...)`.
+  - [x] Make `batch_get_v1(...)` issue `BatchGetIntoRegion(...)` into the
+    scratch slab, then copy the filled bytes back into ordinary L2 pages.
+  - [x] Remove GPU staging from the active Tensorcast backend path once the
+    `HOST_SHARED` path is enabled; do not keep a runtime GPU-staging fallback in
+    the same backend implementation.
+- [x] Validate Phase A in SGLang end to end immediately after the integration
+  switch:
+  - [x] Run `share_local` in `share` mode.
+  - [x] Run `share_local` in `separate` mode.
+  - [x] Verify:
+    - [x] functional `batch_exists / batch_get / batch_set`,
+    - [x] real prefix reuse hits,
+    - [x] no Tensorcast GPU staging allocation or H2D/D2H bounce remains on the
+      active path.
+
+### Phase 2.5B - Phase B allocator-backed zero-copy host residency
+
+- [ ] Freeze the Phase-2.5B contract:
+  - [ ] One allocator slot equals one HiCache KV page.
+  - [ ] One slot lifetime is guarded by a monotonically increasing
+    `generation`.
+  - [ ] Phase B must reuse the same daemon-exported `HOST_SHARED` slab model as
+    Phase A rather than introducing a second host-memory API family.
+  - [ ] Once Phase B becomes the active backend path, no GPU staging fallback is
+    retained.
+- [ ] Implement the Phase-B slot-token and slot-lifecycle contract:
+  - [ ] Extend the region-backed request model so the caller can identify one
+    slot lifetime, not only a byte window:
+    - `region_id`
+    - `memory_kind=HOST_SHARED`
+    - `slot_index`
+    - `slot_generation`
+    - `offset_bytes`
+    - `length_bytes`
+  - [ ] Update Tensorcast proto, layout validation, and response-mapping code so
+    these slot-lifetime fields survive request decoding, target/source
+    validation, and per-item result mapping.
+  - [ ] Keep the first safe rollout at one logical slot token per KV page even
+    if adjacent slots are later coalesced for execution efficiency.
+  - [ ] Define and wire the caller-owned slot state machine:
+    - `SlotFree`
+    - `SlotReserved`
+    - `GetInFlight`
+    - `SlotResident`
+    - `PutInFlight`
+    - `SlotInvalid`
+    - `SlotRetiring`
+  - [ ] Define pin or refcount rules so eviction cannot recycle a slot while it
+    is reserved or in flight.
+  - [ ] Define `SlotInvalid` and retirement semantics for partial failure:
+    - get-side fill failure invalidates the target slot,
+    - ordinary put failure does not invalidate the local source slot,
+    - generation bumps only after retirement and ref-drain.
+- [ ] Implement `M3` allocator-slab page-slot state / recycle / partial-failure
+  correctness:
+  - [ ] Tensorcast-side plumbing:
+    - [ ] ensure host-region validation remains slot-token aware but does not
+      create a daemon-owned allocator table,
+    - [ ] preserve slot token metadata through `BatchGetIntoRegion` and
+      `BatchPutIfAbsentFromRegion` result construction so SGLang can revalidate
+      generation before making a page visible.
+  - [ ] Add Tensorcast unit/integration tests for:
+    - slot validation by generation,
+    - stale completion rejection,
+    - partial batch failure,
+    - slot retirement and recycle.
+  - [ ] Add SGLang-side correctness checks where feasible for pinning,
+    provisional visibility, and eviction interaction.
+- [ ] Implement `M4` host-registration attach / detach / fallback:
+  - [ ] Add optional one-time `cudaHostRegister(...)` on the SGLang-local slab
+    mapping.
+  - [ ] Keep Tensorcast host-region semantics independent from host pinning:
+    the daemon-side `HOST_SHARED` region model must remain correct whether or
+    not the local client successfully host-registers the mapping.
+  - [ ] Add the matching detach path:
+    - drain in-flight slot refs,
+    - retire resident or invalid slots,
+    - `cudaHostUnregister(...)`,
+    - unmap,
+    - release slab lease.
+  - [ ] Define the fallback behavior when host registration is unavailable:
+    correctness must remain intact and only the performance policy changes.
+  - [ ] Add Tensorcast unit/integration tests for `M4`.
+- [ ] Add the SGLang Phase-B allocator integration:
+  - [ ] Implement a Tensorcast-aware `HostKVCache` allocator backed by one
+    daemon-exported slab per rank.
+  - [ ] Make L2 host pages live directly in exported slab slots rather than in a
+    separate ordinary host pool.
+  - [ ] Make `batch_set_v1(...)` publish directly from resident slot offsets
+    without an extra copy into a scratch slab.
+  - [ ] Make `batch_get_v1(...)` reserve destination slots and materialize
+    directly into those slots.
+  - [ ] Insert fetched pages into radix-visible HiCache state only after get
+    success and generation revalidation.
+  - [ ] Retire invalid slots correctly on failure.
+- [ ] Validate Phase B in SGLang end to end immediately after allocator
+  integration:
+  - [ ] Rerun the same `share_local` benchmark shape used for Phase A.
+  - [ ] Compare against the last GPU-staging baseline and the Phase-A host
+    staging path.
+  - [ ] Verify:
+    - functionality remains correct,
+    - prefix reuse still hits,
+    - `TTFT`, `batch_get`, and `batch_set` metrics improve or at least behave as
+      expected,
+    - GPU staging is completely absent from the active Tensorcast backend path.
+
+### Phase 2.5 Exit Criteria
+
+- [ ] Tensorcast has a daemon-managed `HOST_SHARED` slab lifecycle validated by
+  milestone tests `M0` through `M4`.
+- [x] `BatchPutIfAbsentFromRegion(...)` supports `HOST_SHARED` source layouts.
+- [x] `BatchGetIntoRegion(...)` supports `HOST_SHARED` target layouts.
+- [x] Phase A host staging runs end to end in `share_local` without GPU staging.
+- [ ] Phase B allocator-backed host residency runs end to end in `share_local`
+  with slot-generation protection and no GPU staging fallback.
+
+Current Phase-2.5A validation note:
+
+- Tensorcast milestone coverage currently confirmed locally by:
+  - `//daemon:byte_artifact_region_layout_host_shared_test`
+  - `//daemon:grpc_service_impl_batch_runtime_test --test_arg=[host_shared]`
+- SGLang end-to-end host-staging bring-up is confirmed in:
+  - `benchmark/tensorcast_benchmark/kv/share_local/outputs/20260401-224749_tensorcast_tp2_pairs10`
+    - `tensorcast-daemon-mode=separate`
+    - `--wait-for-source-publication-drain`
+    - `--source-publication-drain-idle-s 10`
+    - `prompt_count=10`
+    - `--hicache-storage-prefetch-policy wait_complete`
+  - `benchmark/tensorcast_benchmark/kv/share_local/outputs/20260401-230828_tensorcast_tp2_pairs10`
+    - `tensorcast-daemon-mode=share`
+    - `--wait-for-source-publication-drain`
+    - `--source-publication-drain-idle-s 10`
+    - `prompt_count=10`
+    - `--hicache-storage-prefetch-policy wait_complete`
+- That run shows:
+  - instance A successfully publishing through `batch_set_v1(...)`,
+  - instance B reaching `batch_exists(...)` hits and successful
+    `batch_get_v1(...)` on the `HOST_SHARED` path,
+  - all 10 prompt pairs reaching storage-backed prefix hits on instance B
+    without falling back to `batch_set_v1(...)` in both `share` and `separate`
+    daemon modes,
+  - the active SGLang Tensorcast backend using `region_ref.memory_kind=HOST_SHARED`
+    with `device_uuid=""`, not the old `vram_region_id` staging path.
+- Performance is not yet an exit criterion for Phase 2.5A bring-up:
+  - mean TTFT was still worse than the GPU-staging baseline,
+  - `host_fill_ms` remained significant because Phase A still performs one host
+    copy between the Tensorcast scratch slab and ordinary HiCache L2 pages.
 
 ## Phase 3 - Request Transfer Interface
 
@@ -471,6 +815,8 @@ The most important implementation boundary is:
 - `Phase 1` stayed primarily in the SGLang repo.
 - `Phase 1.5` required Tensorcast daemon/runtime work for byte-artifact batch
   transport and performance, in addition to the SGLang-side backend.
+- `Phase 2.5` extends that same integration boundary into Tensorcast
+  region-backed host memory, slab lifecycle, and SGLang host-allocator wiring.
 - `Phase 3` is where Tensorcast programmability-facing request-transfer API
   changes still become necessary.
 
@@ -519,6 +865,9 @@ The most important implementation boundary is:
 
 ### Tensorcast files to modify
 
+- `Phase 2.5` is expected to touch Tensorcast daemon/runtime code for
+  region-backed `HOST_SHARED` placement in addition to the SGLang integration.
+
 These are split into two categories:
 
 - Phase 1.5 / Phase 2 already required Tensorcast daemon/runtime changes for
@@ -533,6 +882,38 @@ Representative Tensorcast Phase-1.5 / Phase-2 areas are:
 - `tensorcast/core/store/runtime/ingestion/`
 - `tensorcast/core/store/materialization/dataplane/sources/`
 - `tensorcast/daemon/service/routing/`
+
+Representative Tensorcast Phase-2.5 areas are:
+
+- Proto and Python client surface:
+  - `tensorcast/proto/tensorcast/daemon/v2/store_daemon.proto`
+  - `tensorcast/tensorcast/daemon_ctl.py`
+  - `tensorcast/tensorcast/api/store/__init__.py`
+- Region registry and lifecycle:
+  - `tensorcast/daemon/state/ipc_region_registry.h`
+  - `tensorcast/daemon/state/ipc_region_registry.cc`
+  - `tensorcast/daemon/service/grpc_service_impl.cc`
+  - `tensorcast/daemon/service/grpc_service_impl.h`
+- Local region validation and lowering:
+  - `tensorcast/daemon/service/controllers/external_target_access_service.h`
+  - `tensorcast/daemon/service/controllers/external_target_access_service.cc`
+  - `tensorcast/daemon/service/controllers/materialization_target_storage_utils.h`
+  - `tensorcast/daemon/service/controllers/materialization_target_storage_utils.cc`
+  - `tensorcast/daemon/service/byte_artifact_region_layout.h`
+  - `tensorcast/daemon/service/byte_artifact_region_layout.cc`
+- Byte-artifact region ingress or egress:
+  - `tensorcast/daemon/service/controllers/byte_artifact_controller.h`
+  - `tensorcast/daemon/service/controllers/byte_artifact_controller.cc`
+- Existing CPU-target dataplane pieces likely to be reused or extended:
+  - `tensorcast/core/store/materialization/dataplane/sinks/cpu_va_sink.h`
+  - `tensorcast/core/store/materialization/dataplane/sinks/cpu_va_sink.cc`
+  - `tensorcast/core/store/materialization/dataplane/sources/remote_key_source.h`
+  - `tensorcast/core/store/materialization/dataplane/sources/remote_key_source.cc`
+- Tensorcast tests that should gain Phase-2.5 coverage:
+  - `tensorcast/daemon/state/ipc_region_registry_test.cc`
+  - `tensorcast/daemon/service/grpc_service_impl_batch_runtime_test.cc`
+  - `tensorcast/daemon/service/grpc_service_impl_batch_redirect_e2e_test.cc`
+  - `tensorcast/tests/python/test_store_region_registration.py`
 
 Phase-3 request-transfer areas remain:
 

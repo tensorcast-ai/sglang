@@ -7,6 +7,7 @@ import atexit
 import collections
 import hashlib
 import logging
+import mmap
 import os
 import re
 import threading
@@ -14,8 +15,9 @@ import time
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Callable, Protocol
+from typing import Protocol
 
+import numpy as np
 import torch
 
 from sglang.srt.mem_cache.storage.tensorcast_store.config import (
@@ -61,11 +63,13 @@ class TensorcastPageClient(Protocol):
 
 
 @dataclass
-class _StagingRegionState:
+class _HostSharedRegionState:
     tensor: torch.Tensor
     region_id: str
     capacity_bytes: int
-    mapping_base_offset: int
+    handle: object
+    mapping: mmap.mmap
+    array: np.ndarray
 
 
 _CGID_SAFE_PATTERN = re.compile(r"[^-._~A-Za-z0-9]+")
@@ -105,46 +109,25 @@ def _engine_key_payload(engine_key_prefix: str, logical_key: str) -> bytes:
     return prefix + b":" + key_bytes
 
 
-def _resolve_daemon_device_id(local_device_id: int) -> int:
-    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-    if not visible_devices:
-        return int(local_device_id)
-    device_tokens = [
-        token.strip() for token in visible_devices.split(",") if token.strip()
-    ]
-    if local_device_id < 0 or local_device_id >= len(device_tokens):
-        return int(local_device_id)
-    try:
-        return int(device_tokens[local_device_id])
-    except ValueError:
-        return int(local_device_id)
-
-
-class _StagingRegionManager:
+class _HostSharedRegionManager:
     def __init__(
         self,
         *,
-        client,
-        device: torch.device,
-        export_device_id: int,
-        daemon_device_id: int,
+        store,
+        host_shared_region_class,
+        region_memory_kind,
         ttl_ms: int,
         name: str,
-        get_cuda_memory_handle: Callable[[int, int], bytes],
-        get_cuda_memory_handle_with_offset: Callable[[int, int], tuple[bytes, int]],
     ) -> None:
-        self._client = client
-        self._device = device
-        self._export_device_id = int(export_device_id)
-        self._daemon_device_id = int(daemon_device_id)
+        self._store = store
+        self._host_shared_region_class = host_shared_region_class
+        self._region_memory_kind = region_memory_kind
         self._ttl_ms = int(ttl_ms)
         self._name = name
-        self._get_cuda_memory_handle = get_cuda_memory_handle
-        self._get_cuda_memory_handle_with_offset = get_cuda_memory_handle_with_offset
-        self._state: _StagingRegionState | None = None
+        self._state: _HostSharedRegionState | None = None
         self._lock = threading.Lock()
 
-    def ensure_capacity(self, required_bytes: int) -> _StagingRegionState:
+    def ensure_capacity(self, required_bytes: int) -> _HostSharedRegionState:
         if required_bytes <= 0:
             raise ValueError("required_bytes must be positive")
         with self._lock:
@@ -152,41 +135,46 @@ class _StagingRegionManager:
             if state is not None and state.capacity_bytes >= required_bytes:
                 return state
             self._release_locked()
-            tensor = torch.empty(
-                required_bytes,
-                dtype=torch.uint8,
-                device=self._device,
-            )
-            base_ptr_value = int(tensor.data_ptr())
-            size_value = int(required_bytes)
-            mapping_base_offset = 0
+            handle = None
             try:
-                handle_bytes, mapping_base_offset = (
-                    self._get_cuda_memory_handle_with_offset(
-                        self._export_device_id,
-                        base_ptr_value,
+                handle = self._store.register_region(
+                    memory_kind=self._region_memory_kind,
+                    size_bytes=int(required_bytes),
+                    ttl_ms=self._ttl_ms,
+                    daemon_managed=True,
+                    host_shared_region_class=self._host_shared_region_class,
+                    name=self._name,
+                )
+                attachment = self._store.attach_host_shared_region(handle)
+                fd = int(attachment.fd)
+                try:
+                    mapping = mmap.mmap(
+                        fd,
+                        int(attachment.size_bytes),
+                        flags=mmap.MAP_SHARED,
+                        prot=mmap.PROT_READ | mmap.PROT_WRITE,
                     )
+                finally:
+                    os.close(fd)
+                array = np.ndarray(
+                    (int(attachment.size_bytes),), dtype=np.uint8, buffer=mapping
                 )
-            except Exception:  # noqa: BLE001
-                handle_bytes = self._get_cuda_memory_handle(
-                    self._export_device_id,
-                    base_ptr_value,
-                )
-                mapping_base_offset = 0
-            if mapping_base_offset:
-                size_value += int(mapping_base_offset)
-            handle = self._client.register_vram_region(
-                device_id=self._daemon_device_id,
-                size_bytes=size_value,
-                ttl_ms=self._ttl_ms,
-                cuda_ipc_handle=handle_bytes,
-                region_name=self._name,
-            )
-            self._state = _StagingRegionState(
+                tensor = torch.from_numpy(array)
+            except Exception:
+                with suppress(Exception):
+                    if handle is not None:
+                        self._store.release_host_shared_region(handle)
+                with suppress(Exception):
+                    if handle is not None:
+                        self._store.unregister_region(str(handle.region_id), force=True)
+                raise
+            self._state = _HostSharedRegionState(
                 tensor=tensor,
                 region_id=str(handle.region_id),
                 capacity_bytes=int(required_bytes),
-                mapping_base_offset=int(mapping_base_offset),
+                handle=handle,
+                mapping=mapping,
+                array=array,
             )
             return self._state
 
@@ -199,8 +187,14 @@ class _StagingRegionManager:
         self._state = None
         if state is None:
             return
+        state.tensor = torch.empty(0, dtype=torch.uint8)
+        state.array = np.empty((0,), dtype=np.uint8)
         with suppress(Exception):
-            self._client.unregister_vram_region(state.region_id, force=True)
+            state.mapping.close()
+        with suppress(Exception):
+            self._store.release_host_shared_region(state.handle)
+        with suppress(Exception):
+            self._store.unregister_region(state.region_id, force=True)
 
 
 class DefaultTensorcastPageClient:
@@ -212,22 +206,17 @@ class DefaultTensorcastPageClient:
         engine_key_prefix: str,
     ) -> None:
         import tensorcast as tc
-        from tensorcast._c_ext import (
-            get_cuda_memory_handle,
-            get_cuda_memory_handle_with_offset,
-        )
-        from tensorcast.api._device import device_uuid_for
         from tensorcast.common.identity import build_byte_artifact_cgid
         from tensorcast.common.selection_contract import build_artifact_selection
         from tensorcast.proto.common.v1 import common_pb2
         from tensorcast.proto.daemon.v2 import store_daemon_pb2
+        from tensorcast.types import HostSharedRegionClass, RegionMemoryKind
 
         self._tc = tc
         self._common_pb2 = common_pb2
         self._store_daemon_pb2 = store_daemon_pb2
         self._build_artifact_selection = build_artifact_selection
         self._build_byte_artifact_cgid = build_byte_artifact_cgid
-        self._device_uuid_for = device_uuid_for
         self._config = config
         self._layout_id = _compact_cgid_segment(layout_id, prefix="ly")
         self._namespace = _compact_cgid_segment(config.namespace, prefix="ns")
@@ -239,31 +228,20 @@ class DefaultTensorcastPageClient:
         self._selection_cache: dict[str, object] = {}
         self._store = tc.Store(config.daemon_address)
         self._client = self._store._runtime.ensure_client()
-        current_device = torch.cuda.current_device()
-        self._device = torch.device(f"cuda:{current_device}")
-        self._export_device_id = int(current_device)
-        self._daemon_device_id = _resolve_daemon_device_id(current_device)
-        self._device_uuid = str(self._device_uuid_for(current_device))
         region_ttl_ms = int(config.staging_region_ttl_ms)
-        self._put_staging = _StagingRegionManager(
-            client=self._client,
-            device=self._device,
-            export_device_id=self._export_device_id,
-            daemon_device_id=self._daemon_device_id,
+        self._put_staging = _HostSharedRegionManager(
+            store=self._store,
+            host_shared_region_class=HostSharedRegionClass.SCRATCH,
+            region_memory_kind=RegionMemoryKind.HOST_SHARED,
             ttl_ms=region_ttl_ms,
             name="sglang_tensorcast_put_staging",
-            get_cuda_memory_handle=get_cuda_memory_handle,
-            get_cuda_memory_handle_with_offset=get_cuda_memory_handle_with_offset,
         )
-        self._get_staging = _StagingRegionManager(
-            client=self._client,
-            device=self._device,
-            export_device_id=self._export_device_id,
-            daemon_device_id=self._daemon_device_id,
+        self._get_staging = _HostSharedRegionManager(
+            store=self._store,
+            host_shared_region_class=HostSharedRegionClass.SCRATCH,
+            region_memory_kind=RegionMemoryKind.HOST_SHARED,
             ttl_ms=region_ttl_ms,
             name="sglang_tensorcast_get_staging",
-            get_cuda_memory_handle=get_cuda_memory_handle,
-            get_cuda_memory_handle_with_offset=get_cuda_memory_handle_with_offset,
         )
         logger.info(
             "Tensorcast page client configured verification_mode=%s namespace=%s engine=%s layout_id=%s model_id=%s model_version=%s",
@@ -374,17 +352,23 @@ class DefaultTensorcastPageClient:
         )
         storage = source_layout.storages.add()
         storage.storage_id = "storage-0"
-        storage.device_id = int(self._daemon_device_id)
+        storage.device_id = -1
         storage.storage_length = int(total_bytes)
-        storage.vram_region_id = staging.region_id
-        storage.mapping_base_offset = int(staging.mapping_base_offset)
+        storage.mapping_base_offset = 0
+        region_ref = storage.region_ref
+        region_ref.region_id = staging.region_id
+        region_ref.memory_kind = (
+            self._store_daemon_pb2.REGION_MEMORY_KIND_HOST_SHARED
+        )
+        region_ref.device_id = -1
+        region_ref.size_bytes = int(staging.capacity_bytes)
         items = []
         stage_started_at = time.perf_counter()
         cursor = 0
         for _, artifact_id, page_bytes, byte_length in packed_pages:
             staging.tensor[cursor : cursor + byte_length].copy_(
                 page_bytes,
-                non_blocking=True,
+                non_blocking=False,
             )
             offset = source_layout.offsets.add()
             offset.name = artifact_id
@@ -403,14 +387,13 @@ class DefaultTensorcastPageClient:
             )
             items.append(item)
             cursor += byte_length
-        torch.cuda.synchronize(self._device)
         stage_copy_elapsed_s = time.perf_counter() - stage_started_at
         rpc_started_at = time.perf_counter()
         response = self._client.batch_put_if_absent_from_region(
             items=items,
             source_layout=source_layout,
             pid=os.getpid(),
-            device_uuid=self._device_uuid,
+            device_uuid="",
             operation_id=uuid.uuid4().hex,
             timeout_s=float(self._config.batch_transfer_timeout_s),
         )
@@ -506,10 +489,16 @@ class DefaultTensorcastPageClient:
         )
         storage = target_layout.storages.add()
         storage.storage_id = "storage-0"
-        storage.device_id = int(self._daemon_device_id)
+        storage.device_id = -1
         storage.storage_length = int(total_bytes)
-        storage.vram_region_id = staging.region_id
-        storage.mapping_base_offset = int(staging.mapping_base_offset)
+        storage.mapping_base_offset = 0
+        region_ref = storage.region_ref
+        region_ref.region_id = staging.region_id
+        region_ref.memory_kind = (
+            self._store_daemon_pb2.REGION_MEMORY_KIND_HOST_SHARED
+        )
+        region_ref.device_id = -1
+        region_ref.size_bytes = int(staging.capacity_bytes)
         selections = []
         cursor = 0
         for _, artifact_id, _, byte_length in packed_targets:
@@ -526,11 +515,10 @@ class DefaultTensorcastPageClient:
             selections=selections,
             target_layout=target_layout,
             pid=os.getpid(),
-            device_uuid=self._device_uuid,
+            device_uuid="",
             operation_id=operation_id,
             timeout_s=float(self._config.batch_transfer_timeout_s),
         )
-        torch.cuda.synchronize(self._device)
         rpc_elapsed_s = time.perf_counter() - rpc_started_at
         ok_status = int(self._store_daemon_pb2.BATCH_ITEM_STATUS_OK)
         outcome_by_artifact = {
@@ -557,11 +545,10 @@ class DefaultTensorcastPageClient:
                 continue
             target_bytes.copy_(
                 staging.tensor[cursor : cursor + byte_length],
-                non_blocking=True,
+                non_blocking=False,
             )
             success_mask.append(True)
             cursor += byte_length
-        torch.cuda.synchronize(self._device)
         host_fill_elapsed_s = time.perf_counter() - host_fill_started_at
         failed_statuses = {
             self._store_daemon_pb2.BatchItemStatus.Name(status): count
