@@ -401,7 +401,8 @@ class HiCacheController:
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
             is_mla_model=is_mla_backend,
-            is_page_first_layout=self.mem_pool_host.layout == "page_first",
+            is_page_first_layout=self.mem_pool_host.layout
+            in ["page_first", "page_blob_direct"],
             model_name=model_name,
             extra_config=storage_backend_extra_config,
         )
@@ -510,12 +511,12 @@ class HiCacheController:
                 device_indices = device_indices.cpu()
                 host_indices, idx = host_indices.sort()
                 return host_indices, device_indices.index_select(0, idx)
-            elif self.mem_pool_host.layout == "page_first_direct":
+            elif self.mem_pool_host.layout in ["page_first_direct", "page_blob_direct"]:
                 return host_indices, device_indices.cpu()
         elif self.io_backend == "kernel_ascend":
             return host_indices, device_indices.cpu()
         else:
-            raise ValueError(f"Unsupported io backend")
+            raise ValueError("Unsupported io backend")
 
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:

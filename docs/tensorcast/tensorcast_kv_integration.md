@@ -20,9 +20,14 @@ Status:
   - byte-artifact-native `batch_exists(...)`
   - byte-artifact-native `batch_set_v1(...)`
   - byte-artifact-native `batch_get_v1(...)`
+  - persistent `HOST_SHARED` scratch-slab transport for host-backed batch
+    `put/get`
+  - allocator-backed `HOST_SHARED` host residency with `page_blob_direct`,
+    direct slot-based `put/get`, and generation-guarded slot lifetime
+  - optional one-time `cudaHostRegister(...)` on allocator-backed exported slabs
   - `benchmark/tensorcast_benchmark/kv/share_local` automation for
-    `tensorcast-daemon-mode=share|separate`, explicit benchmark `rid`, and
-    source-publication-drain tracking
+    `tensorcast-daemon-mode=share|separate`, explicit benchmark `rid`,
+    source-publication-drain tracking, and overlap-mode request-pair driving
 - Current Tensorcast core already exposes the legacy request-transfer surface
   `publish(engine_request_id=...)`, `hydrate(engine_request_id=...)`,
   `evict_local(...)`, and generic `ManifestResult`.
@@ -481,9 +486,13 @@ This means:
 - and `batch_set_v1(...)` MUST NOT be interpreted as upsert for an already
   published logical page.
 
-For the current Tensorcast core, the high-throughput batch region path is
-VRAM-region-backed; host-region support is a medium-term extension rather than a
-current assumption.
+In the current codebase, the high-throughput batch region path is already
+host-native for SGLang prefix share:
+
+- `BatchPutIfAbsentFromRegion(...)` accepts `HOST_SHARED` sources,
+- `BatchGetIntoRegion(...)` accepts `HOST_SHARED` targets,
+- and the active SGLang Tensorcast backend no longer uses a VRAM-staging fast
+  path.
 
 #### 4.2.2 Data-path graph for one page shard
 
@@ -519,20 +528,18 @@ flowchart RL
     C -->|"load_back when SGLang decides"| D
 ```
 
-#### 4.2.4 v1 short-term implementation: byte-artifact-native substrate over GPU staging
+#### 4.2.4 Current implementation: byte-artifact-native substrate over `HOST_SHARED` regions
 
 This is the current implementation strategy in the SGLang repo:
 
 - `batch_exists(...)` uses Tensorcast `BatchExists(...)`,
 - `batch_set_v1(...)` uses `BatchPutIfAbsentFromRegion(...)`,
 - `batch_get_v1(...)` uses `BatchGetIntoRegion(...)`,
-- reusable per-rank VRAM staging regions are managed inside
-  `tensorcast_store/client.py`,
+- the active data path is `HOST_SHARED`, not VRAM staging,
 - and the steady-state prefix-share path no longer goes through generic
   `tc.Store.put(..., key=...)` / tensor fetch APIs.
 
-For the immediate implementation, the shared substrate SHOULD be
-byte-artifact-native end-to-end:
+The shared substrate is byte-artifact-native end to end:
 
 - page existence is checked by byte-artifact identity,
 - page publication is performed by byte-artifact put-if-absent,
@@ -540,33 +547,21 @@ byte-artifact-native end-to-end:
 - and prefix/request metadata refers to page artifact identities rather than to
   Tensor-valued `key=` artifacts.
 
-However, the current Tensorcast batch region APIs impose an important
-implementation constraint:
+Today the SGLang backend has two host-native execution modes built on the same
+`HOST_SHARED` region model:
 
-- `BatchPutIfAbsentFromRegion(...)` and `BatchGetIntoRegion(...)` are the
-  intended high-throughput batch byte-artifact data path,
-- but today they accept only VRAM-backed registered regions,
-- not host/L2 buffers directly.
+1. **scratch-slab mode**
+   - used when HiCache L2 pages live in ordinary host memory,
+   - SGLang copies between ordinary L2 pages and one long-lived
+     Tensorcast-exported `HOST_SHARED` scratch slab per rank.
+2. **allocator-backed direct mode**
+   - used when `host_allocator_enabled=true`,
+   - requires `page_blob_direct` plus a live exported host-region binding,
+   - publishes directly from resident slot offsets and fetches directly into
+     reserved destination slots on the exported slab.
 
-Therefore the first production-oriented SGLang integration SHOULD use:
-
-- **host/L2 pages as the semantic ownership boundary**, and
-- **reusable GPU staging buffers as the transport scratch boundary**.
-
-This means:
-
-- SGLang still decides when a page becomes backup-eligible and when a host page
-  is admissible,
-- Tensorcast still stores one page shard as one byte artifact,
-- but the hottest batch ingress/egress path temporarily uses:
-  - `host page -> H2D into coalesced GPU staging region -> Tensorcast batch RPC`
-  - `Tensorcast batch RPC -> GPU staging region -> D2H into host page`
-
-The GPU staging buffer is therefore a transport adapter, not a semantic change
-to the substrate boundary.
-
-The short-term implementation SHOULD NOT treat the following as the steady-state
-hot path for prefix share:
+The active backend path should not treat the following as the steady-state hot
+path for prefix share:
 
 - generic `tc.Store.put(..., key=...)` / `artifact(key=...).tensor(...)`,
 - `HomeBatchPutIfAbsent(...)`,
@@ -576,9 +571,9 @@ Those paths remain useful for fallback, bring-up, and debugging, but they are
 not the intended high-cardinality page IO path because they operate through
 payload bodies rather than through client-owned region-backed batch transfer.
 
-#### 4.2.5 v1 short-term write path
+#### 4.2.5 Current write path
 
-For one publication batch, the recommended write-side flow is:
+For one publication batch, the current write-side flow is:
 
 1. SGLang offloads or backs up mutable L1 device KV into stable L2 host pages.
 2. The Tensorcast-backed backend selects one ordered batch of rank-local page
@@ -590,15 +585,16 @@ For one publication batch, the recommended write-side flow is:
    - `PUT_IF_ABSENT` verification mode,
    - and optional payload digest metadata when enabled for debugging or
      observability.
-4. The backend packs those pages into one coalesced GPU staging buffer with one
-   contiguous slice per page shard.
-5. The backend reuses or recreates a registered VRAM region for that staging
-   buffer.
-6. The backend issues one `BatchPutIfAbsentFromRegion(...)` call with:
+4. The backend chooses one of two host-native source layouts:
+   - ordinary-host mode: copy pages into one persistent `HOST_SHARED` scratch
+     slab with one contiguous slice per page shard,
+   - allocator-backed mode: reference resident exported-slab slot offsets
+     directly.
+5. The backend issues one `BatchPutIfAbsentFromRegion(...)` call with:
    - one item per page shard,
    - one coalesced `source_layout`,
    - explicit per-item invariants.
-7. Per-item outcomes update the SGLang-side batch publication result:
+6. Per-item outcomes update the SGLang-side batch publication result:
    - `ready` for newly published or already-existing pages,
    - `failed` for publication errors.
 
@@ -626,35 +622,38 @@ explicit overwrite or delete-and-reissue path rather than another logical-page
 flowchart LR
     A["SGLang host pages<br/>(rank-local L2 shards)"]
     B["Derive artifact_id / layout_id / invariant"]
-    C["Pack coalesced GPU staging buffer"]
-    D["Register or reuse VRAM region"]
-    E["BatchPutIfAbsentFromRegion<br/>one item per page shard"]
-    F["Tensorcast byte-artifact pool"]
-    G["SGLang batch publication state"]
+    C["HOST_SHARED source layout<br/>scratch slab or resident slot offsets"]
+    D["BatchPutIfAbsentFromRegion<br/>one item per page shard"]
+    E["Tensorcast byte-artifact pool"]
+    F["SGLang batch publication state"]
 
     A --> B
     B --> C
-    C -->|"H2D"| D
-    D --> E
-    E -->|"put-if-absent outcomes"| F
-    E --> G
+    C --> D
+    D -->|"put-if-absent outcomes"| E
+    D --> F
 ```
 
-#### 4.2.6 v1 short-term read path
+#### 4.2.6 Current read path
 
-For one retrieval batch, the recommended read-side flow is:
+For one retrieval batch, the current read-side flow is:
 
 1. SGLang computes the ordered candidate page identities for the request or
    prefix continuation.
 2. The backend uses `BatchExists(...)` to determine the consecutive hit span.
-3. The backend allocates or reuses a coalesced GPU staging buffer large enough
-   for the hit span.
+3. The backend chooses one of two host-native target layouts:
+   - ordinary-host mode: one persistent `HOST_SHARED` scratch slab large enough
+     for the hit span,
+   - allocator-backed mode: freshly reserved destination slots on the exported
+     slab.
 4. The backend issues `BatchGetIntoRegion(...)` so Tensorcast materializes the
-   hit pages directly into the staging region.
-5. The backend copies each resolved page slice from GPU staging back into the
-   target L2 host pages.
-6. SGLang inserts those host pages into its radix-tree / host-cache structures
-   and later decides whether to load them back to L1 device memory.
+   hit pages directly into that `HOST_SHARED` target layout.
+5. If scratch-slab mode is in use, the backend copies each resolved page slice
+   from the slab into the target L2 host pages.
+6. If allocator-backed mode is in use, the backend revalidates slot generation
+   and only then makes the fetched pages visible to HiCache/radix state.
+7. SGLang later decides whether to load those host pages back to L1 device
+   memory.
 
 This preserves the v1 ownership rule:
 
@@ -665,10 +664,10 @@ This preserves the v1 ownership rule:
 flowchart LR
     A["Ordered page artifact_ids"]
     B["BatchExists<br/>find consecutive hit span"]
-    C["Allocate / reuse GPU staging buffer"]
+    C["HOST_SHARED target layout<br/>scratch slab or reserved resident slots"]
     D["BatchGetIntoRegion<br/>materialize hit pages"]
-    E["D2H copy into host/L2 page buffers"]
-    F["Insert into HiRadixCache / host cache"]
+    E["Optional local host copy<br/>(scratch-slab mode only)"]
+    F["Generation revalidation + insert into HiRadixCache / host cache"]
     G["Optional later load_back host->device"]
 
     A --> B
@@ -679,26 +678,17 @@ flowchart LR
     F --> G
 ```
 
-#### 4.2.7 Medium-term plan: host-native region registration and allocator
+#### 4.2.7 Current host-native region model, allocator residency, and remaining work
 
-The short-term GPU staging path is a practical consequence of the current
-Tensorcast region API, not the desired final substrate shape.
+The current prefix-share implementation already has the host-native region model
+that earlier bring-up work targeted:
 
-The agreed medium-term direction SHOULD be:
-
-- Tensorcast converges on a generalized local region-registration surface such
-  as `RegisterRegion(memory_kind=VRAM|HOST_SHARED)` or equivalent,
-- `BatchPutIfAbsentFromRegion(...)` and `BatchGetIntoRegion(...)` accept
-  `HOST_SHARED` regions in addition to `VRAM`,
-- Tensorcast daemon exports one long-lived host-shared slab per rank or per
-  worker role rather than allocating one temporary shared buffer per batch,
-- SGLang maps that exported memfd locally and MAY perform one long-lived
-  `cudaHostRegister(...)` on the local mapping when host-to-device load-back
-  performance matters,
-- SGLang eventually adds a Tensorcast-aware host allocator for `HostKVCache`,
-  analogous in spirit to the existing Mooncake host allocator integration,
-- byte-artifact identity, layout, invariant, and routed authority semantics
-  remain unchanged.
+- `BatchPutIfAbsentFromRegion(...)` and `BatchGetIntoRegion(...)` both operate
+  on `HOST_SHARED`,
+- Tensorcast daemon exports long-lived host-shared slabs,
+- SGLang maps those memfd-backed slabs locally,
+- and SGLang can optionally perform one long-lived `cudaHostRegister(...)` on
+  allocator-backed slabs when host-to-device load-back performance matters.
 
 The important semantic point is:
 
@@ -708,124 +698,33 @@ The important semantic point is:
 - it does **not** change shard-home routing or authority,
 - and it does **not** let remote daemons write directly into SGLang memory.
 
-##### Agreed bring-up sequence
+There are now two concrete SGLang-side shapes built on that same model:
 
-To minimize risk, bring-up SHOULD proceed in this order:
+1. **scratch-slab transport**
+   - Tensorcast daemon exports one long-lived `HOST_SHARED` scratch slab per
+     rank,
+   - SGLang rank maps that slab locally and reuses it across batches,
+   - `batch_set_v1(...)` copies ordinary L2 pages into that slab before issuing
+     `BatchPutIfAbsentFromRegion(...)`,
+   - `batch_get_v1(...)` fills that slab via `BatchGetIntoRegion(...)` and then
+     copies into ordinary L2 pages.
+2. **allocator-backed direct host residency**
+   - Tensorcast daemon exports one long-lived memfd-backed host slab per rank,
+   - `HostKVCache` allocates L2 pages directly from that slab,
+   - one allocator `slot` corresponds to one HiCache KV page,
+   - each slot carries a monotonically increasing `generation`,
+   - `batch_set_v1(...)` and `batch_get_v1(...)` reference those page offsets
+     directly in `source_layout` and `target_layout`.
 
-0. Tensorcast first adds the daemon-managed `HOST_SHARED` slab lifecycle needed
-   by both later phases:
-   - slab allocation,
-   - memfd export,
-   - local lease issuance,
-   - local mapping by the SGLang rank,
-   - and keepalive or explicit release semantics for long-lived attached slabs.
-1. Tensorcast adds `HOST_SHARED` source support to
-   `BatchPutIfAbsentFromRegion(...)`.
-2. Tensorcast adds `HOST_SHARED` target support to
-   `BatchGetIntoRegion(...)`.
-3. SGLang removes GPU staging by switching from reusable VRAM staging buffers
-   to long-lived Tensorcast-exported host staging slabs.
-4. SGLang adds a Tensorcast-aware host allocator so HiCache L2 pages can live
-   directly inside daemon-exported host slabs and the extra CPU staging copy
-   disappears.
-
-This ordering is intentional:
-
-- the put path is the narrower CPU-region bring-up because it only needs a
-  host-readable source layout,
-- the get path is deeper because Tensorcast runtime currently materializes into
-  GPU targets only,
-- and SGLang should not try to remove the current GPU staging path until both
-  byte-artifact batch region RPCs already support `HOST_SHARED`.
-
-Another important design rule is:
-
-- Phase A and Phase B are **not** two unrelated mechanisms,
-- they are two integration stages built on the same daemon-exported
-  `HOST_SHARED` slab model,
-- and Phase-A implementation SHOULD already be structured so the same slab
-  export, attach, and lease path can later back the direct L2 allocator.
-- once this backend switches to `HOST_SHARED`, the Tensorcast HiCache backend
-  SHOULD remove its internal GPU-staging path rather than keep a runtime
-  fallback to VRAM staging inside the same backend implementation.
-
-##### Phase A: persistent host staging slab, not zero-copy yet
-
-The first post-GPU-staging implementation SHOULD still tolerate one CPU copy on
-the SGLang side, but it SHOULD avoid:
-
-- any extra `H2D` / `D2H`,
-- any GPU staging VRAM reservation,
-- and any per-batch memfd allocation churn.
-
-The recommended Phase-A shape is:
-
-- Tensorcast daemon exports one long-lived `HOST_SHARED` scratch slab per rank,
-- SGLang rank maps that slab locally and holds the mapping,
-- `batch_set_v1(...)` copies ordinary L2 pages into that slab before issuing
-  `BatchPutIfAbsentFromRegion(...)`,
-- `batch_get_v1(...)` asks Tensorcast to fill that slab via
-  `BatchGetIntoRegion(...)`, then copies from the slab into ordinary L2 pages.
-
-Phase-A write and read data flow:
-
-```mermaid
-flowchart LR
-    A["SGLang ordinary L2 host pages"] -->|"CPU memcpy"| B["Tensorcast-exported HOST_SHARED staging slab"]
-    B -->|"BatchPutIfAbsentFromRegion<br/>source_layout on HOST_SHARED"| C["Local Tensorcast daemon"]
-    C --> D["Routed byte-artifact substrate"]
-
-    E["Routed byte-artifact substrate"] --> F["Local Tensorcast daemon"]
-    F -->|"BatchGetIntoRegion<br/>target_layout on HOST_SHARED"| G["Tensorcast-exported HOST_SHARED staging slab"]
-    G -->|"CPU memcpy"| H["SGLang ordinary L2 host pages"]
-```
-
-This Phase-A plan is explicitly **not** the final zero-copy target, but it is a
-clean validation step because it proves:
-
-- Tensorcast batch byte-artifact region APIs no longer require GPU staging,
-- SGLang batch `put/get` can operate on host-shared regions correctly,
-- and the remaining copy is purely a local host-side integration concern.
-
-Phase-A implementation SHOULD therefore avoid any Phase-A-only region API or
-lease model. The scratch slab should already use the same exported-slab
-mechanism that Phase B will later bind to `HostKVCache`.
-
-Phase-A policy notes:
-
-- scratch slabs SHOULD be pure `HOST_SHARED` placements rather than mixed
-  `VRAM` + `HOST_SHARED` requests,
-- scratch slabs SHOULD default to unpinned shared memory,
-- ordinary Phase-A batch failure SHOULD invalidate only the current staging
-  window rather than poison the entire scratch slab,
-- slab re-export or remap SHOULD be reserved for slab-level fatal faults such
-  as invalid lease or unusable mapping state,
-- and the host-shared milestone SHOULD replace the existing GPU staging path
-  rather than add a second active fast path inside the same backend.
-
-##### Phase B: Tensorcast-aware host allocator for HiCache L2
-
-The final target shape SHOULD be:
-
-- Tensorcast daemon exports one long-lived memfd-backed host slab per rank,
-- SGLang rank maps that slab once at startup,
-- SGLang performs one long-lived `cudaHostRegister(...)` on that local mapping
-  when configured to do so,
-- `HostKVCache` allocates L2 pages directly from this slab,
-- one allocator `slot` corresponds to one HiCache KV page,
-- each slot carries a monotonically increasing `generation` used to distinguish
-  one residency lifetime from the next after reuse,
-- `batch_set_v1(...)` and `batch_get_v1(...)` reference those page offsets
-  directly in `source_layout` and `target_layout`.
-
-With that shape, the data path becomes:
+With allocator-backed residency, the data path becomes:
 
 - write side:
   - `L2 page already lives in Tensorcast-exported HOST_SHARED slab`
   - `BatchPutIfAbsentFromRegion(...)` references page offsets directly
   - this removes the extra SGLang-side staging copy, but it does **not** imply
     that Tensorcast already has a CPU-source direct-RDMA export path
-  - therefore the first Phase-B write path SHOULD continue to use the existing
+  - therefore the first allocator-backed direct write path SHOULD continue to
+    use the existing
     Tensorcast communicator/export transport on the daemon side; CPU-source
     direct RDMA is follow-up communicator work rather than part of this
     milestone
@@ -836,7 +735,7 @@ With that shape, the data path becomes:
     host staging buffer first
   - no extra SGLang-side staging copy is needed
 
-Phase-B zero-copy data flow:
+Allocator-backed direct-host data flow:
 
 ```mermaid
 flowchart LR
@@ -866,7 +765,8 @@ Pinned-host operational policy:
 
 ##### Host-slab and slot residency state machine
 
-For Phase B, one allocator slot is the ownership unit:
+For allocator-backed direct residency, one allocator slot is the ownership
+unit:
 
 - one slot corresponds to one HiCache KV page,
 - one batch operation may cover multiple slots,
@@ -881,11 +781,12 @@ For Phase B, one allocator slot is the ownership unit:
   before it may be reused,
 - any in-flight `get` completion, local bookkeeping record, or later callback
   that still refers to the old generation MUST be treated as stale and ignored,
-- this is the Phase-B mechanism that prevents ABA when one page slot is freed,
+- this is the slot-generation mechanism that prevents ABA when one page slot is
+  freed,
   reused for another logical page, and then receives a delayed completion from
   the old lifetime.
 
-Minimal Phase-B slot token:
+Minimal slot token:
 
 - the request path MUST carry enough information to identify not only the slab
   byte range but also the intended slot lifetime,
@@ -953,7 +854,7 @@ rather than repeatedly creating and destroying region objects.
 
 Allocator-slab failure rule:
 
-- one failed `batch_get_v1(...)` or `batch_set_v1(...)` on Phase-B direct L2
+- one failed `batch_get_v1(...)` or `batch_set_v1(...)` on allocator-backed direct L2
   residency SHOULD invalidate only the affected page slots,
 - it SHOULD NOT retire the whole slab or invalidate unrelated resident pages,
 - and slab replacement SHOULD remain a rare control-path recovery for fatal
@@ -975,15 +876,16 @@ Allocator-slab failure rule:
   remove it from any provisional bookkeeping, wait for in-flight refs to drain,
   bump generation, and return it to `SlotFree`.
 
-Phase-B read or write scope clarification:
+Allocator-backed read or write scope clarification:
 
-- the Phase-B zero-copy win is defined first at the SGLang <-> local-daemon
+- the zero-copy win is defined first at the SGLang <-> local-daemon
   boundary,
 - `batch_get_v1(...)` SHOULD use Tensorcast direct-write into destination
   `HOST_SHARED` slots or contiguous slot runs,
 - `batch_set_v1(...)` SHOULD publish from those source slots directly without an
   extra SGLang staging copy,
-- but Phase-B does **not** require a new CPU-source direct-RDMA communicator
+- but allocator-backed direct residency does **not** require a new CPU-source
+  direct-RDMA communicator
   path for put; that remains follow-up transport optimization work inside
   Tensorcast.
 
@@ -1000,16 +902,19 @@ Slab teardown order:
 6. Unmap the memfd from the SGLang rank.
 7. Release the local slab lease so the daemon may reap the slab.
 
-This order is normative for Phase B because reversing it can leave pinned or
-in-flight slot references pointing at unmapped or re-exported host memory.
+This order is normative for allocator-backed direct host residency because
+reversing it can leave pinned or in-flight slot references pointing at unmapped
+or re-exported host memory.
 
-This medium-term plan remains future work:
+Remaining follow-up work after the current implementation is narrower:
 
-- it requires Tensorcast core changes in the region-backed batch path,
-- it requires SGLang integration changes in both the backend client and the
-  host allocator,
-- but it is the intended steady-state direction after the current GPU-staging
-  bridge.
+- request-transfer-specific `PublishManifest` / `hydrate(publish_manifest=...)`
+  support is still missing,
+- prefix-bundle programmability is still an optional future layer rather than a
+  public API,
+- and put-side CPU-source direct-RDMA transport is still a later optimization,
+  not a requirement for the current correctness or zero-extra-copy local
+  boundary.
 
 ### 4.3 Relationship to current SGLang hashing
 
@@ -1343,14 +1248,14 @@ The reason is pragmatic:
 - preserves the existing `HiCacheController` / host-pool scheduling model,
 - and matches the existing Mooncake-like storage backend contract.
 
-Under the current Tensorcast byte-artifact fast-path constraints, the first
-implementation MAY still use reusable GPU staging buffers internally for batch
-publication and retrieval. That does not change the memory-hierarchy contract:
+Under the current Tensorcast byte-artifact fast-path, the active implementation
+uses `HOST_SHARED` regions rather than reusable GPU staging buffers. That does
+not change the memory-hierarchy contract:
 
 - SGLang still owns `L1 <-> L2`,
 - Tensorcast still owns `L2 <-> distributed pool`,
-- GPU staging is only a temporary transport scratch path until host-native
-  region registration exists.
+- and the hot path remains host/L2-facing even when allocator-backed direct
+  residency removes extra local host copies.
 
 Tensorcast GPU fast paths such as CUDA-IPC-backed mapped-target materialization
 remain valuable, but they should be treated as later optimizations or
@@ -2349,17 +2254,12 @@ request-transfer surface.
 ### 8.2 What Tensorcast does not yet directly provide
 
 Current Tensorcast does not yet directly provide all the primitives needed for
-either:
-
-- the prefix-share hot path, or
-- the final explicit-handle request-transfer surface.
+the final explicit-handle request-transfer surface.
 
 The main gaps are:
 
 - a stable public page-store-style batch API tailored for high-cardinality KV
   page IO, rather than today’s lower-level byte-artifact batch-region surfaces,
-- host-native batch region registration for byte-artifact ingress/egress,
-- a Tensorcast-aware SGLang host allocator for L2 page residency,
 - explicit public prefix-bundle programmability,
 - `PublishResult.publish_manifest`,
 - opaque `EngineOwnedManifest` carriage in the instance-step result path,
@@ -2371,10 +2271,10 @@ The main gaps are:
 
 Because of these gaps, the recommended implementation strategy is:
 
-- build the prefix-share path as an internal SGLang integration over Tensorcast
-  storage/artifact primitives,
-- while using current Tensorcast programmability for request transfer with as
-  little Tensorcast-core extension as possible.
+- keep the already-implemented prefix-share path as an internal SGLang
+  integration over Tensorcast byte-artifact and region-backed primitives,
+- while extending Tensorcast programmability for request transfer with as
+  little Tensorcast-core change as possible.
 
 ---
 
@@ -2399,12 +2299,17 @@ Implemented in the current repo:
 
 Implement:
 
-- the byte-artifact-native batch `exists/get/set` path over VRAM staging,
+- the byte-artifact-native batch `exists/get/set` path over `HOST_SHARED`
+  regions,
+- persistent `HOST_SHARED` scratch-slab transport for ordinary host pools,
+- allocator-backed direct host residency with `page_blob_direct`,
+  slot-generation protection, and optional `cudaHostRegister(...)`,
 - the `share_local` Tensorcast benchmark harness,
 - `tensorcast-daemon-mode=share`,
 - `tensorcast-daemon-mode=separate`,
 - explicit benchmark `rid`,
 - source-publication-drain measurement,
+- overlap-mode request-pair driving with `--pair-rps` and `--settle-ms`,
 - and log-based validation of real HiCache prefix reuse.
 
 Goal:

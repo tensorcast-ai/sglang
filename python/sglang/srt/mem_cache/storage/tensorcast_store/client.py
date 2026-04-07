@@ -15,16 +15,22 @@ import time
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 import torch
 
+from sglang.srt.mem_cache.host_shared_slot_state import HostSharedPageSlotToken
 from sglang.srt.mem_cache.storage.tensorcast_store.config import (
     TensorcastHiCacheConfig,
 )
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.storage.tensorcast_store.host_allocator import (
+        TensorcastHostRegionBinding,
+    )
 
 
 @dataclass(frozen=True)
@@ -53,12 +59,16 @@ class TensorcastPageClient(Protocol):
         self,
         logical_keys: list[str],
         pages: list[torch.Tensor],
+        slot_tokens: list[HostSharedPageSlotToken] | None = None,
+        source_region_binding: "TensorcastHostRegionBinding | None" = None,
     ) -> TensorcastBatchTransferResult: ...
 
     def batch_get_into(
         self,
         logical_keys: list[str],
         targets: list[torch.Tensor],
+        slot_tokens: list[HostSharedPageSlotToken] | None = None,
+        target_region_binding: "TensorcastHostRegionBinding | None" = None,
     ) -> TensorcastBatchTransferResult: ...
 
 
@@ -322,9 +332,13 @@ class DefaultTensorcastPageClient:
         self,
         logical_keys: list[str],
         pages: list[torch.Tensor],
+        slot_tokens: list[HostSharedPageSlotToken] | None = None,
+        source_region_binding: "TensorcastHostRegionBinding | None" = None,
     ) -> TensorcastBatchTransferResult:
         if len(logical_keys) != len(pages):
             raise ValueError("logical_keys and pages must have the same length")
+        if slot_tokens is not None and len(slot_tokens) != len(logical_keys):
+            raise ValueError("slot_tokens and logical_keys must have the same length")
         if not logical_keys:
             return TensorcastBatchTransferResult(
                 success_mask=(),
@@ -339,11 +353,27 @@ class DefaultTensorcastPageClient:
         total_bytes = 0
         for logical_key, page in zip(logical_keys, pages, strict=True):
             artifact_id = self.artifact_id_for(logical_key)
-            page_bytes = _cpu_tensor_as_uint8_view(page)
-            byte_length = int(page_bytes.numel())
+            byte_length = int(page.numel()) * int(page.element_size())
+            page_bytes = (
+                page
+                if source_region_binding is not None
+                else _cpu_tensor_as_uint8_view(page)
+            )
             packed_pages.append((logical_key, artifact_id, page_bytes, byte_length))
             total_bytes += byte_length
         pack_elapsed_s = time.perf_counter() - pack_started_at
+        if source_region_binding is not None:
+            if slot_tokens is None:
+                raise ValueError(
+                    "source_region_binding requires slot_tokens for direct host-slot publish"
+                )
+            return self._batch_put_from_resident_slots(
+                logical_keys=logical_keys,
+                packed_pages=packed_pages,
+                pack_elapsed_s=pack_elapsed_s,
+                slot_tokens=slot_tokens,
+                source_region_binding=source_region_binding,
+            )
         staging = self._put_staging.ensure_capacity(total_bytes)
         source_layout = self._store_daemon_pb2.TargetLayout(
             layout_kind=self._store_daemon_pb2.TargetLayout.LAYOUT_KIND_COALESCED_UNSPECIFIED,
@@ -365,7 +395,9 @@ class DefaultTensorcastPageClient:
         items = []
         stage_started_at = time.perf_counter()
         cursor = 0
-        for _, artifact_id, page_bytes, byte_length in packed_pages:
+        for item_index, (_, artifact_id, page_bytes, byte_length) in enumerate(
+            packed_pages
+        ):
             staging.tensor[cursor : cursor + byte_length].copy_(
                 page_bytes,
                 non_blocking=False,
@@ -375,6 +407,9 @@ class DefaultTensorcastPageClient:
             offset.storage_id = "storage-0"
             offset.storage_offset = int(cursor)
             offset.logical_length = int(byte_length)
+            if slot_tokens is not None:
+                offset.slot_index = int(slot_tokens[item_index].slot_index)
+                offset.slot_generation = int(slot_tokens[item_index].slot_generation)
             item = self._store_daemon_pb2.BatchPutIfAbsentFromRegionItem(
                 selection=self._selection_for(artifact_id),
                 invariant=self._store_daemon_pb2.PutIfAbsentInvariant(
@@ -455,13 +490,141 @@ class DefaultTensorcastPageClient:
             host_fill_elapsed_s=0.0,
         )
 
+    def _batch_put_from_resident_slots(
+        self,
+        *,
+        logical_keys: list[str],
+        packed_pages: list[tuple[str, str, torch.Tensor, int]],
+        pack_elapsed_s: float,
+        slot_tokens: list[HostSharedPageSlotToken],
+        source_region_binding: "TensorcastHostRegionBinding",
+    ) -> TensorcastBatchTransferResult:
+        source_layout = self._store_daemon_pb2.TargetLayout(
+            layout_kind=self._store_daemon_pb2.TargetLayout.LAYOUT_KIND_COALESCED_UNSPECIFIED,
+            index_kind=self._store_daemon_pb2.TargetLayout.INDEX_KIND_CANONICAL_UNSPECIFIED,
+            tensor_spec_kind=self._store_daemon_pb2.TargetLayout.TENSOR_SPEC_KIND_OFFSETS,
+        )
+        storage = source_layout.storages.add()
+        storage.storage_id = "storage-0"
+        storage.device_id = -1
+        storage.storage_length = int(source_region_binding.capacity_bytes)
+        storage.mapping_base_offset = 0
+        region_ref = storage.region_ref
+        region_ref.region_id = str(source_region_binding.region_id)
+        region_ref.memory_kind = (
+            self._store_daemon_pb2.REGION_MEMORY_KIND_HOST_SHARED
+        )
+        region_ref.device_id = -1
+        region_ref.size_bytes = int(source_region_binding.capacity_bytes)
+
+        items = []
+        page_bytes_per_slot: int | None = None
+        for item_index, (_, artifact_id, _, byte_length) in enumerate(packed_pages):
+            if page_bytes_per_slot is None:
+                page_bytes_per_slot = int(byte_length)
+            elif page_bytes_per_slot != int(byte_length):
+                raise ValueError(
+                    "resident-slot direct publish requires fixed byte length per page slot"
+                )
+            offset = source_layout.offsets.add()
+            offset.name = artifact_id
+            offset.storage_id = "storage-0"
+            offset.storage_offset = int(slot_tokens[item_index].slot_index) * int(
+                page_bytes_per_slot
+            )
+            offset.logical_length = int(byte_length)
+            offset.slot_index = int(slot_tokens[item_index].slot_index)
+            offset.slot_generation = int(slot_tokens[item_index].slot_generation)
+            item = self._store_daemon_pb2.BatchPutIfAbsentFromRegionItem(
+                selection=self._selection_for(artifact_id),
+                invariant=self._store_daemon_pb2.PutIfAbsentInvariant(
+                    layout_id=self._layout_id,
+                    byte_length=int(byte_length),
+                    verification_mode=(
+                        self._store_daemon_pb2.BYTE_ARTIFACT_VERIFICATION_MODE_LAYOUT_AND_SIZE_ONLY
+                    ),
+                ),
+            )
+            items.append(item)
+
+        rpc_started_at = time.perf_counter()
+        response = self._client.batch_put_if_absent_from_region(
+            items=items,
+            source_layout=source_layout,
+            pid=os.getpid(),
+            device_uuid="",
+            operation_id=uuid.uuid4().hex,
+            timeout_s=float(self._config.batch_transfer_timeout_s),
+        )
+        rpc_elapsed_s = time.perf_counter() - rpc_started_at
+        ok_status = int(self._store_daemon_pb2.BATCH_ITEM_STATUS_OK)
+        outcome_by_artifact = {
+            str(outcome.artifact_id): outcome for outcome in response.outcomes
+        }
+        status_counts = collections.Counter(
+            int(outcome.status) for outcome in response.outcomes
+        )
+        success_mask: list[bool] = []
+        adopted_duplicate_count = 0
+        for _, artifact_id, _, _ in packed_pages:
+            outcome = outcome_by_artifact.get(artifact_id)
+            status = int(outcome.status) if outcome is not None else 0
+            if status == ok_status:
+                if (
+                    outcome is not None
+                    and str(outcome.message).strip().lower() == "joined"
+                ):
+                    adopted_duplicate_count += 1
+                success_mask.append(True)
+                continue
+            success_mask.append(False)
+        failed_statuses = {
+            self._store_daemon_pb2.BatchItemStatus.Name(status): count
+            for status, count in status_counts.items()
+            if status != ok_status
+        }
+        if failed_statuses:
+            failure_messages = []
+            invariant_mismatch_detected = False
+            for artifact_id, outcome in outcome_by_artifact.items():
+                status = int(outcome.status)
+                if status == ok_status:
+                    continue
+                if "invariant mismatch" in str(outcome.message).lower():
+                    invariant_mismatch_detected = True
+                failure_messages.append(
+                    f"{artifact_id}:{self._store_daemon_pb2.BatchItemStatus.Name(status)}:{outcome.message}"
+                )
+                if len(failure_messages) >= 3:
+                    break
+            log_fn = logger.warning if invariant_mismatch_detected else logger.debug
+            log_fn(
+                "Tensorcast direct batch_put failures statuses=%s first_key=%s first_artifact_id=%s samples=%s",
+                failed_statuses,
+                logical_keys[0],
+                packed_pages[0][1],
+                failure_messages,
+            )
+        return TensorcastBatchTransferResult(
+            success_mask=tuple(success_mask),
+            adopted_duplicate_count=adopted_duplicate_count,
+            pack_elapsed_s=pack_elapsed_s,
+            stage_copy_elapsed_s=0.0,
+            rpc_elapsed_s=rpc_elapsed_s,
+            host_fill_elapsed_s=0.0,
+        )
+
     def batch_get_into(
         self,
         logical_keys: list[str],
         targets: list[torch.Tensor],
+        slot_tokens: list[HostSharedPageSlotToken] | None = None,
+        target_region_binding: "TensorcastHostRegionBinding | None" = None,
     ) -> TensorcastBatchTransferResult:
         if len(logical_keys) != len(targets):
             raise ValueError("logical_keys and targets must have the same length")
+        if slot_tokens is not None and len(slot_tokens) != len(logical_keys):
+            raise ValueError("slot_tokens and logical_keys must have the same length")
         if not logical_keys:
             return TensorcastBatchTransferResult(
                 success_mask=(),
@@ -470,6 +633,17 @@ class DefaultTensorcastPageClient:
                 stage_copy_elapsed_s=0.0,
                 rpc_elapsed_s=0.0,
                 host_fill_elapsed_s=0.0,
+            )
+        if target_region_binding is not None:
+            if slot_tokens is None:
+                raise ValueError(
+                    "target_region_binding requires slot_tokens for direct host-slot fetch"
+                )
+            return self._batch_get_into_resident_slots(
+                logical_keys=logical_keys,
+                targets=targets,
+                slot_tokens=slot_tokens,
+                target_region_binding=target_region_binding,
             )
         pack_started_at = time.perf_counter()
         packed_targets: list[tuple[str, str, torch.Tensor, int]] = []
@@ -501,13 +675,16 @@ class DefaultTensorcastPageClient:
         region_ref.size_bytes = int(staging.capacity_bytes)
         selections = []
         cursor = 0
-        for _, artifact_id, _, byte_length in packed_targets:
+        for item_index, (_, artifact_id, _, byte_length) in enumerate(packed_targets):
             selections.append(self._selection_for(artifact_id))
             offset = target_layout.offsets.add()
             offset.name = artifact_id
             offset.storage_id = "storage-0"
             offset.storage_offset = int(cursor)
             offset.logical_length = int(byte_length)
+            if slot_tokens is not None:
+                offset.slot_index = int(slot_tokens[item_index].slot_index)
+                offset.slot_generation = int(slot_tokens[item_index].slot_generation)
             cursor += byte_length
         operation_id = uuid.uuid4().hex
         rpc_started_at = time.perf_counter()
@@ -580,6 +757,126 @@ class DefaultTensorcastPageClient:
             stage_copy_elapsed_s=0.0,
             rpc_elapsed_s=rpc_elapsed_s,
             host_fill_elapsed_s=host_fill_elapsed_s,
+            operation_id=operation_id,
+        )
+
+    def _batch_get_into_resident_slots(
+        self,
+        *,
+        logical_keys: list[str],
+        targets: list[torch.Tensor],
+        slot_tokens: list[HostSharedPageSlotToken],
+        target_region_binding: "TensorcastHostRegionBinding",
+    ) -> TensorcastBatchTransferResult:
+        pack_started_at = time.perf_counter()
+        packed_targets: list[tuple[str, str, int]] = []
+        page_bytes_per_slot: int | None = None
+        for logical_key, target in zip(logical_keys, targets, strict=True):
+            artifact_id = self.artifact_id_for(logical_key)
+            target_bytes = _cpu_tensor_as_uint8_view(target)
+            byte_length = int(target_bytes.numel())
+            if page_bytes_per_slot is None:
+                page_bytes_per_slot = int(byte_length)
+            elif page_bytes_per_slot != int(byte_length):
+                raise ValueError(
+                    "resident-slot direct fetch requires fixed byte length per page slot"
+                )
+            packed_targets.append((logical_key, artifact_id, byte_length))
+        pack_elapsed_s = time.perf_counter() - pack_started_at
+
+        target_layout = self._store_daemon_pb2.TargetLayout(
+            layout_kind=self._store_daemon_pb2.TargetLayout.LAYOUT_KIND_COALESCED_UNSPECIFIED,
+            index_kind=self._store_daemon_pb2.TargetLayout.INDEX_KIND_CANONICAL_UNSPECIFIED,
+            tensor_spec_kind=self._store_daemon_pb2.TargetLayout.TENSOR_SPEC_KIND_OFFSETS,
+        )
+        storage = target_layout.storages.add()
+        storage.storage_id = "storage-0"
+        storage.device_id = -1
+        storage.storage_length = int(target_region_binding.capacity_bytes)
+        storage.mapping_base_offset = 0
+        region_ref = storage.region_ref
+        region_ref.region_id = str(target_region_binding.region_id)
+        region_ref.memory_kind = (
+            self._store_daemon_pb2.REGION_MEMORY_KIND_HOST_SHARED
+        )
+        region_ref.device_id = -1
+        region_ref.size_bytes = int(target_region_binding.capacity_bytes)
+
+        selections = []
+        for item_index, (_, artifact_id, byte_length) in enumerate(packed_targets):
+            selections.append(self._selection_for(artifact_id))
+            offset = target_layout.offsets.add()
+            offset.name = artifact_id
+            offset.storage_id = "storage-0"
+            offset.storage_offset = int(slot_tokens[item_index].slot_index) * int(
+                page_bytes_per_slot
+            )
+            offset.logical_length = int(byte_length)
+            offset.slot_index = int(slot_tokens[item_index].slot_index)
+            offset.slot_generation = int(slot_tokens[item_index].slot_generation)
+
+        operation_id = uuid.uuid4().hex
+        rpc_started_at = time.perf_counter()
+        response = self._client.batch_get_into_region(
+            selections=selections,
+            target_layout=target_layout,
+            pid=os.getpid(),
+            device_uuid="",
+            operation_id=operation_id,
+            timeout_s=float(self._config.batch_transfer_timeout_s),
+        )
+        rpc_elapsed_s = time.perf_counter() - rpc_started_at
+        ok_status = int(self._store_daemon_pb2.BATCH_ITEM_STATUS_OK)
+        outcome_by_artifact = {
+            str(outcome.artifact_id): outcome for outcome in response.outcomes
+        }
+        status_counts = collections.Counter(
+            int(outcome.status) for outcome in response.outcomes
+        )
+        success_mask: list[bool] = []
+        stop_copying = False
+        for _, artifact_id, _ in packed_targets:
+            outcome = outcome_by_artifact.get(artifact_id)
+            status = (
+                int(outcome.status)
+                if outcome is not None
+                else int(self._store_daemon_pb2.BATCH_ITEM_STATUS_MISS)
+            )
+            if stop_copying or status != ok_status:
+                stop_copying = True
+                success_mask.append(False)
+                continue
+            success_mask.append(True)
+        failed_statuses = {
+            self._store_daemon_pb2.BatchItemStatus.Name(status): count
+            for status, count in status_counts.items()
+            if status != ok_status
+        }
+        if failed_statuses:
+            failure_messages = []
+            for artifact_id, outcome in outcome_by_artifact.items():
+                status = int(outcome.status)
+                if status == ok_status:
+                    continue
+                failure_messages.append(
+                    f"{artifact_id}:{self._store_daemon_pb2.BatchItemStatus.Name(status)}:{outcome.message}"
+                )
+                if len(failure_messages) >= 3:
+                    break
+            logger.debug(
+                "Tensorcast direct batch_get failures statuses=%s first_key=%s first_artifact_id=%s samples=%s",
+                failed_statuses,
+                logical_keys[0],
+                packed_targets[0][1],
+                failure_messages,
+            )
+        return TensorcastBatchTransferResult(
+            success_mask=tuple(success_mask),
+            adopted_duplicate_count=0,
+            pack_elapsed_s=pack_elapsed_s,
+            stage_copy_elapsed_s=0.0,
+            rpc_elapsed_s=rpc_elapsed_s,
+            host_fill_elapsed_s=0.0,
             operation_id=operation_id,
         )
 

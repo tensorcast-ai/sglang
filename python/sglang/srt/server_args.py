@@ -2050,12 +2050,12 @@ class ServerArgs:
 
     def _handle_hicache(self):
         if (
-            self.hicache_mem_layout == "page_first_direct"
+            self.hicache_mem_layout in ["page_first_direct", "page_blob_direct"]
             and self.hicache_io_backend == "kernel"
         ):
             self.hicache_io_backend = "direct"
             logger.warning(
-                "Kernel io backend does not support page first direct layout"
+                "Kernel io backend does not support the requested direct page layout"
             )
 
         if (
@@ -3959,6 +3959,7 @@ class ServerArgs:
                 "layer_first",
                 "page_first",
                 "page_first_direct",
+                "page_blob_direct",
                 "page_first_kv_split",
                 "page_head",
             ],

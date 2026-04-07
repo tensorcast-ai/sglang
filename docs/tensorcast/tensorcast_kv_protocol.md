@@ -20,6 +20,10 @@ Implementation details and internal design choices live in:
 - `sglang/docs/tensorcast/tensorcast_kv_integration.md`
 
 Status:
+- The prefix-share half of this protocol is already implemented in the current
+  SGLang repo as an internal HiCache backend over Tensorcast byte-artifact batch
+  APIs, `HOST_SHARED` region-backed transfer, and optional allocator-backed
+  direct host residency.
 - Tensorcast core already provides the public plan surface needed for the
   request-level transfer control plane:
   `connect`, `directory`, `plan`, `publish`, `hydrate`,
@@ -36,9 +40,10 @@ Status:
   plane, not per-request external plan orchestration.
 - The SGLang KV-specific in-process instance-agent / `EngineAdapter`
   integration is not implemented yet.
-- Therefore this document is a **v1 target protocol** for the upcoming KV
-  integration, not a statement that end-to-end prefix share and request
-  transfer are already working in SGLang today.
+- Therefore this document mixes:
+  - the already-implemented prefix-share contract, and
+  - the still-target request-transfer contract that is not implemented end to
+    end in SGLang today.
 
 Installation prerequisite:
 - Inference servers that will execute Tensorcast plans must have Tensorcast

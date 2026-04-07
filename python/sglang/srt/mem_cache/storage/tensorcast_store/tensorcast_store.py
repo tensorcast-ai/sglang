@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 import logging
 import threading
 import time
@@ -16,6 +17,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
+from sglang.srt.mem_cache.host_shared_slot_state import HostSharedPageSlotToken
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.tensorcast_store.client import (
     DefaultTensorcastPageClient,
@@ -117,6 +119,15 @@ class TensorcastStore(HiCacheStorage):
         )
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
+        if self._tensorcast_config.host_allocator_enabled:
+            if mem_pool_host.layout != "page_blob_direct":
+                raise ValueError(
+                    "TensorCast allocator-backed host residency requires mem_pool_host.layout=page_blob_direct"
+                )
+            if mem_pool_host.host_region_binding is None:
+                raise ValueError(
+                    "TensorCast allocator-backed host residency requires a live host_region_binding"
+                )
         super().register_mem_pool_host(mem_pool_host)
 
     def _build_rank_suffix(self) -> str:
@@ -160,6 +171,40 @@ class TensorcastStore(HiCacheStorage):
             self.mem_pool_host.get_data_page(index, flat=True) for index in page_starts
         ]
 
+    def _slot_tokens_enabled(
+        self, extra_info: HiCacheStorageExtraInfo | None
+    ) -> bool:
+        if extra_info is None or extra_info.extra_info is None:
+            return False
+        enabled = extra_info.extra_info.get("tensorcast_use_host_slot_tokens", False)
+        return bool(enabled)
+
+    def _slot_tokens_for_page_starts_if_enabled(
+        self,
+        page_starts: list[int],
+        extra_info: HiCacheStorageExtraInfo | None,
+    ) -> list[HostSharedPageSlotToken] | None:
+        if not self._slot_tokens_enabled(extra_info):
+            return None
+        return list(self.mem_pool_host.slot_tokens_for_page_starts(page_starts))
+
+    def _allocator_backed_direct_put_enabled(self) -> bool:
+        return (
+            self._tensorcast_config.host_allocator_enabled
+            and self.mem_pool_host.host_region_binding is not None
+        )
+
+    def _allocator_backed_direct_get_enabled(self) -> bool:
+        return self._allocator_backed_direct_put_enabled()
+
+    def _success_prefix_count(self, success_mask: tuple[bool, ...]) -> int:
+        prefix_success = 0
+        for success in success_mask:
+            if not success:
+                break
+            prefix_success += 1
+        return prefix_success
+
     def batch_exists(
         self,
         keys: list[str],
@@ -192,10 +237,40 @@ class TensorcastStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: HiCacheStorageExtraInfo | None = None,
     ) -> list[bool]:
-        _ = extra_info
         page_starts = self._page_start_indices(host_indices, len(keys))
         targets = self._host_page_views(page_starts)
-        result = self._page_client.batch_get_into(keys, targets)
+        direct_get_enabled = self._allocator_backed_direct_get_enabled()
+        slot_tokens = (
+            list(self.mem_pool_host.reserve_page_slots(page_starts, keys))
+            if direct_get_enabled
+            else self._slot_tokens_for_page_starts_if_enabled(page_starts, extra_info)
+        )
+        target_region_binding = (
+            self.mem_pool_host.host_region_binding if direct_get_enabled else None
+        )
+        if direct_get_enabled:
+            self.mem_pool_host.mark_page_get_inflight(slot_tokens)
+        try:
+            result = self._page_client.batch_get_into(
+                keys,
+                targets,
+                slot_tokens=slot_tokens,
+                target_region_binding=target_region_binding,
+            )
+        except Exception:
+            if direct_get_enabled:
+                with suppress(Exception):
+                    self.mem_pool_host.fail_page_get(slot_tokens)
+            raise
+        if direct_get_enabled:
+            prefix_success = self._success_prefix_count(result.success_mask)
+            if prefix_success > 0:
+                self.mem_pool_host.commit_page_get_success(
+                    slot_tokens[:prefix_success],
+                    keys[:prefix_success],
+                )
+            if prefix_success < len(slot_tokens):
+                self.mem_pool_host.fail_page_get(slot_tokens[prefix_success:])
         first_key = keys[0] if keys else ""
         first_artifact_id = (
             self._page_client.artifact_id_for(first_key) if first_key else ""
@@ -219,11 +294,24 @@ class TensorcastStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: HiCacheStorageExtraInfo | None = None,
     ) -> list[bool]:
-        _ = extra_info
         page_starts = self._page_start_indices(host_indices, len(keys))
         pages = self._host_page_views(page_starts)
+        direct_put_enabled = self._allocator_backed_direct_put_enabled()
+        slot_tokens = (
+            list(self.mem_pool_host.slot_tokens_for_page_starts(page_starts))
+            if direct_put_enabled
+            else self._slot_tokens_for_page_starts_if_enabled(page_starts, extra_info)
+        )
+        source_region_binding = (
+            self.mem_pool_host.host_region_binding if direct_put_enabled else None
+        )
         batch_started_at = time.perf_counter()
-        result: TensorcastBatchTransferResult = self._page_client.batch_put(keys, pages)
+        result: TensorcastBatchTransferResult = self._page_client.batch_put(
+            keys,
+            pages,
+            slot_tokens=slot_tokens,
+            source_region_binding=source_region_binding,
+        )
         batch_elapsed_s = time.perf_counter() - batch_started_at
         succeeded = sum(1 for item in result.success_mask if item)
         failed_pages = len(keys) - succeeded

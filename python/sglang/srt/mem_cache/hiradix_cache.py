@@ -5,7 +5,7 @@ import json
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
@@ -49,7 +49,9 @@ class HiRadixCache(RadixCache):
 
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
-
+        raw_storage_extra_config = self._load_storage_backend_extra_config(
+            server_args.hicache_storage_backend_extra_config
+        )
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
@@ -58,6 +60,7 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                allocator_config=raw_storage_extra_config,
             )
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
@@ -67,9 +70,10 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                allocator_config=raw_storage_extra_config,
             )
         else:
-            raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
+            raise ValueError("HiRadixCache only supports MHA and MLA yet")
 
         self.tp_group = params.tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -85,7 +89,7 @@ class HiRadixCache(RadixCache):
             prefetch_timeout_per_ki_token,
             hicache_storage_pass_prefix_keys,
         ) = self._parse_storage_backend_extra_config(
-            server_args.hicache_storage_backend_extra_config
+            raw_storage_extra_config
         )
         self.prefetch_threshold = prefetch_threshold
         self.prefetch_timeout_base = prefetch_timeout_base
@@ -139,8 +143,19 @@ class HiRadixCache(RadixCache):
 
         super().__init__(params=params)
 
-    def _parse_storage_backend_extra_config(
+    def _load_storage_backend_extra_config(
         self, storage_backend_extra_config: Optional[str]
+    ) -> dict[str, Any]:
+        if storage_backend_extra_config is None:
+            return {}
+        try:
+            return json.loads(storage_backend_extra_config)
+        except Exception as e:
+            logger.error(f"Invalid backend extra config JSON: {e}")
+            raise e
+
+    def _parse_storage_backend_extra_config(
+        self, storage_backend_extra_config: Optional[dict[str, Any] | str]
     ):
         """
         Parse storage backend extra config JSON and extract specific parameters.
@@ -152,13 +167,11 @@ class HiRadixCache(RadixCache):
             tuple: (extra_config_dict, prefetch_threshold, prefetch_timeout_base, prefetch_timeout_per_ki_token, hicache_storage_pass_prefix_keys)
         """
         # Parse extra config JSON if provided
-        extra_config = {}
-        if storage_backend_extra_config:
-            try:
-                extra_config = json.loads(storage_backend_extra_config)
-            except Exception as e:
-                logger.error(f"Invalid backend extra config JSON: {e}")
-                raise e
+        extra_config = (
+            self._load_storage_backend_extra_config(storage_backend_extra_config)
+            if isinstance(storage_backend_extra_config, str)
+            else dict(storage_backend_extra_config or {})
+        )
 
         prefetch_threshold = extra_config.pop("prefetch_threshold", 256)  # tokens
         prefetch_timeout_base = extra_config.pop("prefetch_timeout_base", 1)  # seconds

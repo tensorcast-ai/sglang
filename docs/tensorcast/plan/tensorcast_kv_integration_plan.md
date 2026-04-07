@@ -29,6 +29,11 @@ This split is the right one for the current codebase because:
 - `Phase 3` is the first phase that requires Tensorcast programmability-facing
   API additions and in-process instance-agent work.
 
+Current repo status:
+
+- `Phase 0` through `Phase 2.5` are implemented in the current codebase.
+- `Phase 3` and `Phase 4` remain planned.
+
 ## Target Outcome
 
 - Add a Tensorcast-backed shared KV substrate for SGLang HiCache pages, with KV
@@ -46,65 +51,65 @@ This split is the right one for the current codebase because:
 
 ## Phase 0 - Foundation and Scope Freeze
 
-- [ ] Keep documentation aligned before code lands:
-  - [ ] Treat `tensorcast_kv_protocol.md` as the external contract.
-  - [ ] Treat `tensorcast_kv_integration.md` as the internal design source of truth.
-  - [ ] Keep this plan file updated as implementation decisions change.
-- [ ] Freeze phase boundaries:
-  - [ ] `Phase 1` must not require Tensorcast plan / instance-step changes.
-  - [ ] `Phase 1.5` must preserve the Phase-1 external substrate contract while replacing the hot-path data plane.
-  - [ ] `Phase 2` must not require an external controller or request handoff.
-  - [ ] `Phase 2.5` must stay within the existing prefix-share hot path while replacing the local SGLang <-> daemon memory boundary.
-  - [ ] `Phase 3` is the only phase allowed to extend Tensorcast request-transfer semantics.
-- [ ] Freeze the Phase-2 success criterion:
-  - [ ] `benchmark/tensorcast_benchmark/kv/share_local` must run with
+- [x] Keep documentation aligned before code lands:
+  - [x] Treat `tensorcast_kv_protocol.md` as the external contract.
+  - [x] Treat `tensorcast_kv_integration.md` as the internal design source of truth.
+  - [x] Keep this plan file updated as implementation decisions change.
+- [x] Freeze phase boundaries:
+  - [x] `Phase 1` must not require Tensorcast plan / instance-step changes.
+  - [x] `Phase 1.5` must preserve the Phase-1 external substrate contract while replacing the hot-path data plane.
+  - [x] `Phase 2` must not require an external controller or request handoff.
+  - [x] `Phase 2.5` must stay within the existing prefix-share hot path while replacing the local SGLang <-> daemon memory boundary.
+  - [x] `Phase 3` is the only phase allowed to extend Tensorcast request-transfer semantics.
+- [x] Freeze the Phase-2 success criterion:
+  - [x] `benchmark/tensorcast_benchmark/kv/share_local` must run with
     `hicache-storage-backend=tensorcast`.
-  - [ ] The benchmark must start Tensorcast services automatically.
-  - [ ] The benchmark must preserve the same output contract as the Mooncake path.
-  - [ ] The target first validation environment is `charged-group=codesign`.
-- [ ] Preserve non-goals for early phases:
-  - [ ] No PD-prefill/decode split in `share_local`.
-  - [ ] No request-level `publish()` / `hydrate()` in `share_local`.
-  - [ ] No Tensorcast-core semantic changes for prefix-share hot path behavior.
+  - [x] The benchmark must start Tensorcast services automatically.
+  - [x] The benchmark must preserve the same output contract as the Mooncake path.
+  - [x] The target first validation environment is `charged-group=codesign`.
+- [x] Preserve non-goals for early phases:
+  - [x] No PD-prefill/decode split in `share_local`.
+  - [x] No request-level `publish()` / `hydrate()` in `share_local`.
+  - [x] No Tensorcast-core semantic changes for prefix-share hot path behavior.
 
 ## Phase 1 - Shared KV Substrate
 
 This phase creates the smallest useful unit: a Tensorcast-backed HiCache
 storage backend that can publish and retrieve page data correctly.
 
-- [ ] Add a built-in SGLang HiCache backend named `tensorcast`:
+- [x] Add a built-in SGLang HiCache backend named `tensorcast`:
   - [x] Extend `--hicache-storage-backend` validation to include `tensorcast`.
   - [x] Register a Tensorcast backend in `StorageBackendFactory`.
   - [x] Add a dedicated backend package under
     `sglang/python/sglang/srt/mem_cache/storage/tensorcast_store/`.
-- [ ] Define the SGLang-side Tensorcast backend config surface:
+- [x] Define the SGLang-side Tensorcast backend config surface:
   - [x] Parse backend extra config from `--hicache-storage-backend-extra-config`.
   - [x] Include daemon/global-store addresses, local daemon association, durable policy,
     and any benchmark-only overrides.
   - [x] Validate missing or inconsistent fields with clear errors.
-- [ ] Implement page identity and namespacing rules:
+- [x] Implement page identity and namespacing rules:
   - [x] Use SGLang page hash / prefix-chain-derived identity as the logical page key.
   - [x] Add TP-rank namespacing for MHA so different TP shards do not collide.
   - [x] Preserve MLA ownership rules instead of blindly duplicating all ranks.
   - [x] Keep page identity shared between prefix share and future request transfer.
-- [ ] Implement Tensorcast-backed page operations:
+- [x] Implement Tensorcast-backed page operations:
   - [x] `batch_exists(...)`
   - [x] `batch_get_v1(...)`
   - [x] `batch_set_v1(...)`
   - [x] Map each SGLang page to a Tensorcast byte artifact payload boundary.
   - [x] Keep v1 at the host/L2-facing boundary rather than requiring direct L1 GPU zero-copy semantics.
-- [ ] Define substrate publication semantics:
+- [x] Define substrate publication semantics:
   - [x] Default KV-page publication policy should be durable-but-evictable.
   - [x] Duplicate page publication must be idempotent at the SGLang integration layer.
   - [x] Partial backend visibility must be tolerated so later publish/snapshot code can reason over mixed already-published and newly-published pages.
-- [ ] Integrate with current HiCache control flow without changing hot-path ownership:
+- [x] Integrate with current HiCache control flow without changing hot-path ownership:
   - [x] Keep per-rank radix tree ownership in SGLang.
   - [x] Keep TP synchronization in `HiCacheController` / `HiRadixCache`.
   - [x] Do not introduce a request-level coordinator hop for ordinary prefix share.
-- [ ] Add observability:
+- [x] Add observability:
   - [x] Backend init logs for daemon/store endpoints and rank suffix rules.
   - [x] Counters or debug logs for page `exists/get/set`, duplicate put skip, and backend failures.
-- [ ] Add unit-level verification:
+- [x] Add unit-level verification:
   - [x] Key/schema tests for TP/MLA namespacing.
   - [x] Storage round-trip tests for page put/get.
   - [x] Duplicate publication tests.
@@ -275,7 +280,7 @@ the `share_local` benchmark the primary validation harness.
 
 ### Phase 2A - Benchmark Harness Completion
 
-- [ ] Finish the `share_local` Tensorcast backend path in
+- [x] Finish the `share_local` Tensorcast backend path in
   `benchmark/tensorcast_benchmark/kv/share_local/run_benchmark.py`:
   - [x] Replace the current hard failure for `backend=tensorcast`.
   - [x] Generate Tensorcast config files into `outputs/<run_id>/generated_configs/`
@@ -285,18 +290,18 @@ the `share_local` benchmark the primary validation harness.
   - [x] Start and stop Tensorcast global store and daemon(s) on the remote worker.
   - [x] Wait for service readiness and fail early on readiness timeout.
   - [x] Copy Tensorcast logs from `/data` into the benchmark output directory.
-- [ ] Reuse the proven benchmark service lifecycle pattern:
+- [x] Reuse the proven benchmark service lifecycle pattern:
   - [x] Follow the service lifecycle model already used by
     `benchmark/tensorcast_benchmark/load_weight_remote/scripts/tensorcast_service.sh`.
   - [x] Decide whether to reuse that helper directly or extract a shared KV benchmark helper.
-- [ ] Add benchmark request-id control:
+- [x] Add benchmark request-id control:
   - [x] Extend `benchmark/tensorcast_benchmark/kv/sgl_client.py` so `/generate` can send an explicit `rid`.
   - [x] Make `request_driver.py` construct deterministic request ids for each request pair.
   - [x] Keep the benchmark able to compare the same logical prompt across instances.
-- [ ] Keep benchmark result compatibility:
+- [x] Keep benchmark result compatibility:
   - [x] Preserve `pair_results.jsonl`, `summary.json`, `logs/`, and append-only CSV behavior.
   - [x] Preserve the Mooncake path as the baseline.
-- [ ] Keep the target test environment explicit:
+- [x] Keep the target test environment explicit:
   - [x] Use `--brainctl-charged-group codesign` in documentation/examples for Tensorcast validation.
   - [x] Keep `--existing-worker-process` supported so an already-running 8xH800 worker can be reused.
 
@@ -442,8 +447,8 @@ Milestone definitions used below:
     - keep daemon-side routed byte-artifact transport semantics unchanged.
   - [x] Require Phase A scratch slabs to reuse the same export / attach / lease
     model that Phase B allocator slabs will later use.
-- [ ] Implement `M0` Tensorcast host-slab export / attach / lease / keepalive:
-  - [ ] Tensorcast proto and client surface:
+- [x] Implement `M0` Tensorcast host-slab export / attach / lease / keepalive:
+  - [x] Tensorcast proto and client surface:
     - [x] extend `tensorcast/proto/tensorcast/daemon/v2/store_daemon.proto`
       toward the unified region model:
       - `RegionMemoryKind`,
@@ -456,7 +461,7 @@ Milestone definitions used below:
     - [x] update `tensorcast/tensorcast/daemon_ctl.py` and
       `tensorcast/tensorcast/api/store/__init__.py` so Python callers can use
       the new local-region surface.
-  - [ ] Tensorcast daemon region registry and lifecycle:
+  - [x] Tensorcast daemon region registry and lifecycle:
     - [x] refactor `tensorcast/daemon/state/ipc_region_registry.*` into a
       generic local-region registry or add an equivalent generic layer above it,
       so `VRAM` and `HOST_SHARED` share:
@@ -479,7 +484,7 @@ Milestone definitions used below:
       UDS FD passing or another explicitly local mechanism.
     - [x] keep this attach path local-only and lease-scoped; it must never be
       usable cross-host.
-  - [ ] Tensorcast daemon validation and ownership boundary:
+  - [x] Tensorcast daemon validation and ownership boundary:
     - [x] extend `daemon/service/controllers/external_target_access_service.*`
       so local source or target validation can reason about `HOST_SHARED`
       regions, not only CUDA IPC regions.
@@ -487,16 +492,16 @@ Milestone definitions used below:
       `daemon/service/controllers/materialization_target_storage_utils.*` and
       `daemon/service/byte_artifact_region_layout.*` so region-backed accesses
       can acquire host-shared layouts in addition to VRAM layouts.
-    - [ ] keep trust-boundary rules unchanged:
+    - [x] keep trust-boundary rules unchanged:
       - batch region RPCs stay loopback or UDS-only,
       - remote daemons still never write directly into caller-visible memory.
-  - [ ] Tensorcast tests for `M0`:
+  - [x] Tensorcast tests for `M0`:
     - [x] region registration tests for `HOST_SHARED`,
     - [x] lease keepalive and expiry tests,
     - [x] local attach or detach tests,
     - [x] slab cleanup on explicit release and owner exit.
-- [ ] Implement `M1` `BatchPutIfAbsentFromRegion(HOST_SHARED source)` correctness:
-  - [ ] Tensorcast request validation and lowering:
+- [x] Implement `M1` `BatchPutIfAbsentFromRegion(HOST_SHARED source)` correctness:
+  - [x] Tensorcast request validation and lowering:
     - [x] extend
       `ExternalTargetAccessService::validate_local_source_layout(...)` so
       `BatchPutIfAbsentFromRegion(...)` accepts `HOST_SHARED` source entries in
@@ -512,17 +517,19 @@ Milestone definitions used below:
     - [x] allow the daemon-side put transport to continue using the current
       communicator/export realization after the local source bytes have been
       validated and opened.
-  - [ ] Tensorcast tests for `M1`:
+  - [x] Tensorcast tests for `M1`:
     - [x] correctness tests for `BatchPutIfAbsentFromRegion(HOST_SHARED source)`
       with:
       - [x] success,
       - [x] duplicate adoption,
       - [x] partial failure,
       - [x] invalid bounds or poisoned region rejection.
-  - [ ] After `M1`, optionally do a narrow SGLang-side local integration check
+  - [x] After `M1`, optionally do a narrow SGLang-side local integration check
     without yet switching the main backend path.
-- [ ] Implement `M2` `BatchGetIntoRegion(HOST_SHARED target)` correctness:
-  - [ ] Tensorcast request validation and target access:
+    Later `share_local` active-path validation exceeded this narrower check, so
+    this item is treated as covered by stronger end-to-end evidence.
+- [x] Implement `M2` `BatchGetIntoRegion(HOST_SHARED target)` correctness:
+  - [x] Tensorcast request validation and target access:
     - [x] extend
       `ExternalTargetAccessService::validate_local_target_layout(...)` so
       `BatchGetIntoRegion(...)` accepts `HOST_SHARED` target entries in addition
@@ -533,17 +540,21 @@ Milestone definitions used below:
     - [x] keep device checks fail-closed:
       `device_uuid` remains meaningful for `VRAM` and not applicable for pure
       `HOST_SHARED`.
-  - [ ] Tensorcast target execution path:
+  - [x] Tensorcast target execution path:
     - [x] extend `byte_artifact_controller.cc` and any shared lowering helpers
       so `BatchGetIntoRegion(...)` can materialize directly into `HOST_SHARED`
       target slices.
-    - [ ] reuse or adapt the existing CPU direct-write sink path where possible
+    - [x] reuse or adapt the existing CPU direct-write sink path where possible
       instead of inventing a second host-target data plane.
+      `HOST_SHARED` target materialization now goes through
+      `materialize_mapped_loader_into_target(...)` with a dedicated
+      `TargetLayoutHostSink`, so the controller no longer carries a bespoke
+      `read_at(...)`-into-host helper path.
     - [x] preserve existing batch-get semantics:
       - [x] partial hit behavior,
       - [x] per-item vs pack-scoped failure rules,
       - [x] layout and verification-mode checks.
-  - [ ] Tensorcast tests for `M2`:
+  - [x] Tensorcast tests for `M2`:
     - [x] correctness tests for `BatchGetIntoRegion(HOST_SHARED target)` with:
       - [x] full hit,
       - [x] partial hit,
@@ -572,16 +583,16 @@ Milestone definitions used below:
 
 ### Phase 2.5B - Phase B allocator-backed zero-copy host residency
 
-- [ ] Freeze the Phase-2.5B contract:
-  - [ ] One allocator slot equals one HiCache KV page.
-  - [ ] One slot lifetime is guarded by a monotonically increasing
+- [x] Freeze the Phase-2.5B contract:
+  - [x] One allocator slot equals one HiCache KV page.
+  - [x] One slot lifetime is guarded by a monotonically increasing
     `generation`.
-  - [ ] Phase B must reuse the same daemon-exported `HOST_SHARED` slab model as
+  - [x] Phase B must reuse the same daemon-exported `HOST_SHARED` slab model as
     Phase A rather than introducing a second host-memory API family.
-  - [ ] Once Phase B becomes the active backend path, no GPU staging fallback is
+  - [x] Once Phase B becomes the active backend path, no GPU staging fallback is
     retained.
-- [ ] Implement the Phase-B slot-token and slot-lifecycle contract:
-  - [ ] Extend the region-backed request model so the caller can identify one
+- [x] Implement the Phase-B slot-token and slot-lifecycle contract:
+  - [x] Extend the region-backed request model so the caller can identify one
     slot lifetime, not only a byte window:
     - `region_id`
     - `memory_kind=HOST_SHARED`
@@ -589,12 +600,12 @@ Milestone definitions used below:
     - `slot_generation`
     - `offset_bytes`
     - `length_bytes`
-  - [ ] Update Tensorcast proto, layout validation, and response-mapping code so
+  - [x] Update Tensorcast proto, layout validation, and response-mapping code so
     these slot-lifetime fields survive request decoding, target/source
     validation, and per-item result mapping.
-  - [ ] Keep the first safe rollout at one logical slot token per KV page even
+  - [x] Keep the first safe rollout at one logical slot token per KV page even
     if adjacent slots are later coalesced for execution efficiency.
-  - [ ] Define and wire the caller-owned slot state machine:
+  - [x] Define and wire the caller-owned slot state machine:
     - `SlotFree`
     - `SlotReserved`
     - `GetInFlight`
@@ -602,60 +613,78 @@ Milestone definitions used below:
     - `PutInFlight`
     - `SlotInvalid`
     - `SlotRetiring`
-  - [ ] Define pin or refcount rules so eviction cannot recycle a slot while it
+  - [x] Define pin or refcount rules so eviction cannot recycle a slot while it
     is reserved or in flight.
-  - [ ] Define `SlotInvalid` and retirement semantics for partial failure:
+  - [x] Define `SlotInvalid` and retirement semantics for partial failure:
     - get-side fill failure invalidates the target slot,
     - ordinary put failure does not invalidate the local source slot,
     - generation bumps only after retirement and ref-drain.
-- [ ] Implement `M3` allocator-slab page-slot state / recycle / partial-failure
+- [x] Implement `M3` allocator-slab page-slot state / recycle / partial-failure
   correctness:
-  - [ ] Tensorcast-side plumbing:
-    - [ ] ensure host-region validation remains slot-token aware but does not
+  - [x] Tensorcast-side plumbing:
+    - [x] ensure host-region validation remains slot-token aware but does not
       create a daemon-owned allocator table,
-    - [ ] preserve slot token metadata through `BatchGetIntoRegion` and
+    - [x] reject allocator-backed `HOST_SHARED` generic target validation so
+      allocator slabs only flow through the byte-artifact region-backed path,
+    - [x] preserve slot token metadata through `BatchGetIntoRegion` and
       `BatchPutIfAbsentFromRegion` result construction so SGLang can revalidate
       generation before making a page visible.
-  - [ ] Add Tensorcast unit/integration tests for:
-    - slot validation by generation,
+  - [x] Add Tensorcast unit/integration tests for:
+    - [x] allocator-backed `HOST_SHARED` validation requires explicit offsets
+      with complete `slot_index` and `slot_generation`,
+    - [x] allocator-backed `HOST_SHARED` generic target validation fails closed,
+    - [x] request-scoped `slot_generation` metadata is preserved across repeated
+      slot reuse requests so Tensorcast does not echo a stale cached generation,
+    - [x] partial batch failure,
+    - [x] caller-owned generation lifetime remains external to Tensorcast; the
+      daemon preserves request-scoped slot tokens but does not own allocator
+      recycle state.
+  - [x] Add SGLang-side groundwork tests for slot-tracker correctness where
+    feasible:
+    - pin or refcount state,
     - stale completion rejection,
-    - partial batch failure,
-    - slot retirement and recycle.
-  - [ ] Add SGLang-side correctness checks where feasible for pinning,
-    provisional visibility, and eviction interaction.
-- [ ] Implement `M4` host-registration attach / detach / fallback:
-  - [ ] Add optional one-time `cudaHostRegister(...)` on the SGLang-local slab
+    - retirement and reuse guards,
+    - store-layer seam coverage that rejects stale `batch_get_v1(...)`
+      completion before the fetched page becomes radix-visible.
+- [x] Implement `M4` host-registration attach / detach / fallback:
+  - [x] Add optional one-time `cudaHostRegister(...)` on the SGLang-local slab
     mapping.
-  - [ ] Keep Tensorcast host-region semantics independent from host pinning:
+  - [x] Keep Tensorcast host-region semantics independent from host pinning:
     the daemon-side `HOST_SHARED` region model must remain correct whether or
     not the local client successfully host-registers the mapping.
-  - [ ] Add the matching detach path:
+  - [x] Add the matching detach path:
     - drain in-flight slot refs,
     - retire resident or invalid slots,
     - `cudaHostUnregister(...)`,
     - unmap,
     - release slab lease.
-  - [ ] Define the fallback behavior when host registration is unavailable:
+  - [x] Define the fallback behavior when host registration is unavailable:
     correctness must remain intact and only the performance policy changes.
-  - [ ] Add Tensorcast unit/integration tests for `M4`.
-- [ ] Add the SGLang Phase-B allocator integration:
-  - [ ] Implement a Tensorcast-aware `HostKVCache` allocator backed by one
+  - [x] Add `M4` test coverage:
+    - allocator-side register/unregister lifecycle,
+    - register failure fallback without breaking cleanup,
+    - store-layer end-to-end regression with `HOST_SHARED` allocator path.
+- [x] Add the SGLang Phase-B allocator integration:
+  - [x] Implement a Tensorcast-aware `HostKVCache` allocator backed by one
     daemon-exported slab per rank.
-  - [ ] Make L2 host pages live directly in exported slab slots rather than in a
+  - [x] Make L2 host pages live directly in exported slab slots rather than in a
     separate ordinary host pool.
-  - [ ] Make `batch_set_v1(...)` publish directly from resident slot offsets
+  - [x] Fail closed unless allocator-backed TensorCast host pools use the
+    page-contiguous `page_blob_direct` layout and a live exported region
+    binding.
+  - [x] Make `batch_set_v1(...)` publish directly from resident slot offsets
     without an extra copy into a scratch slab.
-  - [ ] Make `batch_get_v1(...)` reserve destination slots and materialize
+  - [x] Make `batch_get_v1(...)` reserve destination slots and materialize
     directly into those slots.
-  - [ ] Insert fetched pages into radix-visible HiCache state only after get
+  - [x] Insert fetched pages into radix-visible HiCache state only after get
     success and generation revalidation.
-  - [ ] Retire invalid slots correctly on failure.
-- [ ] Validate Phase B in SGLang end to end immediately after allocator
+  - [x] Retire invalid slots correctly on failure.
+- [x] Validate Phase B in SGLang end to end immediately after allocator
   integration:
-  - [ ] Rerun the same `share_local` benchmark shape used for Phase A.
-  - [ ] Compare against the last GPU-staging baseline and the Phase-A host
+  - [x] Rerun the same `share_local` benchmark shape used for Phase A.
+  - [x] Compare against the last GPU-staging baseline and the Phase-A host
     staging path.
-  - [ ] Verify:
+  - [x] Verify:
     - functionality remains correct,
     - prefix reuse still hits,
     - `TTFT`, `batch_get`, and `batch_set` metrics improve or at least behave as
@@ -664,17 +693,18 @@ Milestone definitions used below:
 
 ### Phase 2.5 Exit Criteria
 
-- [ ] Tensorcast has a daemon-managed `HOST_SHARED` slab lifecycle validated by
+- [x] Tensorcast has a daemon-managed `HOST_SHARED` slab lifecycle validated by
   milestone tests `M0` through `M4`.
 - [x] `BatchPutIfAbsentFromRegion(...)` supports `HOST_SHARED` source layouts.
 - [x] `BatchGetIntoRegion(...)` supports `HOST_SHARED` target layouts.
 - [x] Phase A host staging runs end to end in `share_local` without GPU staging.
-- [ ] Phase B allocator-backed host residency runs end to end in `share_local`
+- [x] Phase B allocator-backed host residency runs end to end in `share_local`
   with slot-generation protection and no GPU staging fallback.
 
 Current Phase-2.5A validation note:
 
 - Tensorcast milestone coverage currently confirmed locally by:
+  - `//core/store/materialization/dataplane:target_layout_host_sink_test`
   - `//daemon:byte_artifact_region_layout_host_shared_test`
   - `//daemon:grpc_service_impl_batch_runtime_test --test_arg=[host_shared]`
 - SGLang end-to-end host-staging bring-up is confirmed in:
@@ -703,6 +733,179 @@ Current Phase-2.5A validation note:
   - mean TTFT was still worse than the GPU-staging baseline,
   - `host_fill_ms` remained significant because Phase A still performs one host
     copy between the Tensorcast scratch slab and ordinary HiCache L2 pages.
+
+Current Phase-2.5B validation note:
+
+- SGLang local allocator plumbing currently confirmed by:
+  - `python/sglang/test/mem_cache/test_memory_pool_host_page_blob_direct.py`
+  - `python/sglang/test/mem_cache/tensorcast/test_tensorcast_host_allocator.py`
+  - `python/sglang/test/mem_cache/tensorcast/test_tensorcast_store.py`
+  - `python/sglang/test/mem_cache/test_host_shared_slot_state.py`
+- That coverage confirms:
+  - the `page_blob_direct` host layout keeps one TensorCast-facing KV page in a
+    page-contiguous blob shape,
+  - TensorCast extra config is parsed before host-pool construction,
+  - TensorCast allocator-backed `HOST_SHARED` slabs can back a `HostKVCache`
+    allocation directly,
+  - allocator-backed host-pool construction is wired without regressing the
+    existing slot-token plumbing,
+  - allocator-backed TensorCast registration now fails closed unless the host
+    pool exposes a live binding on the page-contiguous `page_blob_direct`
+    layout,
+  - the active TensorCast page client now publishes `batch_set_v1(...)` directly
+    from resident allocator slot offsets on the exported `HOST_SHARED` slab,
+  - `batch_get_v1(...)` now reserves destination slots and materializes
+    directly into those allocator-backed `HOST_SHARED` slots, and
+  - releasing resident or invalid fetched pages now retires the slot token so
+    later reuse bumps generation instead of re-entering with a stale slot
+    lifetime.
+- Partial Phase-2.5B end-to-end validation is confirmed in:
+  - `benchmark/tensorcast_benchmark/kv/share_local/outputs/20260402-152750_tensorcast_tp2_pairs10`
+    - `tensorcast-daemon-mode=separate`
+    - `--wait-for-source-publication-drain`
+    - `--source-publication-drain-idle-s 10`
+    - `prompt_count=10`
+    - `--hicache-storage-prefetch-policy wait_complete`
+    - `--hicache-mem-layout page_blob_direct`
+    - `--hicache-io-backend direct`
+    - allocator-backed TensorCast host residency enabled
+- That run shows:
+  - instance A `batch_set_v1(...)` remains functionally correct with no failed
+    pages,
+  - source-side publication now runs with `stage_copy_ms=0.00`, confirming the
+    scratch host-staging copy is removed from the active put path,
+  - instance B still reaches `batch_exists(...)` hits and successful
+    `batch_get_v1(...)` with positive cached-token reuse on the same long-prompt
+    benchmark shape used for the Phase-A separate-mode baseline,
+  - overall TTFT still regresses versus the best Phase-A host-staging baseline,
+    which is consistent with `batch_get_v1(...)` still paying the ordinary
+    scratch-region `host_fill_ms` copy on the fetch path.
+- Updated Phase-2.5B direct-get validation is confirmed in:
+  - `benchmark/tensorcast_benchmark/kv/share_local/outputs/20260402-160726_tensorcast_tp2_pairs10`
+    - `tensorcast-daemon-mode=separate`
+    - `--wait-for-source-publication-drain`
+    - `--source-publication-drain-idle-s 10`
+    - `prompt_count=10`
+    - `--hicache-storage-prefetch-policy wait_complete`
+    - `--hicache-mem-layout page_blob_direct`
+    - `--hicache-io-backend direct`
+    - allocator-backed TensorCast host residency enabled
+- That run shows:
+  - instance A `batch_set_v1(...)` remains functionally correct with no failed
+    pages and still keeps `stage_copy_ms=0.00`,
+  - instance B reaches full `batch_exists(...)` prefix hits and successful
+    `batch_get_v1(...)` on the allocator-backed direct-slot path,
+  - `batch_get_v1(...)` now reports `host_fill_ms=0.00`, confirming the old
+    scratch host-staging copy is gone from the active fetch path,
+  - mean instance-B TTFT improves by about `483.61 ms` relative to
+    `20260402-152750_tensorcast_tp2_pairs10`,
+  - mean TTFT improvement flips from `-363.26 ms` in
+    `20260402-152750_tensorcast_tp2_pairs10` to `+82.69 ms`, and
+  - mean TTFT improvement is about `1058.35 ms` better than the earlier
+    Phase-A separate-mode host-staging baseline
+    `20260401-224749_tensorcast_tp2_pairs10`.
+- Updated Phase-2.5B share-mode validation is confirmed in:
+  - `benchmark/tensorcast_benchmark/kv/share_local/outputs/20260402-203549_tensorcast_tp2_pairs10`
+    - `tensorcast-daemon-mode=share`
+    - `--wait-for-source-publication-drain`
+    - `--source-publication-drain-idle-s 10`
+    - `prompt_count=10`
+    - `--hicache-storage-prefetch-policy wait_complete`
+    - `--hicache-mem-layout page_blob_direct`
+    - `--hicache-io-backend direct`
+    - allocator-backed TensorCast host residency enabled
+- That run shows:
+  - all `10/10` prompt pairs succeed with real TensorCast-backed prefix reuse
+    on instance B,
+  - instance A `batch_set_v1(...)` remains successful with
+    `stage_copy_ms=0.00`,
+  - instance B `batch_get_v1(...)` stays on the allocator-backed direct-slot
+    path with `host_fill_ms=0.00`,
+  - instance B average cached tokens are about `16.4k`, confirming reuse on the
+    same long-prompt benchmark shape, and
+  - mean TTFT improvement is `+337.96 ms` with mean speedup ratio `1.24x` in
+    the shared-daemon topology.
+- Updated `M4` host-registration validation is confirmed in:
+  - `benchmark/tensorcast_benchmark/kv/share_local/outputs/20260403-170738_tensorcast_tp2_pairs10`
+    - `tensorcast-daemon-mode=separate`
+    - `--wait-for-source-publication-drain`
+    - `prompt_count=10`
+    - `--hicache-storage-prefetch-policy wait_complete`
+    - `--hicache-mem-layout page_blob_direct`
+    - `--hicache-io-backend direct`
+    - allocator-backed TensorCast host residency enabled
+  - `benchmark/tensorcast_benchmark/kv/share_local/outputs/20260403-171931_tensorcast_tp2_pairs10`
+    - `tensorcast-daemon-mode=share`
+    - `--wait-for-source-publication-drain`
+    - `prompt_count=10`
+    - `--hicache-storage-prefetch-policy wait_complete`
+    - `--hicache-mem-layout page_blob_direct`
+    - `--hicache-io-backend direct`
+    - allocator-backed TensorCast host residency enabled
+- Those runs show:
+  - each rank successfully performs one-time `cudaHostRegister(...)` on the
+    local allocator-backed `HOST_SHARED` slab mapping,
+  - `batch_get_v1(...)` remains on the allocator-backed direct-slot path with
+    `host_fill_ms=0.00`, so `M4` does not reintroduce the old host copy-back
+    path,
+  - `share` mode remains healthy and shows `10/10` successful prefix-reuse
+    pairs with mean TTFT improvement `+410.99 ms`, and
+  - `separate` mode remains functionally correct on the same path.
+- Post-Phase-2.5 publish-slowdown follow-up is confirmed in:
+  - `benchmark/tensorcast_benchmark/kv/share_local/outputs/20260405-125504_tensorcast_tp2_pairs10`
+    - `tensorcast-daemon-mode=separate`
+    - `--wait-for-source-publication-drain`
+    - `prompt_count=10`
+    - `--hicache-storage-prefetch-policy wait_complete`
+    - `--hicache-mem-layout page_blob_direct`
+    - `--hicache-io-backend direct`
+    - allocator-backed TensorCast host residency enabled
+  - `benchmark/tensorcast_benchmark/kv/share_local/outputs/20260405-173854_tensorcast_tp2_pairs10`
+    - `tensorcast-daemon-mode=share`
+    - `--wait-for-source-publication-drain`
+    - `prompt_count=10`
+    - `--hicache-storage-prefetch-policy wait_complete`
+    - `--hicache-mem-layout page_blob_direct`
+    - `--hicache-io-backend direct`
+    - allocator-backed TensorCast host residency enabled
+- That follow-up confirms:
+  - the `ReplicaRegistry::erase()` O(1) fix removes the source-side
+    publication-time growth that previously appeared as prompt count increased,
+  - in `separate` mode, instance-A `batch_set_v1(...)` no longer trends upward:
+    mean batch time is about `363.90 ms`, median `364.65 ms`, max `942.01 ms`,
+  - in `share` mode, instance-A `batch_set_v1(...)` also remains stable:
+    mean batch time is about `190.68 ms`, median `196.36 ms`, max `569.92 ms`,
+  - instance-B still reaches full `batch_exists(...)` hits and successful
+    `batch_get_v1(...)` with positive cached-token reuse in both daemon modes,
+    and
+  - the store-layer regression tests
+    `//core/store:replica_registry_test`,
+    `//core/store:stable_dram_cache_manager_test`, and
+    `//core/store:eviction_service_test`
+    all pass after the registry fix.
+- Post-refactor modularity validation is confirmed in:
+  - `benchmark/tensorcast_benchmark/kv/share_local/outputs/20260407-152641_tensorcast_tp2_pairs10`
+    - `tensorcast-daemon-mode=share`
+    - `--pair-rps 0.5`
+    - `--settle-ms 10000`
+    - `--hicache-mem-layout page_blob_direct`
+    - `--hicache-io-backend direct`
+    - allocator-backed TensorCast host residency enabled
+  - `benchmark/tensorcast_benchmark/kv/share_local/outputs/20260407-153305_tensorcast_tp2_pairs10`
+    - `tensorcast-daemon-mode=separate`
+    - `--pair-rps 0.5`
+    - `--settle-ms 10000`
+    - `--hicache-mem-layout page_blob_direct`
+    - `--hicache-io-backend direct`
+    - allocator-backed TensorCast host residency enabled
+- Those runs show:
+  - the post-sweep SGLang-side refactor keeps `10/10` successful prompt pairs
+    in both daemon modes,
+  - instance B still reaches real prefix reuse with about `16.4k` average
+    cached tokens in both runs,
+  - `share` mode keeps a positive mean TTFT improvement (`+552.78 ms`), and
+  - `separate` mode remains functionally correct with batch `exists/get/set`
+    behavior in the same order of magnitude as the April 6 baselines.
 
 ## Phase 3 - Request Transfer Interface
 
@@ -846,13 +1049,18 @@ The most important implementation boundary is:
 - `sglang/benchmark/tensorcast_benchmark/kv/share_local/configs/global_store_config.yaml`
 - `sglang/benchmark/tensorcast_benchmark/kv/share_local/configs/store_daemon_config.yaml`
 
-### SGLang files already added for Phase 1 / Phase 1.5 / Phase 2
+### SGLang files already added for Phase 1 / Phase 1.5 / Phase 2 / Phase 2.5
 
 - `sglang/python/sglang/srt/mem_cache/storage/tensorcast_store/__init__.py`
 - `sglang/python/sglang/srt/mem_cache/storage/tensorcast_store/tensorcast_store.py`
 - `sglang/python/sglang/srt/mem_cache/storage/tensorcast_store/config.py`
 - `sglang/python/sglang/srt/mem_cache/storage/tensorcast_store/client.py`
-- `sglang/python/sglang/srt/mem_cache/storage/tensorcast_store/test_tensorcast_store.py`
+- `sglang/python/sglang/srt/mem_cache/storage/tensorcast_store/host_allocator.py`
+- `sglang/python/sglang/srt/mem_cache/host_shared_slot_state.py`
+- `sglang/python/sglang/test/mem_cache/tensorcast/test_tensorcast_store.py`
+- `sglang/python/sglang/test/mem_cache/tensorcast/test_tensorcast_host_allocator.py`
+- `sglang/python/sglang/test/mem_cache/test_memory_pool_host_page_blob_direct.py`
+- `sglang/python/sglang/test/mem_cache/test_host_shared_slot_state.py`
 - `sglang/benchmark/tensorcast_benchmark/kv/share_local/scripts/tensorcast_service.sh`
 
 ### New SGLang files still likely needed for Phase 3
