@@ -13,14 +13,7 @@ from pathlib import Path
 
 import yaml
 
-from tensorcast_benchmark.kv.models import BenchmarkConfig, RunSummary
-from tensorcast_benchmark.kv.outputs import (
-    append_csv_row,
-    build_paths,
-    create_run_id,
-    prepare_paths,
-    write_json,
-)
+from tensorcast_benchmark.kv.outputs import build_paths, create_run_id, prepare_paths
 from tensorcast_benchmark.kv.remote import (
     exec_user,
     launch_worker,
@@ -28,6 +21,11 @@ from tensorcast_benchmark.kv.remote import (
     wait_for_condition,
     wait_for_worker_running,
 )
+from tensorcast_benchmark.kv.request_transfer.models import (
+    RequestTransferBenchmarkConfig,
+    RequestTransferRunSummary,
+)
+from tensorcast_benchmark.kv.request_transfer.outputs import append_csv_row
 
 ORCHESTRATOR_LOG_PATH: Path | None = None
 
@@ -36,35 +34,29 @@ def log(message: str) -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {message}"
     print(line, flush=True)
-    if ORCHESTRATOR_LOG_PATH is not None:
-        ORCHESTRATOR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with ORCHESTRATOR_LOG_PATH.open("a", encoding="utf-8") as file:
-            file.write(line + "\n")
+    if ORCHESTRATOR_LOG_PATH is None:
+        return
+    ORCHESTRATOR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with ORCHESTRATOR_LOG_PATH.open("a", encoding="utf-8") as file:
+        file.write(line + "\n")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the share-local KV benchmark.")
-    parser.add_argument(
-        "--hicache-storage-backend",
-        choices=["mooncake", "tensorcast"],
-        default="mooncake",
+    parser = argparse.ArgumentParser(
+        description="Run the Tensorcast request-transfer benchmark."
     )
-    parser.add_argument(
-        "--tensorcast-daemon-mode", choices=["share", "separate"], default="share"
-    )
+    parser.add_argument("--topology-mode", choices=["local", "remote"], default="local")
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--model-name", default="")
     parser.add_argument("--prompt-count", type=int, default=10)
-    parser.add_argument("--pair-rps", type=float, default=1.0)
-    parser.add_argument("--settle-ms", type=int, default=1000)
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--tp-size", type=int, default=2)
     parser.add_argument("--min-prompt-chars", type=int, default=0)
     parser.add_argument("--max-prompt-chars", type=int, default=0)
     parser.add_argument("--mem-fraction-static", type=float, default=0.85)
-    parser.add_argument("--hicache-mem-layout", default="page_first")
-    parser.add_argument("--hicache-io-backend", default="kernel")
+    parser.add_argument("--hicache-mem-layout", default="page_blob_direct")
+    parser.add_argument("--hicache-io-backend", default="direct")
     parser.add_argument("--hicache-ratio", type=float, default=2.0)
     parser.add_argument("--hicache-size-gb", type=int, default=0)
     parser.add_argument(
@@ -72,58 +64,94 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["best_effort", "wait_complete", "timeout"],
         default="best_effort",
     )
-    parser.add_argument("--port-a", type=int, default=31000)
-    parser.add_argument("--port-b", type=int, default=31001)
-    parser.add_argument("--instance-a-cuda-visible-devices", default="0,1")
-    parser.add_argument("--instance-b-cuda-visible-devices", default="4,5")
     parser.add_argument("--request-timeout-s", type=float, default=600.0)
     parser.add_argument("--instance-ready-timeout-s", type=float, default=1800.0)
     parser.add_argument("--instance-health-poll-interval-s", type=float, default=1.0)
-    parser.add_argument("--wait-for-source-publication-drain", action="store_true")
+    parser.add_argument("--plan-deadline-ms", type=int, default=15_000)
+    parser.add_argument("--publish-ttl-ms", type=int, default=60_000)
     parser.add_argument(
-        "--source-publication-drain-timeout-s", type=float, default=120.0
+        "--enable-target-worker-warmup",
+        action=argparse.BooleanOptionalAction,
+        default=False,
     )
-    parser.add_argument("--source-publication-drain-idle-s", type=float, default=10.0)
-    parser.add_argument("--source-publication-drain-poll-s", type=float, default=0.25)
-    parser.add_argument("--require-positive-ttft-improvement", action="store_true")
-    parser.add_argument("--data-path", default="/home/i-zhouyuhan/tot/data/test.jsonl")
-    parser.add_argument("--extra-server-args", default="")
-    parser.add_argument("--trust-remote-code", action="store_true")
-    parser.add_argument("--keep-worker", action="store_true")
-    parser.add_argument("--existing-worker-process", default="")
+    parser.add_argument("--verify-log-timeout-s", type=float, default=15.0)
+    parser.add_argument("--verify-log-poll-interval-s", type=float, default=0.25)
+    parser.add_argument("--post-target-generate-settle-s", type=float, default=1.0)
+    parser.add_argument(
+        "--evict-after-prompt",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--port-a", type=int, default=34000)
+    parser.add_argument("--port-b", type=int, default=34001)
+    parser.add_argument("--instance-a-cuda-visible-devices", default="0,1")
+    parser.add_argument("--instance-b-cuda-visible-devices", default="2,3")
+    parser.add_argument(
+        "--trust-remote-code",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--extra-server-args", default="--log-level debug")
+    parser.add_argument(
+        "--data-path",
+        default=(
+            "/home/i-zhouyuhan/tot/thirdparty/sglang/benchmark/"
+            "tensorcast_benchmark/kv/dataset/LongBench/hotpotqa.jsonl"
+        ),
+    )
+    parser.add_argument(
+        "--keep-worker",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--existing-worker-process-a", default="")
+    parser.add_argument("--existing-worker-process-b", default="")
+    parser.add_argument("--brainctl-namespace", default="shai-core")
     parser.add_argument("--brainctl-charged-group", default="")
-    parser.add_argument("--worker-gpu", type=int, default=8)
-    parser.add_argument("--worker-cpu", type=int, default=128)
-    parser.add_argument("--worker-memory", type=int, default=1000000)
+    parser.add_argument("--brainctl-private-machine", default="group")
+    parser.add_argument(
+        "--brainctl-mount",
+        default=(
+            "juicefs+s3://oss.i.shaipower.com/step2-alignment-jfs:"
+            "/mnt/step2-alignment-jfs"
+        ),
+    )
+    parser.add_argument("--brainctl-max-wait-duration", default="10m")
+    parser.add_argument("--worker-ready-timeout-s", type=float, default=900.0)
+    parser.add_argument("--worker-poll-interval-s", type=float, default=5.0)
+    parser.add_argument("--worker-gpu", type=int, default=4)
+    parser.add_argument("--worker-cpu", type=int, default=64)
+    parser.add_argument("--worker-memory", type=int, default=500_000)
     parser.add_argument("--worker-positive-tags", default="H800")
     parser.add_argument("--worker-negative-tags", default="")
+    parser.add_argument("--tensorcast-namespace", default="request_transfer")
     parser.add_argument("--tensorcast-global-store-port", type=int, default=50051)
     parser.add_argument("--tensorcast-daemon-port-a", type=int, default=50052)
     parser.add_argument("--tensorcast-daemon-port-b", type=int, default=50053)
-    parser.add_argument(
-        "--tensorcast-instance-agent-port-a",
-        type=int,
-        default=31110,
-    )
-    parser.add_argument(
-        "--tensorcast-instance-agent-port-b",
-        type=int,
-        default=31111,
-    )
+    parser.add_argument("--tensorcast-instance-agent-port-a", type=int, default=34110)
+    parser.add_argument("--tensorcast-instance-agent-port-b", type=int, default=34111)
     parser.add_argument("--tensorcast-daemon-p2p-port-a", type=int, default=65090)
     parser.add_argument("--tensorcast-daemon-p2p-port-b", type=int, default=65091)
-    parser.add_argument("--tensorcast-prefetch-threshold", type=int, default=1)
+    parser.add_argument("--tensorcast-source-prefetch-threshold", type=int, default=1)
+    parser.add_argument(
+        "--tensorcast-target-prefetch-threshold", type=int, default=1_000_000
+    )
     parser.add_argument(
         "--tensorcast-service-ready-timeout-s", type=float, default=120.0
     )
     parser.add_argument("--tensorcast-service-poll-interval-s", type=float, default=2.0)
+    parser.add_argument("--tensorcast-cuda-home", default="/usr/local/cuda-12.4")
+    parser.add_argument(
+        "--tensorcast-nvidia-lib-dirs",
+        default="/usr/local/cuda-12.9/compat:/usr/local/nvidia/lib64",
+    )
     parser.add_argument("--tensorcast-daemon-stable-bytes", default="64GB")
     parser.add_argument("--tensorcast-byte-artifact-shard-count", type=int, default=8)
     parser.add_argument(
         "--tensorcast-byte-artifact-lease-ttl-s", type=float, default=30.0
     )
     parser.add_argument(
-        "--tensorcast-byte-artifact-keepalive-interval-s", type=float, default=5.0
+        "--tensorcast-byte-artifact-keepalive-interval-s", type=float, default=10.0
     )
     parser.add_argument(
         "--tensorcast-payload-max-chunk-bytes", type=int, default=(1 << 20)
@@ -133,67 +161,66 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tensorcast-host-allocator-enabled",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
     )
     parser.add_argument(
-        "--tensorcast-host-allocator-region-ttl-ms",
-        type=int,
-        default=0,
+        "--tensorcast-host-allocator-region-ttl-ms", type=int, default=0
     )
     parser.add_argument(
         "--tensorcast-host-allocator-region-name",
         default="sglang_tensorcast_host_pool",
     )
-    parser.add_argument("--tensorcast-cuda-home", default="/usr/local/cuda-12.4")
-    parser.add_argument(
-        "--tensorcast-nvidia-lib-dirs",
-        default="/usr/local/cuda-12.9/compat:/usr/local/nvidia/lib64",
-    )
-    parser.add_argument("--mooncake-http-metadata-server-port", type=int, default=8080)
-    parser.add_argument("--mooncake-master-port", type=int, default=60051)
-    parser.add_argument("--mooncake-global-segment-size", default="4gb")
-    parser.add_argument("--mooncake-local-buffer-size", type=int, default=0)
-    parser.add_argument(
-        "--mooncake-eviction-high-watermark-ratio", type=float, default=0.9
-    )
     return parser
 
 
-def build_remote_prefix(paths) -> str:
-    return build_remote_python_prefix(paths, include_benchmark=False)
+def parse_args() -> RequestTransferBenchmarkConfig:
+    args = build_parser().parse_args()
+    payload = vars(args)
+    for key in ("data_path", "model_path"):
+        value = Path(payload[key]).expanduser()
+        if not value.is_absolute():
+            value = (Path.cwd() / value).resolve()
+        payload[key] = str(value)
+    if payload["brainctl_charged_group"].strip():
+        payload["brainctl_charged_group"] = payload["brainctl_charged_group"].strip()
+    return RequestTransferBenchmarkConfig.model_validate(payload)
 
 
-def build_remote_python_prefix(paths, *, include_benchmark: bool) -> str:
+def shared_log_path(paths, name: str) -> Path:
+    return paths.logs_dir / f"{name}.log"
+
+
+def shared_pid_path(paths, name: str) -> Path:
+    return paths.run_dir / "pids" / f"{name}.pid"
+
+
+def build_remote_python_prefix(
+    paths,
+    *,
+    include_benchmark: bool,
+    include_tensorcast: bool,
+) -> str:
     python_paths = [paths.sglang_root / "python"]
     if include_benchmark:
         python_paths.insert(0, paths.sglang_root / "benchmark")
+    if include_tensorcast:
+        python_paths.append(paths.workspace_root / "thirdparty" / "tensorcast")
     python_path = ":".join(str(path) for path in python_paths)
     return (
         f"cd {shlex.quote(str(paths.sglang_root))}; "
         f"source {shlex.quote(str(paths.workspace_root / '.venv' / 'bin' / 'activate'))}; "
         f"export PYTHONPATH={shlex.quote(python_path)}:${{PYTHONPATH:-}}; "
-        f"export PATH={shlex.quote(str(paths.venv_python.parent))}:$PATH; "
+        f"export PATH={shlex.quote(str(paths.uv_bin.parent))}:$PATH; "
     )
-
-
-def build_remote_python(paths) -> str:
-    return shlex.quote(str(paths.venv_python))
 
 
 def build_remote_uv(paths) -> str:
     return shlex.quote(str(paths.uv_bin))
 
 
-def remote_file_log(run_id: str, name: str) -> Path:
-    return Path(f"/data/{run_id}_{name}.log")
-
-
-def remote_pid_file(paths, name: str) -> Path:
-    return paths.run_dir / f"{name}.pid"
-
-
 def stop_remote_process(
-    config: BenchmarkConfig,
+    config: RequestTransferBenchmarkConfig,
     worker_process: str,
     pid_path: Path,
 ) -> None:
@@ -205,7 +232,9 @@ def stop_remote_process(
         'if kill -0 "$PID" >/dev/null 2>&1; then '
         '  kill "$PID" >/dev/null 2>&1 || true; '
         "  sleep 2; "
-        '  if kill -0 "$PID" >/dev/null 2>&1; then kill -9 "$PID" >/dev/null 2>&1 || true; fi; '
+        '  if kill -0 "$PID" >/dev/null 2>&1; then '
+        '    kill -9 "$PID" >/dev/null 2>&1 || true; '
+        "  fi; "
         "fi; "
         'rm -f "$PID_PATH"'
     )
@@ -213,7 +242,7 @@ def stop_remote_process(
 
 
 def start_remote_process(
-    config: BenchmarkConfig,
+    config: RequestTransferBenchmarkConfig,
     worker_process: str,
     *,
     paths,
@@ -228,7 +257,7 @@ def start_remote_process(
         export_cmd += f"export {key}={shlex.quote(value)}; "
     remote_cmd = (
         "set -euo pipefail; "
-        f"{build_remote_prefix(paths)}"
+        f"{build_remote_python_prefix(paths, include_benchmark=False, include_tensorcast=False)}"
         f"{export_cmd}"
         f"LOG_PATH={shlex.quote(str(log_path))}; "
         f"PID_PATH={shlex.quote(str(pid_path))}; "
@@ -245,7 +274,7 @@ def start_remote_process(
 
 
 def wait_remote_health(
-    config: BenchmarkConfig,
+    config: RequestTransferBenchmarkConfig,
     worker_process: str,
     *,
     paths,
@@ -264,7 +293,7 @@ def wait_remote_health(
         completed = exec_user(
             config,
             worker_process,
-            f"{build_remote_prefix(paths)}"
+            f"{build_remote_python_prefix(paths, include_benchmark=False, include_tensorcast=False)}"
             f"{build_remote_uv(paths)} run --active --no-project --offline "
             f"python -c {shlex.quote(python_snippet)}",
             check=False,
@@ -280,42 +309,20 @@ def wait_remote_health(
     )
 
 
-def capture_remote_snapshots(
-    config: BenchmarkConfig,
-    worker_process: str,
-    *,
-    paths,
-    run_id: str,
-) -> None:
-    gpu_log = remote_file_log(run_id, "gpu_snapshot")
-    ports_log = remote_file_log(run_id, "port_snapshot")
-    gpu_cmd = (
-        "set -euo pipefail; "
-        f"LOG_PATH={shlex.quote(str(gpu_log))}; "
-        'nvidia-smi > "$LOG_PATH" 2>&1'
-    )
-    ports_cmd = (
-        "set -euo pipefail; "
-        f"LOG_PATH={shlex.quote(str(ports_log))}; "
-        'ss -ltnp > "$LOG_PATH" 2>&1 || netstat -ltnp > "$LOG_PATH" 2>&1 || true'
-    )
-    exec_user(config, worker_process, gpu_cmd, check=False)
-    exec_user(config, worker_process, ports_cmd, check=False)
-
-
 def run_remote_smoke_checks(
-    config: BenchmarkConfig,
+    config: RequestTransferBenchmarkConfig,
     worker_process: str,
     *,
     paths,
-    run_id: str,
+    role: str,
 ) -> None:
-    log("Running remote environment smoke checks")
-    smoke_file = Path(f"/data/{run_id}_smoke_check.txt")
+    tensorcast_root = paths.workspace_root / "thirdparty" / "tensorcast"
+    smoke_file = paths.logs_dir / f"{role}_smoke_check.txt"
     remote_cmd = (
         "set -euo pipefail; "
-        f"{build_remote_prefix(paths)}"
+        f"{build_remote_python_prefix(paths, include_benchmark=False, include_tensorcast=True)}"
         f"test -d {shlex.quote(str(paths.sglang_root))}; "
+        f"test -d {shlex.quote(str(tensorcast_root))}; "
         f"test -x {shlex.quote(str(paths.venv_python))}; "
         f"test -x {shlex.quote(str(paths.uv_bin))}; "
         "nvidia-smi -L >/dev/null; "
@@ -327,85 +334,29 @@ def run_remote_smoke_checks(
     exec_user(config, worker_process, remote_cmd)
 
 
-def write_mooncake_config(paths, config: BenchmarkConfig) -> Path:
-    config_path = paths.generated_configs_dir / "mooncake_config.json"
-    write_json(
-        config_path,
-        {
-            "local_hostname": "localhost",
-            "metadata_server": (
-                f"http://127.0.0.1:{config.mooncake_http_metadata_server_port}/metadata"
-            ),
-            "master_server_address": f"127.0.0.1:{config.mooncake_master_port}",
-            "protocol": config.mooncake_protocol,
-            "device_name": config.mooncake_device_name,
-            "global_segment_size": config.mooncake_global_segment_size,
-            "local_buffer_size": config.mooncake_local_buffer_size,
-        },
-    )
-    return config_path
-
-
-def start_mooncake_service(
-    config: BenchmarkConfig,
+def capture_remote_snapshots(
+    config: RequestTransferBenchmarkConfig,
     worker_process: str,
     *,
     paths,
-    run_id: str,
+    role: str,
 ) -> None:
-    log("Starting Mooncake service")
-    stop_mooncake_service(config, worker_process, paths=paths)
-    log_path = remote_file_log(run_id, "mooncake_master")
-    pid_path = remote_pid_file(paths, "mooncake_master")
-    command = (
-        f"{shlex.quote(str(paths.mooncake_master_bin))} "
-        "--enable_http_metadata_server=true "
-        f"--http_metadata_server_port={config.mooncake_http_metadata_server_port} "
-        f"--eviction_high_watermark_ratio={config.mooncake_eviction_high_watermark_ratio} "
-        f"--port={config.mooncake_master_port}"
-    )
-    start_remote_process(
-        config,
-        worker_process,
-        paths=paths,
-        name="mooncake_master",
-        command=command,
-        log_path=log_path,
-        pid_path=pid_path,
-    )
-    wait_remote_health(
-        config,
-        worker_process,
-        paths=paths,
-        url=f"http://127.0.0.1:{config.mooncake_http_metadata_server_port}/health",
-        timeout_s=120.0,
-        poll_interval_s=1.0,
-    )
-
-
-def stop_mooncake_service(
-    config: BenchmarkConfig,
-    worker_process: str,
-    *,
-    paths,
-) -> None:
-    stop_remote_process(
-        config,
-        worker_process,
-        remote_pid_file(paths, "mooncake_master"),
-    )
-    remote_cmd = (
+    gpu_log = shared_log_path(paths, f"{role}_gpu_snapshot")
+    ports_log = shared_log_path(paths, f"{role}_port_snapshot")
+    gpu_cmd = (
         "set -euo pipefail; "
-        "if command -v pkill >/dev/null 2>&1; then "
-        "  pkill -f '[m]ooncake_master' >/dev/null 2>&1 || true; "
-        "fi; "
-        f"for port in {config.mooncake_http_metadata_server_port} {config.mooncake_master_port}; do "
-        "  if command -v fuser >/dev/null 2>&1; then "
-        "    fuser -k ${port}/tcp >/dev/null 2>&1 || true; "
-        "  fi; "
-        "done"
+        f"LOG_PATH={shlex.quote(str(gpu_log))}; "
+        'mkdir -p "$(dirname "$LOG_PATH")"; '
+        'nvidia-smi > "$LOG_PATH" 2>&1'
     )
-    exec_user(config, worker_process, remote_cmd, check=False)
+    ports_cmd = (
+        "set -euo pipefail; "
+        f"LOG_PATH={shlex.quote(str(ports_log))}; "
+        'mkdir -p "$(dirname "$LOG_PATH")"; '
+        'ss -ltnp > "$LOG_PATH" 2>&1 || netstat -ltnp > "$LOG_PATH" 2>&1 || true'
+    )
+    exec_user(config, worker_process, gpu_cmd, check=False)
+    exec_user(config, worker_process, ports_cmd, check=False)
 
 
 def load_yaml(path: Path) -> dict:
@@ -452,16 +403,8 @@ def daemon_is_stopped(status_text: str) -> bool:
     return "no local daemon session found" in lowered or "not found" in lowered
 
 
-def build_local_daemon_address(port: int) -> str:
-    return f"127.0.0.1:{port}"
-
-
-def daemon_handle_socket_path(paths, port: int) -> str:
-    return str(paths.workspace_root.parent / ".tensorcast-kv-sockets" / f"{port}.sock")
-
-
 def cleanup_remote_tcp_ports(
-    config: BenchmarkConfig,
+    config: RequestTransferBenchmarkConfig,
     worker_process: str,
     *,
     ports: list[int],
@@ -479,7 +422,7 @@ def cleanup_remote_tcp_ports(
 
 
 def cleanup_remote_path(
-    config: BenchmarkConfig,
+    config: RequestTransferBenchmarkConfig,
     worker_process: str,
     *,
     path: str,
@@ -492,8 +435,24 @@ def cleanup_remote_path(
     exec_user(config, worker_process, remote_cmd, check=False)
 
 
+def build_local_daemon_address(port: int) -> str:
+    return f"127.0.0.1:{port}"
+
+
+def build_daemon_address(host: str, port: int) -> str:
+    return f"{host}:{port}"
+
+
+def build_daemon_client_address(port: int) -> str:
+    return build_local_daemon_address(port)
+
+
+def daemon_handle_socket_path(paths, port: int) -> str:
+    return str(paths.workspace_root.parent / ".tensorcast-kv-sockets" / f"{port}.sock")
+
+
 def start_global_store(
-    config: BenchmarkConfig,
+    config: RequestTransferBenchmarkConfig,
     worker_process: str,
     *,
     paths,
@@ -561,7 +520,7 @@ def start_global_store(
 
 
 def stop_global_store(
-    config: BenchmarkConfig,
+    config: RequestTransferBenchmarkConfig,
     worker_process: str,
     *,
     paths,
@@ -581,7 +540,7 @@ def stop_global_store(
 
 
 def start_tensorcast_daemon(
-    config: BenchmarkConfig,
+    config: RequestTransferBenchmarkConfig,
     worker_process: str,
     *,
     paths,
@@ -656,7 +615,7 @@ def start_tensorcast_daemon(
 
 
 def stop_tensorcast_daemon(
-    config: BenchmarkConfig,
+    config: RequestTransferBenchmarkConfig,
     worker_process: str,
     *,
     paths,
@@ -698,11 +657,13 @@ def stop_tensorcast_daemon(
 
 
 def build_tensorcast_configs(
-    config: BenchmarkConfig,
+    config: RequestTransferBenchmarkConfig,
     *,
     paths,
     run_id: str,
-    worker_ip: str,
+    global_store_host: str,
+    daemon_a_host: str,
+    daemon_b_host: str,
 ) -> dict[str, Path]:
     global_cfg = load_yaml(
         paths.benchmark_root / "configs" / "global_store_config.yaml"
@@ -711,36 +672,45 @@ def build_tensorcast_configs(
         paths.benchmark_root / "configs" / "store_daemon_config.yaml"
     )
     global_cfg["server"]["listen"]["port"] = config.tensorcast_global_store_port
-    global_cfg["server"]["advertise"]["host"] = worker_ip
+    global_cfg["server"]["advertise"]["host"] = global_store_host
     global_cfg["server"]["advertise"]["port"] = config.tensorcast_global_store_port
     global_cfg["observability"]["logging"]["file"] = str(
-        remote_file_log(run_id, "tensorcast_global_store")
+        shared_log_path(paths, "tensorcast_global_store")
     )
-
-    generated: dict[str, Path] = {
+    generated = {
         "global": paths.generated_configs_dir / "tensorcast_global_store.yaml",
+        "daemon_a": paths.generated_configs_dir / "tensorcast_daemon_a.yaml",
+        "daemon_b": paths.generated_configs_dir / "tensorcast_daemon_b.yaml",
     }
     dump_yaml(generated["global"], global_cfg)
     capability_token_secret = f"tensorcast-benchmark-{run_id}"
 
-    def build_daemon_config(port: int, p2p_port: int, log_name: str) -> dict:
+    def build_daemon_config(
+        *,
+        advertise_host: str,
+        daemon_port: int,
+        p2p_port: int,
+        log_name: str,
+    ) -> dict:
         payload = json.loads(json.dumps(daemon_cfg))
-        payload["server"]["listen"]["port"] = port
-        payload["server"]["advertise"]["host"] = worker_ip
+        payload["server"]["listen"]["port"] = daemon_port
+        payload["server"]["advertise"]["host"] = advertise_host
         payload["server"]["p2p_listen"]["port"] = p2p_port
         payload["engine"]["memory_tiers"]["stable_bytes"] = (
             config.tensorcast_daemon_stable_bytes
         )
-        payload["high_availability"]["global_store_endpoints"][0]["host"] = worker_ip
+        payload["high_availability"]["global_store_endpoints"][0]["host"] = (
+            global_store_host
+        )
         payload["high_availability"]["global_store_endpoints"][0]["port"] = (
             config.tensorcast_global_store_port
         )
         payload["high_availability"]["heartbeat_interval"] = "10s"
         payload["observability"]["logging"]["file"] = str(
-            remote_file_log(run_id, log_name)
+            shared_log_path(paths, log_name)
         )
         payload["lifecycle"]["handle_leases"]["local_handle_socket_path"] = (
-            daemon_handle_socket_path(paths, port)
+            daemon_handle_socket_path(paths, daemon_port)
         )
         byte_artifact_routing = payload.setdefault("byte_artifact_routing", {})
         byte_artifact_routing["shard_count"] = (
@@ -766,38 +736,27 @@ def build_tensorcast_configs(
         active_tokens["version"] = int(active_tokens.get("version", 1) or 1)
         if not str(active_tokens.get("secret", "")).strip():
             active_tokens["secret"] = capability_token_secret
+        capability_directory = payload.setdefault("capability_directory", {})
+        capability_directory["enabled"] = True
+        capability_directory["gateway_ingress_enabled"] = True
         return payload
 
-    if config.tensorcast_daemon_mode == "share":
-        generated["daemon_shared"] = (
-            paths.generated_configs_dir / "tensorcast_daemon_shared.yaml"
-        )
-        dump_yaml(
-            generated["daemon_shared"],
-            build_daemon_config(
-                config.tensorcast_daemon_port_a,
-                config.tensorcast_daemon_p2p_port_a,
-                "tensorcast_daemon_shared",
-            ),
-        )
-        return generated
-
-    generated["daemon_a"] = paths.generated_configs_dir / "tensorcast_daemon_a.yaml"
-    generated["daemon_b"] = paths.generated_configs_dir / "tensorcast_daemon_b.yaml"
     dump_yaml(
         generated["daemon_a"],
         build_daemon_config(
-            config.tensorcast_daemon_port_a,
-            config.tensorcast_daemon_p2p_port_a,
-            "tensorcast_daemon_a",
+            advertise_host=daemon_a_host,
+            daemon_port=config.tensorcast_daemon_port_a,
+            p2p_port=config.tensorcast_daemon_p2p_port_a,
+            log_name="tensorcast_daemon_a",
         ),
     )
     dump_yaml(
         generated["daemon_b"],
         build_daemon_config(
-            config.tensorcast_daemon_port_b,
-            config.tensorcast_daemon_p2p_port_b,
-            "tensorcast_daemon_b",
+            advertise_host=daemon_b_host,
+            daemon_port=config.tensorcast_daemon_port_b,
+            p2p_port=config.tensorcast_daemon_p2p_port_b,
+            log_name="tensorcast_daemon_b",
         ),
     )
     return generated
@@ -805,23 +764,26 @@ def build_tensorcast_configs(
 
 def build_tensorcast_backend_extra_config(
     *,
-    config: BenchmarkConfig,
-    daemon_port: int,
-    global_store_address: str | None = None,
-    execution_endpoint: str | None = None,
+    config: RequestTransferBenchmarkConfig,
+    daemon_address: str,
+    global_store_address: str,
+    execution_endpoint: str,
+    prefetch_threshold: int,
 ) -> dict[str, object]:
     model_id = config.model_name or Path(config.model_path).name
-    model_version = hashlib.sha256(str(config.model_path).encode("utf-8")).hexdigest()[:16]
+    model_version = hashlib.sha256(str(config.model_path).encode("utf-8")).hexdigest()[
+        :16
+    ]
     payload: dict[str, object] = {
-        "daemon_address": build_local_daemon_address(daemon_port),
-        # Namespace is part of the byte-artifact CGID. Keep it stable across
-        # runs so identical KV pages map to identical artifact IDs.
-        "namespace": "share_local",
+        "daemon_address": daemon_address,
+        "namespace": config.tensorcast_namespace,
         "engine": "sglang",
         "model_id": model_id,
         "model_version": model_version,
         "policy_profile": "durable",
-        "prefetch_threshold": config.tensorcast_prefetch_threshold,
+        "prefetch_threshold": prefetch_threshold,
+        "instance_directory_address": global_store_address,
+        "instance_agent_execution_endpoint": execution_endpoint,
     }
     if config.tensorcast_host_allocator_enabled:
         payload["host_allocator_enabled"] = True
@@ -831,20 +793,16 @@ def build_tensorcast_backend_extra_config(
         payload["host_allocator_region_name"] = (
             config.tensorcast_host_allocator_region_name
         )
-    if global_store_address is not None:
-        payload["instance_directory_address"] = global_store_address
-    if execution_endpoint is not None:
-        payload["instance_agent_execution_endpoint"] = execution_endpoint
     return payload
 
 
 def build_sglang_command_for_instance(
     *,
     paths,
-    config: BenchmarkConfig,
+    config: RequestTransferBenchmarkConfig,
+    host: str,
     port: int,
-    mooncake_config_path: Path | None,
-    tensorcast_backend_extra_config: dict[str, object] | None,
+    tensorcast_backend_extra_config: dict[str, object],
 ) -> tuple[str, dict[str, str]]:
     cmd = [
         shlex.quote(str(paths.uv_bin)),
@@ -856,7 +814,7 @@ def build_sglang_command_for_instance(
         "-m",
         "sglang.launch_server",
         "--host",
-        config.host,
+        host,
         "--port",
         str(port),
         "--model-path",
@@ -880,49 +838,38 @@ def build_sglang_command_for_instance(
                 shlex.quote(config.hicache_storage_prefetch_policy),
             ]
         )
-    env: dict[str, str] = {}
-    if config.hicache_storage_backend == "mooncake":
-        cmd.extend(["--hicache-storage-backend", "mooncake"])
-        if mooncake_config_path is None:
-            raise RuntimeError("mooncake_config_path is required for mooncake backend")
-        env["SGLANG_HICACHE_MOONCAKE_CONFIG_PATH"] = str(mooncake_config_path)
-    elif config.hicache_storage_backend == "tensorcast":
-        if tensorcast_backend_extra_config is None:
-            raise RuntimeError(
-                "tensorcast_backend_extra_config is required for tensorcast backend"
-            )
-        cmd.extend(["--hicache-storage-backend", "tensorcast"])
-        cmd.extend(
-            [
-                "--hicache-storage-backend-extra-config",
-                shlex.quote(
-                    json.dumps(
-                        tensorcast_backend_extra_config,
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    )
-                ),
-            ]
-        )
+    cmd.extend(["--hicache-storage-backend", "tensorcast"])
+    cmd.extend(
+        [
+            "--hicache-storage-backend-extra-config",
+            shlex.quote(
+                json.dumps(
+                    tensorcast_backend_extra_config,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            ),
+        ]
+    )
     if config.extra_server_args.strip():
         cmd.append(config.extra_server_args.strip())
-    return " ".join(cmd), env
+    return " ".join(cmd), {}
 
 
 def start_sglang_instance(
-    config: BenchmarkConfig,
+    config: RequestTransferBenchmarkConfig,
     worker_process: str,
     *,
     paths,
-    run_id: str,
     instance_name: str,
+    host: str,
     cuda_visible_devices: str,
     port: int,
-    mooncake_config_path: Path | None,
-    tensorcast_backend_extra_config: dict[str, object] | None,
+    tensorcast_backend_extra_config: dict[str, object],
 ) -> None:
     log(
-        f"Starting SGLang instance {instance_name} on port {port} with CUDA_VISIBLE_DEVICES={cuda_visible_devices}"
+        f"Starting SGLang instance {instance_name} on {host}:{port} "
+        f"with CUDA_VISIBLE_DEVICES={cuda_visible_devices}"
     )
     stop_sglang_instance(
         config,
@@ -934,8 +881,8 @@ def start_sglang_instance(
     command, env = build_sglang_command_for_instance(
         paths=paths,
         config=config,
+        host=host,
         port=port,
-        mooncake_config_path=mooncake_config_path,
         tensorcast_backend_extra_config=tensorcast_backend_extra_config,
     )
     env = {"CUDA_VISIBLE_DEVICES": cuda_visible_devices, **env}
@@ -945,22 +892,22 @@ def start_sglang_instance(
         paths=paths,
         name=f"sglang_{instance_name}",
         command=command,
-        log_path=remote_file_log(run_id, f"sglang_{instance_name}"),
-        pid_path=remote_pid_file(paths, f"sglang_{instance_name}"),
+        log_path=shared_log_path(paths, f"sglang_{instance_name}"),
+        pid_path=shared_pid_path(paths, f"sglang_{instance_name}"),
         exports=env,
     )
     wait_remote_health(
         config,
         worker_process,
         paths=paths,
-        url=f"http://127.0.0.1:{port}/health",
+        url=f"http://{host}:{port}/health",
         timeout_s=config.instance_ready_timeout_s,
         poll_interval_s=config.instance_health_poll_interval_s,
     )
 
 
 def stop_sglang_instance(
-    config: BenchmarkConfig,
+    config: RequestTransferBenchmarkConfig,
     worker_process: str,
     *,
     paths,
@@ -970,7 +917,7 @@ def stop_sglang_instance(
     stop_remote_process(
         config,
         worker_process,
-        remote_pid_file(paths, f"sglang_{instance_name}"),
+        shared_pid_path(paths, f"sglang_{instance_name}"),
     )
     if port is None:
         return
@@ -981,66 +928,79 @@ def stop_sglang_instance(
     exec_user(config, worker_process, remote_cmd, check=False)
 
 
-def run_request_driver(
-    config: BenchmarkConfig,
+def run_caller_driver(
+    config: RequestTransferBenchmarkConfig,
     worker_process: str,
     *,
     paths,
-    run_id: str,
-    worker_info,
-) -> RunSummary:
-    log("Running request-pair driver")
+    results_json_path: Path,
+    summary_json_path: Path,
+    gateway_daemon_address: str,
+    source_instance_id: str,
+    target_instance_id: str,
+    source_instance_url: str,
+    target_instance_url: str,
+    worker_process_a: str,
+    worker_process_b: str,
+    worker_host_a: str,
+    worker_host_b: str,
+    worker_ip_a: str,
+    worker_ip_b: str,
+    worker_node_a: str,
+    worker_node_b: str,
+) -> RequestTransferRunSummary:
+    log("Running request-transfer caller driver")
     remote_cmd = (
-        f"{build_remote_python_prefix(paths, include_benchmark=True)}"
+        f"{build_remote_python_prefix(paths, include_benchmark=True, include_tensorcast=True)}"
         f"{build_remote_uv(paths)} run --active --no-project --offline python -m "
-        "tensorcast_benchmark.kv.share_local.request_driver "
-        f"--run-id {shlex.quote(run_id)} "
-        f"--backend {shlex.quote(config.hicache_storage_backend)} "
-        f"--tensorcast-daemon-mode {shlex.quote(config.tensorcast_daemon_mode)} "
-        f"--instance-a-url {shlex.quote(f'http://127.0.0.1:{config.port_a}')} "
-        f"--instance-b-url {shlex.quote(f'http://127.0.0.1:{config.port_b}')} "
+        "tensorcast_benchmark.kv.request_transfer.caller_driver "
+        f"--run-id {shlex.quote(summary_json_path.parent.name)} "
+        f"--topology-mode {shlex.quote(config.topology_mode)} "
+        f"--gateway-daemon-address {shlex.quote(gateway_daemon_address)} "
+        f"--source-instance-id {shlex.quote(source_instance_id)} "
+        f"--target-instance-id {shlex.quote(target_instance_id)} "
+        f"--source-instance-url {shlex.quote(source_instance_url)} "
+        f"--target-instance-url {shlex.quote(target_instance_url)} "
+        f"--target-instance-log-path {shlex.quote(str(shared_log_path(paths, 'sglang_instance_b')))} "
         f"--dataset-path {shlex.quote(config.data_path)} "
         f"--prompt-count {config.prompt_count} "
         f"--min-prompt-chars {config.min_prompt_chars} "
         f"--max-prompt-chars {config.max_prompt_chars} "
-        f"--pair-rps {config.pair_rps} "
-        f"--settle-ms {config.settle_ms} "
         f"--max-new-tokens {config.max_new_tokens} "
         f"--temperature {config.temperature} "
         f"--request-timeout-s {config.request_timeout_s} "
-        f"--results-json-path {shlex.quote(str(paths.results_json_path))} "
-        f"--summary-json-path {shlex.quote(str(paths.summary_json_path))} "
-        f"--source-instance-log-path {shlex.quote(str(remote_file_log(run_id, 'sglang_instance_a')))} "
-        f"--worker-process {shlex.quote(worker_info.process_name)} "
-        f"--worker-host {shlex.quote(worker_info.hostname)} "
-        f"--worker-ip {shlex.quote(worker_info.ip)} "
-        f"--worker-node {shlex.quote(worker_info.node)} "
-        f"--model-path {shlex.quote(config.model_path)} "
-        f"--tp-size {config.tp_size}"
+        f"--plan-deadline-ms {config.plan_deadline_ms} "
+        f"--publish-ttl-ms {config.publish_ttl_ms} "
+        f"--verify-log-timeout-s {config.verify_log_timeout_s} "
+        f"--verify-log-poll-interval-s {config.verify_log_poll_interval_s} "
+        f"--post-target-generate-settle-s {config.post_target_generate_settle_s} "
+        f"--results-json-path {shlex.quote(str(results_json_path))} "
+        f"--summary-json-path {shlex.quote(str(summary_json_path))} "
+        f"--worker-process-a {shlex.quote(worker_process_a)} "
+        f"--worker-process-b {shlex.quote(worker_process_b)} "
+        f"--worker-host-a {shlex.quote(worker_host_a)} "
+        f"--worker-host-b {shlex.quote(worker_host_b)} "
+        f"--worker-ip-a {shlex.quote(worker_ip_a)} "
+        f"--worker-ip-b {shlex.quote(worker_ip_b)} "
+        f"--worker-node-a {shlex.quote(worker_node_a)} "
+        f"--worker-node-b {shlex.quote(worker_node_b)} "
+        f"--model-path {shlex.quote(config.model_path)}"
     )
-    if config.wait_for_source_publication_drain:
-        remote_cmd += (
-            " --wait-for-source-publication-drain"
-            f" --source-publication-drain-timeout-s {config.source_publication_drain_timeout_s}"
-            f" --source-publication-drain-idle-s {config.source_publication_drain_idle_s}"
-            f" --source-publication-drain-poll-s {config.source_publication_drain_poll_s}"
-        )
-    driver_log_path = remote_file_log(run_id, "request_driver")
+    if config.enable_target_worker_warmup:
+        remote_cmd += " --enable-target-worker-warmup"
+    if config.evict_after_prompt:
+        remote_cmd += " --evict-after-prompt"
+    else:
+        remote_cmd += " --no-evict-after-prompt"
+    driver_log_path = shared_log_path(paths, "caller_driver")
     wrapped_cmd = (
         "set -euo pipefail; "
         f"LOG_PATH={shlex.quote(str(driver_log_path))}; "
         f'{remote_cmd} 2>&1 | tee "$LOG_PATH"'
     )
     exec_user(config, worker_process, wrapped_cmd)
-    with paths.summary_json_path.open("r", encoding="utf-8") as file:
-        return RunSummary.model_validate(json.load(file))
-
-
-def copy_if_exists(src: Path, dst: Path) -> None:
-    if not src.exists():
-        return
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(src, dst)
+    with summary_json_path.open("r", encoding="utf-8") as file:
+        return RequestTransferRunSummary.model_validate(json.load(file))
 
 
 def latest_tensorcast_session_dir(runtime_home: Path) -> Path | None:
@@ -1049,6 +1009,13 @@ def latest_tensorcast_session_dir(runtime_home: Path) -> Path | None:
         return None
     session_dirs = sorted(hosts_root.glob("*/sessions/*"))
     return session_dirs[-1] if session_dirs else None
+
+
+def copy_if_exists(src: Path, dst: Path) -> None:
+    if not src.exists():
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dst)
 
 
 def copy_tensorcast_runtime_stdio_logs(
@@ -1074,319 +1041,312 @@ def copy_tensorcast_runtime_stdio_logs(
     )
 
 
-def collect_logs(
+def collect_runtime_logs(
     paths,
-    run_id: str,
-    config: BenchmarkConfig,
     *,
-    worker_process: str | None,
+    worker_process_a: str,
+    worker_process_b: str,
+    topology_mode: str,
 ) -> None:
-    log("Collecting remote logs from shared /data")
-    remote_names = [
-        "main_keepalive",
-        "gpu_snapshot",
-        "port_snapshot",
-        "sglang_instance_a",
-        "sglang_instance_b",
-        "request_driver",
-    ]
-    if config.hicache_storage_backend == "mooncake":
-        remote_names.append("mooncake_master")
-    else:
-        remote_names.append("tensorcast_global_store")
-        if config.tensorcast_daemon_mode == "share":
-            remote_names.append("tensorcast_daemon_shared")
-        else:
-            remote_names.extend(["tensorcast_daemon_a", "tensorcast_daemon_b"])
-    for name in remote_names:
-        src = remote_file_log(run_id, name)
-        dst = paths.logs_dir / f"{name}.log"
-        copy_if_exists(src, dst)
-    if config.hicache_storage_backend != "tensorcast" or not worker_process:
-        return
     copy_tensorcast_runtime_stdio_logs(
-        runtime_home=tensorcast_runtime_home(paths, worker_process, "global_store"),
+        runtime_home=tensorcast_runtime_home(paths, worker_process_a, "global_store"),
         logs_dir=paths.logs_dir,
         name="tensorcast_global_store",
     )
-    if config.tensorcast_daemon_mode == "share":
-        copy_tensorcast_runtime_stdio_logs(
-            runtime_home=tensorcast_runtime_home(
-                paths, worker_process, "daemon_shared"
-            ),
-            logs_dir=paths.logs_dir,
-            name="tensorcast_daemon_shared",
-        )
-        return
     copy_tensorcast_runtime_stdio_logs(
-        runtime_home=tensorcast_runtime_home(paths, worker_process, "daemon_a"),
+        runtime_home=tensorcast_runtime_home(paths, worker_process_a, "daemon_a"),
         logs_dir=paths.logs_dir,
         name="tensorcast_daemon_a",
     )
+    daemon_b_worker = worker_process_a if topology_mode == "local" else worker_process_b
     copy_tensorcast_runtime_stdio_logs(
-        runtime_home=tensorcast_runtime_home(paths, worker_process, "daemon_b"),
+        runtime_home=tensorcast_runtime_home(paths, daemon_b_worker, "daemon_b"),
         logs_dir=paths.logs_dir,
         name="tensorcast_daemon_b",
     )
 
 
-def parse_args() -> BenchmarkConfig:
-    parser = build_parser()
-    args = parser.parse_args()
-    payload = vars(args)
-    if payload["brainctl_charged_group"].strip():
-        payload["brainctl_charged_group"] = payload["brainctl_charged_group"].strip()
-    data_path = Path(payload["data_path"]).expanduser()
-    if not data_path.is_absolute():
-        data_path = (Path.cwd() / data_path).resolve()
-    payload["data_path"] = str(data_path)
-    return BenchmarkConfig.model_validate(payload)
+def launch_worker_for_role(
+    config: RequestTransferBenchmarkConfig,
+    *,
+    run_id: str,
+    role: str,
+    extra_negative_tag: str = "",
+) -> str:
+    if not extra_negative_tag:
+        return launch_worker(config, run_id, role=role)
+    negative_tags = ",".join(
+        value
+        for value in (config.worker_negative_tags.strip(), extra_negative_tag.strip())
+        if value
+    )
+    launch_config = config.model_copy(update={"worker_negative_tags": negative_tags})
+    return launch_worker(launch_config, run_id, role=role)
 
 
 def main() -> None:
     config = parse_args()
     benchmark_root = Path(__file__).resolve().parent
-    run_id = create_run_id(
-        config.hicache_storage_backend,
-        config.tp_size,
-        config.prompt_count,
-    )
+    run_id = create_run_id("request_transfer", config.tp_size, config.prompt_count)
     paths = build_paths(benchmark_root, run_id)
     prepare_paths(paths)
+    results_json_path = paths.run_dir / "prompt_results.jsonl"
+    summary_json_path = paths.summary_json_path
 
     global ORCHESTRATOR_LOG_PATH
     ORCHESTRATOR_LOG_PATH = paths.orchestrator_log_path
 
-    worker_info = None
-    launched_worker = False
-    mooncake_config_path: Path | None = None
-    tensorcast_configs: dict[str, Path] = {}
+    worker_info_a = None
+    worker_info_b = None
+    launched_worker_a = False
+    launched_worker_b = False
     log(f"Run directory: {paths.run_dir}")
-    log(f"Benchmark backend: {config.hicache_storage_backend}")
+    log(f"Topology mode: {config.topology_mode}")
 
     try:
-        if config.existing_worker_process.strip():
-            worker_process = config.existing_worker_process.strip()
-            log(f"Reusing worker: {worker_process}")
+        if config.existing_worker_process_a.strip():
+            worker_process_a = config.existing_worker_process_a.strip()
+            log(f"Reusing worker A: {worker_process_a}")
         else:
-            worker_process = launch_worker(config, run_id, role="main")
-            launched_worker = True
-            log(f"Launched worker: {worker_process}")
-        worker_info = wait_for_worker_running(config, worker_process)
-        log(
-            f"Worker running: process={worker_info.process_name} host={worker_info.hostname} "
-            f"ip={worker_info.ip} node={worker_info.node}"
-        )
-        run_remote_smoke_checks(config, worker_process, paths=paths, run_id=run_id)
-        capture_remote_snapshots(config, worker_process, paths=paths, run_id=run_id)
-
-        if config.hicache_storage_backend == "mooncake":
-            mooncake_config_path = write_mooncake_config(paths, config)
-            start_mooncake_service(config, worker_process, paths=paths, run_id=run_id)
-        else:
-            tensorcast_configs = build_tensorcast_configs(
+            worker_process_a = launch_worker_for_role(
                 config,
-                paths=paths,
                 run_id=run_id,
-                worker_ip=worker_info.ip,
+                role="worker-a",
             )
-            global_store_home = tensorcast_runtime_home(
-                paths, worker_process, "global_store"
-            )
-            start_global_store(
-                config,
-                worker_process,
-                paths=paths,
-                global_store_config_path=tensorcast_configs["global"],
-                runtime_home=global_store_home,
-            )
-            global_store_address = (
-                f"{worker_info.ip}:{config.tensorcast_global_store_port}"
-            )
-            if config.tensorcast_daemon_mode == "share":
-                start_tensorcast_daemon(
-                    config,
-                    worker_process,
-                    paths=paths,
-                    daemon_config_path=tensorcast_configs["daemon_shared"],
-                    runtime_home=tensorcast_runtime_home(
-                        paths, worker_process, "daemon_shared"
-                    ),
-                    global_store_address=global_store_address,
-                    daemon_port=config.tensorcast_daemon_port_a,
-                )
+            launched_worker_a = True
+            log(f"Launched worker A: {worker_process_a}")
+        worker_info_a = wait_for_worker_running(config, worker_process_a)
+        log(
+            f"Worker A running: process={worker_info_a.process_name} "
+            f"host={worker_info_a.hostname} ip={worker_info_a.ip} node={worker_info_a.node}"
+        )
+        run_remote_smoke_checks(config, worker_process_a, paths=paths, role="worker_a")
+        capture_remote_snapshots(config, worker_process_a, paths=paths, role="worker_a")
+
+        if config.topology_mode == "local":
+            worker_info_b = worker_info_a
+            worker_process_b = worker_process_a
+        else:
+            if config.existing_worker_process_b.strip():
+                worker_process_b = config.existing_worker_process_b.strip()
+                log(f"Reusing worker B: {worker_process_b}")
             else:
-                start_tensorcast_daemon(
-                    config,
-                    worker_process,
-                    paths=paths,
-                    daemon_config_path=tensorcast_configs["daemon_a"],
-                    runtime_home=tensorcast_runtime_home(
-                        paths, worker_process, "daemon_a"
-                    ),
-                    global_store_address=global_store_address,
-                    daemon_port=config.tensorcast_daemon_port_a,
+                negative_node_tag = (
+                    f"node/{worker_info_a.node}" if worker_info_a.node.strip() else ""
                 )
-                start_tensorcast_daemon(
+                worker_process_b = launch_worker_for_role(
                     config,
-                    worker_process,
-                    paths=paths,
-                    daemon_config_path=tensorcast_configs["daemon_b"],
-                    runtime_home=tensorcast_runtime_home(
-                        paths, worker_process, "daemon_b"
-                    ),
-                    global_store_address=global_store_address,
-                    daemon_port=config.tensorcast_daemon_port_b,
+                    run_id=run_id,
+                    role="worker-b",
+                    extra_negative_tag=negative_node_tag,
                 )
+                launched_worker_b = True
+                log(f"Launched worker B: {worker_process_b}")
+            worker_info_b = wait_for_worker_running(config, worker_process_b)
+            log(
+                f"Worker B running: process={worker_info_b.process_name} "
+                f"host={worker_info_b.hostname} ip={worker_info_b.ip} node={worker_info_b.node}"
+            )
+            run_remote_smoke_checks(
+                config,
+                worker_process_b,
+                paths=paths,
+                role="worker_b",
+            )
+            capture_remote_snapshots(
+                config,
+                worker_process_b,
+                paths=paths,
+                role="worker_b",
+            )
+
+        tensorcast_configs = build_tensorcast_configs(
+            config,
+            paths=paths,
+            run_id=run_id,
+            global_store_host=worker_info_a.ip,
+            daemon_a_host=worker_info_a.ip,
+            daemon_b_host=worker_info_b.ip,
+        )
+        start_global_store(
+            config,
+            worker_info_a.process_name,
+            paths=paths,
+            global_store_config_path=tensorcast_configs["global"],
+            runtime_home=tensorcast_runtime_home(
+                paths, worker_info_a.process_name, "global_store"
+            ),
+        )
+        global_store_address = build_daemon_address(
+            worker_info_a.ip,
+            config.tensorcast_global_store_port,
+        )
+        start_tensorcast_daemon(
+            config,
+            worker_info_a.process_name,
+            paths=paths,
+            daemon_config_path=tensorcast_configs["daemon_a"],
+            runtime_home=tensorcast_runtime_home(
+                paths, worker_info_a.process_name, "daemon_a"
+            ),
+            global_store_address=global_store_address,
+            daemon_port=config.tensorcast_daemon_port_a,
+        )
+        daemon_b_worker_process = (
+            worker_info_a.process_name
+            if config.topology_mode == "local"
+            else worker_info_b.process_name
+        )
+        start_tensorcast_daemon(
+            config,
+            daemon_b_worker_process,
+            paths=paths,
+            daemon_config_path=tensorcast_configs["daemon_b"],
+            runtime_home=tensorcast_runtime_home(
+                paths, daemon_b_worker_process, "daemon_b"
+            ),
+            global_store_address=global_store_address,
+            daemon_port=config.tensorcast_daemon_port_b,
+        )
 
         start_sglang_instance(
             config,
-            worker_process,
+            worker_info_a.process_name,
             paths=paths,
-            run_id=run_id,
             instance_name="instance_a",
+            host=worker_info_a.ip,
             cuda_visible_devices=config.instance_a_cuda_visible_devices,
             port=config.port_a,
-            mooncake_config_path=mooncake_config_path,
-            tensorcast_backend_extra_config=(
-                build_tensorcast_backend_extra_config(
-                    config=config,
-                    daemon_port=config.tensorcast_daemon_port_a,
-                    global_store_address=global_store_address,
-                    execution_endpoint=(
-                        f"{worker_info.ip}:{config.tensorcast_instance_agent_port_a}"
-                    ),
-                )
-                if config.hicache_storage_backend == "tensorcast"
-                else None
+            tensorcast_backend_extra_config=build_tensorcast_backend_extra_config(
+                config=config,
+                daemon_address=build_daemon_client_address(
+                    config.tensorcast_daemon_port_a
+                ),
+                global_store_address=global_store_address,
+                execution_endpoint=build_daemon_address(
+                    worker_info_a.ip,
+                    config.tensorcast_instance_agent_port_a,
+                ),
+                prefetch_threshold=config.tensorcast_source_prefetch_threshold,
             ),
         )
         start_sglang_instance(
             config,
-            worker_process,
+            worker_info_b.process_name,
             paths=paths,
-            run_id=run_id,
             instance_name="instance_b",
+            host=worker_info_b.ip,
             cuda_visible_devices=config.instance_b_cuda_visible_devices,
             port=config.port_b,
-            mooncake_config_path=mooncake_config_path,
-            tensorcast_backend_extra_config=(
-                build_tensorcast_backend_extra_config(
-                    config=config,
-                    daemon_port=(
-                        config.tensorcast_daemon_port_a
-                        if config.tensorcast_daemon_mode == "share"
-                        else config.tensorcast_daemon_port_b
-                    ),
-                    global_store_address=global_store_address,
-                    execution_endpoint=(
-                        f"{worker_info.ip}:{config.tensorcast_instance_agent_port_b}"
-                    ),
-                )
-                if config.hicache_storage_backend == "tensorcast"
-                else None
+            tensorcast_backend_extra_config=build_tensorcast_backend_extra_config(
+                config=config,
+                daemon_address=build_daemon_client_address(
+                    config.tensorcast_daemon_port_b
+                ),
+                global_store_address=global_store_address,
+                execution_endpoint=build_daemon_address(
+                    worker_info_b.ip,
+                    config.tensorcast_instance_agent_port_b,
+                ),
+                prefetch_threshold=config.tensorcast_target_prefetch_threshold,
             ),
         )
 
-        summary = run_request_driver(
+        summary = run_caller_driver(
             config,
-            worker_process,
+            worker_info_a.process_name,
             paths=paths,
-            run_id=run_id,
-            worker_info=worker_info,
+            results_json_path=results_json_path,
+            summary_json_path=summary_json_path,
+            gateway_daemon_address=build_daemon_client_address(
+                config.tensorcast_daemon_port_a
+            ),
+            source_instance_id=build_daemon_address(worker_info_a.ip, config.port_a),
+            target_instance_id=build_daemon_address(worker_info_b.ip, config.port_b),
+            source_instance_url=f"http://{worker_info_a.ip}:{config.port_a}",
+            target_instance_url=f"http://{worker_info_b.ip}:{config.port_b}",
+            worker_process_a=worker_info_a.process_name,
+            worker_process_b=worker_info_b.process_name,
+            worker_host_a=worker_info_a.hostname,
+            worker_host_b=worker_info_b.hostname,
+            worker_ip_a=worker_info_a.ip,
+            worker_ip_b=worker_info_b.ip,
+            worker_node_a=worker_info_a.node,
+            worker_node_b=worker_info_b.node,
         )
         append_csv_row(paths.csv_path, summary.model_dump(mode="json"))
         log(summary.observation)
-        if summary.mean_ttft_improvement_ms is None:
-            raise RuntimeError("No TTFT improvement samples were recorded")
-        if (
-            config.require_positive_ttft_improvement
-            and summary.mean_ttft_improvement_ms <= 0
-        ):
-            raise RuntimeError(
-                f"Mean TTFT improvement was not positive: {summary.mean_ttft_improvement_ms:.2f} ms"
-            )
-        direction = (
-            "improvement" if summary.mean_ttft_improvement_ms >= 0 else "regression"
-        )
-        log(
-            f"Completed run: mean TTFT {direction} {summary.mean_ttft_improvement_ms:.2f} ms "
-            f"over {summary.success_pairs} successful pairs"
-        )
-
     finally:
-        if worker_info is not None:
+        if worker_info_a is not None:
             with contextlib.suppress(Exception):
                 stop_sglang_instance(
                     config,
-                    worker_info.process_name,
+                    worker_info_a.process_name,
                     paths=paths,
                     instance_name="instance_a",
                     port=config.port_a,
                 )
+        if worker_info_b is not None:
             with contextlib.suppress(Exception):
                 stop_sglang_instance(
                     config,
-                    worker_info.process_name,
+                    worker_info_b.process_name,
                     paths=paths,
                     instance_name="instance_b",
                     port=config.port_b,
                 )
-            if config.hicache_storage_backend == "mooncake":
-                with contextlib.suppress(Exception):
-                    stop_mooncake_service(config, worker_info.process_name, paths=paths)
-            else:
-                if config.tensorcast_daemon_mode == "share":
-                    with contextlib.suppress(Exception):
-                        stop_tensorcast_daemon(
-                            config,
-                            worker_info.process_name,
-                            paths=paths,
-                            runtime_home=tensorcast_runtime_home(
-                                paths, worker_info.process_name, "daemon_shared"
-                            ),
-                        )
-                else:
-                    with contextlib.suppress(Exception):
-                        stop_tensorcast_daemon(
-                            config,
-                            worker_info.process_name,
-                            paths=paths,
-                            runtime_home=tensorcast_runtime_home(
-                                paths, worker_info.process_name, "daemon_a"
-                            ),
-                        )
-                    with contextlib.suppress(Exception):
-                        stop_tensorcast_daemon(
-                            config,
-                            worker_info.process_name,
-                            paths=paths,
-                            runtime_home=tensorcast_runtime_home(
-                                paths, worker_info.process_name, "daemon_b"
-                            ),
-                        )
-                with contextlib.suppress(Exception):
-                    stop_global_store(
-                        config,
-                        worker_info.process_name,
-                        paths=paths,
-                        runtime_home=tensorcast_runtime_home(
-                            paths, worker_info.process_name, "global_store"
-                        ),
-                    )
-        collect_logs(
-            paths,
-            run_id,
-            config,
-            worker_process=worker_info.process_name
-            if worker_info is not None
-            else None,
-        )
-        if worker_info is not None and launched_worker and not config.keep_worker:
-            log(f"Cleaning up worker: {worker_info.process_name}")
-            stop_delete_worker(config, worker_info.process_name)
-        elif worker_info is not None:
-            log(f"Keeping worker for debug: {worker_info.process_name}")
+        if worker_info_a is not None:
+            with contextlib.suppress(Exception):
+                stop_tensorcast_daemon(
+                    config,
+                    worker_info_a.process_name,
+                    paths=paths,
+                    runtime_home=tensorcast_runtime_home(
+                        paths, worker_info_a.process_name, "daemon_a"
+                    ),
+                )
+        if worker_info_b is not None:
+            daemon_b_worker_process = (
+                worker_info_a.process_name
+                if config.topology_mode == "local" and worker_info_a is not None
+                else worker_info_b.process_name
+            )
+            with contextlib.suppress(Exception):
+                stop_tensorcast_daemon(
+                    config,
+                    daemon_b_worker_process,
+                    paths=paths,
+                    runtime_home=tensorcast_runtime_home(
+                        paths, daemon_b_worker_process, "daemon_b"
+                    ),
+                )
+        if worker_info_a is not None:
+            with contextlib.suppress(Exception):
+                stop_global_store(
+                    config,
+                    worker_info_a.process_name,
+                    paths=paths,
+                    runtime_home=tensorcast_runtime_home(
+                        paths, worker_info_a.process_name, "global_store"
+                    ),
+                )
+        if worker_info_a is not None and worker_info_b is not None:
+            collect_runtime_logs(
+                paths,
+                worker_process_a=worker_info_a.process_name,
+                worker_process_b=worker_info_b.process_name,
+                topology_mode=config.topology_mode,
+            )
+        if worker_info_b is not None and launched_worker_b and not config.keep_worker:
+            log(f"Cleaning up worker B: {worker_info_b.process_name}")
+            stop_delete_worker(config, worker_info_b.process_name)
+        elif worker_info_b is not None and launched_worker_b:
+            log(f"Keeping worker B for debug: {worker_info_b.process_name}")
+        if worker_info_a is not None and launched_worker_a and not config.keep_worker:
+            log(f"Cleaning up worker A: {worker_info_a.process_name}")
+            stop_delete_worker(config, worker_info_a.process_name)
+        elif worker_info_a is not None and launched_worker_a:
+            log(f"Keeping worker A for debug: {worker_info_a.process_name}")
 
 
 if __name__ == "__main__":

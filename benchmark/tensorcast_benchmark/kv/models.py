@@ -29,6 +29,7 @@ class BenchmarkConfig(BaseModel):
     mem_fraction_static: float = Field(default=0.85, gt=0.0, lt=1.0)
     enable_hierarchical_cache: bool = True
     hicache_mem_layout: str = "page_first"
+    hicache_io_backend: str = "kernel"
     hicache_ratio: float = Field(default=2.0, gt=0.0)
     hicache_size_gb: int = Field(default=0, ge=0)
     hicache_storage_prefetch_policy: str = "best_effort"
@@ -79,6 +80,8 @@ class BenchmarkConfig(BaseModel):
     tensorcast_global_store_port: int = Field(default=50051, ge=1, le=65535)
     tensorcast_daemon_port_a: int = Field(default=50052, ge=1, le=65535)
     tensorcast_daemon_port_b: int = Field(default=50053, ge=1, le=65535)
+    tensorcast_instance_agent_port_a: int = Field(default=31110, ge=1, le=65535)
+    tensorcast_instance_agent_port_b: int = Field(default=31111, ge=1, le=65535)
     tensorcast_daemon_p2p_port_a: int = Field(default=65090, ge=1, le=65535)
     tensorcast_daemon_p2p_port_b: int = Field(default=65091, ge=1, le=65535)
     tensorcast_prefetch_threshold: int = Field(default=1, ge=1)
@@ -88,6 +91,17 @@ class BenchmarkConfig(BaseModel):
     tensorcast_nvidia_lib_dirs: str = (
         "/usr/local/cuda-12.9/compat:/usr/local/nvidia/lib64"
     )
+    tensorcast_daemon_stable_bytes: str = "64GB"
+    tensorcast_byte_artifact_shard_count: int = Field(default=8, ge=1)
+    tensorcast_byte_artifact_lease_ttl_s: float = Field(default=30.0, gt=0.0)
+    tensorcast_byte_artifact_keepalive_interval_s: float = Field(
+        default=5.0, gt=0.0
+    )
+    tensorcast_payload_max_chunk_bytes: int = Field(default=(1 << 20), ge=1)
+    tensorcast_max_batch_payload_bytes: int = Field(default=(16 << 20), ge=1)
+    tensorcast_host_allocator_enabled: bool = False
+    tensorcast_host_allocator_region_ttl_ms: int = Field(default=0, ge=0)
+    tensorcast_host_allocator_region_name: str = "sglang_tensorcast_host_pool"
 
     @model_validator(mode="after")
     def validate_config(self) -> "BenchmarkConfig":
@@ -116,6 +130,19 @@ class BenchmarkConfig(BaseModel):
             raise ValueError(
                 "tensorcast_daemon_mode must be share or separate when backend is tensorcast"
             )
+        if self.tensorcast_host_allocator_enabled:
+            if self.hicache_storage_backend != "tensorcast":
+                raise ValueError(
+                    "tensorcast_host_allocator_enabled requires hicache_storage_backend=tensorcast"
+                )
+            if self.hicache_mem_layout != "page_blob_direct":
+                raise ValueError(
+                    "tensorcast_host_allocator_enabled requires hicache_mem_layout=page_blob_direct"
+                )
+            if self.hicache_io_backend != "direct":
+                raise ValueError(
+                    "tensorcast_host_allocator_enabled requires hicache_io_backend=direct"
+                )
         if (
             self.existing_worker_process.strip() == ""
             and self.brainctl_charged_group == ""
@@ -184,6 +211,7 @@ class PairResult(BaseModel):
 
     prompt_id: str
     prompt_chars: int
+    prompt_length: int
     backend: HicacheStorageBackend
     tensorcast_daemon_mode: TensorcastDaemonMode | None = None
     instance_a: GenerateMetrics
@@ -205,6 +233,7 @@ class RunSummary(BaseModel):
     backend: HicacheStorageBackend
     tensorcast_daemon_mode: TensorcastDaemonMode | None = None
     prompt_count: int
+    avg_prompt_length: float | None = None
     success_pairs: int
     failed_pairs: int
     mean_instance_a_ttft_ms: float | None = None

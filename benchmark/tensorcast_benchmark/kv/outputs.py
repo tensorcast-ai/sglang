@@ -16,6 +16,7 @@ RUN_SUMMARY_CSV_FIELDS = [
     "model_path",
     "tp_size",
     "prompt_count",
+    "avg_prompt_length",
     "success_pairs",
     "failed_pairs",
     "mean_instance_a_ttft_ms",

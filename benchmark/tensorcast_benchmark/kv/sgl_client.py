@@ -62,6 +62,8 @@ class StreamGenerateResult:
 class SGLangClient:
     """Thin async client for SGLang's native `/generate` endpoint."""
 
+    _STALE_KEEPALIVE_IDLE_SECONDS = 4.0
+
     def __init__(
         self,
         base_url: str,
@@ -73,11 +75,10 @@ class SGLangClient:
         self._timeout = aiohttp.ClientTimeout(total=request_timeout_seconds)
         self._session = session
         self._owns_session = session is None
+        self._last_request_completed_monotonic: float | None = None
 
     async def __aenter__(self) -> "SGLangClient":
-        if self._session is None:
-            self._session = aiohttp.ClientSession(timeout=self._timeout)
-            self._owns_session = True
+        await self._ensure_session(refresh_if_idle=False)
         return self
 
     async def __aexit__(
@@ -92,13 +93,38 @@ class SGLangClient:
         if self._session is not None and self._owns_session:
             await self._session.close()
         self._session = None
+        self._last_request_completed_monotonic = None
 
-    async def health(self) -> bool:
+    async def _ensure_session(self, *, refresh_if_idle: bool) -> None:
         if self._session is None:
             self._session = aiohttp.ClientSession(timeout=self._timeout)
             self._owns_session = True
+            return
+        if (
+            not refresh_if_idle
+            or not self._owns_session
+            or self._last_request_completed_monotonic is None
+        ):
+            return
+        idle_seconds = (
+            time.monotonic() - self._last_request_completed_monotonic
+        )
+        if idle_seconds < self._STALE_KEEPALIVE_IDLE_SECONDS:
+            return
+        await self._session.close()
+        self._session = aiohttp.ClientSession(timeout=self._timeout)
+
+    async def _reset_owned_session(self) -> None:
+        if self._session is not None and self._owns_session:
+            await self._session.close()
+        self._session = None
+        await self._ensure_session(refresh_if_idle=False)
+
+    async def health(self) -> bool:
+        await self._ensure_session(refresh_if_idle=True)
         url = f"{self._base_url}/health"
         async with self._session.get(url) as response:
+            self._last_request_completed_monotonic = time.monotonic()
             return response.status == 200
 
     async def wait_ready(
@@ -123,10 +149,6 @@ class SGLangClient:
         rid: str | None = None,
         extra_body: dict[str, Any] | None = None,
     ) -> StreamGenerateResult:
-        if self._session is None:
-            self._session = aiohttp.ClientSession(timeout=self._timeout)
-            self._owns_session = True
-
         payload: dict[str, Any] = {
             "text": text,
             "sampling_params": sampling_params,
@@ -137,44 +159,60 @@ class SGLangClient:
         if extra_body:
             payload.update(extra_body)
 
-        start = time.perf_counter()
-        first_token_ms: float | None = None
-        last_text = ""
-        final_chunk: _GenerateChunk | None = None
         url = f"{self._base_url}/generate"
-        async with self._session.post(url, json=payload) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                raise SGLangHTTPError(
-                    f"POST {url} failed: {response.status} {error_text}"
-                )
-            async for chunk_bytes in response.content:
-                chunk_bytes = chunk_bytes.strip()
-                if not chunk_bytes:
-                    continue
-                chunk = chunk_bytes.decode("utf-8")
-                if not chunk.startswith("data:"):
-                    continue
-                body = chunk[5:].strip()
-                if body == "[DONE]":
-                    break
-                parsed = _GenerateChunk.model_validate(json.loads(body))
-                if parsed.text and first_token_ms is None and parsed.text != last_text:
-                    first_token_ms = (time.perf_counter() - start) * 1000.0
-                last_text = parsed.text
-                final_chunk = parsed
+        async def _generate_once() -> StreamGenerateResult:
+            await self._ensure_session(refresh_if_idle=True)
+            start = time.perf_counter()
+            first_token_ms: float | None = None
+            last_text = ""
+            final_chunk: _GenerateChunk | None = None
+            async with self._session.post(url, json=payload) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    raise SGLangHTTPError(
+                        f"POST {url} failed: {response.status} {error_text}"
+                    )
+                async for chunk_bytes in response.content:
+                    chunk_bytes = chunk_bytes.strip()
+                    if not chunk_bytes:
+                        continue
+                    chunk = chunk_bytes.decode("utf-8")
+                    if not chunk.startswith("data:"):
+                        continue
+                    body = chunk[5:].strip()
+                    if body == "[DONE]":
+                        break
+                    parsed = _GenerateChunk.model_validate(json.loads(body))
+                    if (
+                        parsed.text
+                        and first_token_ms is None
+                        and parsed.text != last_text
+                    ):
+                        first_token_ms = (time.perf_counter() - start) * 1000.0
+                    last_text = parsed.text
+                    final_chunk = parsed
 
-        latency_ms = (time.perf_counter() - start) * 1000.0
-        if final_chunk is None:
+            latency_ms = (time.perf_counter() - start) * 1000.0
+            self._last_request_completed_monotonic = time.monotonic()
+            if final_chunk is None:
+                return StreamGenerateResult(
+                    text="",
+                    meta_info={},
+                    ttft_ms=None,
+                    latency_ms=latency_ms,
+                )
             return StreamGenerateResult(
-                text="",
-                meta_info={},
-                ttft_ms=None,
+                text=final_chunk.text,
+                meta_info=final_chunk.meta_info,
+                ttft_ms=first_token_ms,
                 latency_ms=latency_ms,
             )
-        return StreamGenerateResult(
-            text=final_chunk.text,
-            meta_info=final_chunk.meta_info,
-            ttft_ms=first_token_ms,
-            latency_ms=latency_ms,
-        )
+
+        for attempt in range(2):
+            try:
+                return await _generate_once()
+            except aiohttp.ServerDisconnectedError:
+                if attempt == 1 or not self._owns_session:
+                    raise
+                await self._reset_owned_session()
+        raise RuntimeError("unreachable")

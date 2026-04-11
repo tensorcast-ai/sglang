@@ -454,6 +454,6 @@ These decisions should remain stable unless the benchmark goal itself changes.
 - [x] Add a reusable README example and preset wrapper for the validated `Qwen3-32B` / `hotpotqa` / `page_first_direct` Mooncake configuration.
 - [x] Validate the `tensorcast share` path as a service-lifecycle harness.
 - [x] Validate long-prompt Tensorcast prefix sharing on `Qwen3-32B`, `tp=2`, using `LongBench/hotpotqa.jsonl` with debug HiCache logs.
-- [ ] Validate the `tensorcast separate` path as a two-daemon local topology harness.
+- [x] Validate the `tensorcast separate` path as a two-daemon local topology harness.
 - [x] Write `README.md` usage examples for Mooncake and Tensorcast modes.
 - [x] Keep the benchmark-specific workflow self-contained while avoiding duplication with `kv/` shared utilities.

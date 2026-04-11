@@ -3,13 +3,18 @@
 This benchmark measures local prefix-share TTFT improvement across two standard
 SGLang instances running on the same remote GPU worker.
 
-The request pattern is:
+The request pattern depends on `--wait-for-source-publication-drain`:
 
-1. send a prompt to instance A
-2. wait for the full response
-3. optionally wait for a short settle interval
-4. send the exact same prompt to instance B
-5. compare TTFT between A and B
+1. With `--wait-for-source-publication-drain`:
+   - send a prompt to instance A
+   - wait for the full response
+   - wait until source publication drains
+   - optionally wait for a short settle interval
+   - send the exact same prompt to instance B
+2. Without `--wait-for-source-publication-drain`:
+   - schedule instance-A requests at the configured `--pair-rps`
+   - schedule the matching instance-B request `--settle-ms` later
+   - allow A/B requests from different pairs to overlap in time
 
 This benchmark does **not** model PD disaggregation or request-level KV
 transfer.
@@ -209,9 +214,10 @@ happens successfully.
 
 For the measured request pair, the proof sequence is:
 
-1. In instance-A logs, find repeated `stable_dram upload` lines during the
-   formal request window. This shows the source instance is publishing reusable
-   pages into Tensorcast.
+1. In instance-A logs, find repeated source-publication lines during the
+   formal request window. Mooncake emits `stable_dram upload`; Tensorcast emits
+   `Tensorcast batch_set_v1`. This shows the source instance is publishing
+   reusable pages into the storage backend.
 2. In instance-B logs, for the same formal `rid`, find
    `HiCache storage hit query ... hit_tokens > 0`.
 3. Confirm that the same request then logs `Prefetching ... pages for request`
