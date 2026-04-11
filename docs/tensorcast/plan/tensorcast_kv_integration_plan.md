@@ -27,12 +27,16 @@ This split is the right one for the current codebase because:
   regions and allocator-backed host residency, but still requires no external
   controller,
 - `Phase 3` is the first phase that requires Tensorcast programmability-facing
-  API additions and in-process instance-agent work.
+  API additions and instance-agent / coordinator work.
 
 Current repo status:
 
 - `Phase 0` through `Phase 2.5` are implemented in the current codebase.
-- `Phase 3` and `Phase 4` remain planned.
+- `Phase 3A` through `Phase 3C` and the local `M6` external-caller validation
+  portion of `Phase 3D` are implemented in the current codebase.
+- Remaining planned work is:
+  - the remote `M6` validation in `Phase 3D`,
+  - and the hardening / observability / performance follow-up in `Phase 4`.
 
 ## Target Outcome
 
@@ -737,10 +741,10 @@ Current Phase-2.5A validation note:
 Current Phase-2.5B validation note:
 
 - SGLang local allocator plumbing currently confirmed by:
-  - `python/sglang/test/mem_cache/test_memory_pool_host_page_blob_direct.py`
-  - `python/sglang/test/mem_cache/tensorcast/test_tensorcast_host_allocator.py`
-  - `python/sglang/test/mem_cache/tensorcast/test_tensorcast_store.py`
-  - `python/sglang/test/mem_cache/test_host_shared_slot_state.py`
+  - `python/sglang/test/tensorcast/test_memory_pool_host_page_blob_direct.py`
+  - `python/sglang/test/tensorcast/test_tensorcast_host_allocator.py`
+  - `python/sglang/test/tensorcast/test_tensorcast_store.py`
+  - `python/sglang/test/tensorcast/test_host_shared_slot_state.py`
 - That coverage confirms:
   - the `page_blob_direct` host layout keeps one TensorCast-facing KV page in a
     page-contiguous blob shape,
@@ -912,86 +916,388 @@ Current Phase-2.5B validation note:
 This phase adds the programmable request-level handoff path for PD-disaggregated
 inference.
 
-### Phase 3A - SGLang In-Process Instance-Agent and Coordinator
+Validation cadence for this phase should also be milestone-gated rather than
+left to one final bring-up:
 
-- [ ] Add the SGLang-side in-process instance-agent boundary:
-  - [ ] Implement Tensorcast `NodeAgent` semantics inside the logical SGLang instance.
-  - [ ] Co-locate the SGLang `EngineAdapter` with that instance-agent.
-  - [ ] Keep the Tensorcast daemon as worker/data-plane host, not as owner of instance-step execution.
-- [ ] Add the rank-0 coordinator role:
-  - [ ] Rank 0 owns the logical `instance_id` lifecycle and Tensorcast directory registration.
-  - [ ] Rank 0 receives `publish`, `hydrate`, and `evict_local` calls for the logical instance.
-  - [ ] Rank 0 fans out to the required TP ranks and aggregates success/failure.
-  - [ ] Group-scoped success requires all required ranks to succeed.
-- [ ] Add SGLang-owned request bundle bookkeeping:
-  - [ ] Keep request-bundle metadata inside SGLang, not in a Tensorcast registry.
-  - [ ] Add a page publication registry inside SGLang integration code.
-  - [ ] Add request-bundle snapshot state needed to decide publish cutoff and ordered page membership.
-  - [ ] Keep the snapshot logic non-blocking to engine execution except where an explicit publish must wait for pending page publication to reach the requested cutoff.
-- [ ] Define decode-side prepared state:
-  - [ ] Hydrate prepares a target-local request bundle.
-  - [ ] Ordinary decode ingress later consumes that prepared state.
-  - [ ] Hydrate itself must not silently start decode.
+- the first layer is Tensorcast API / proto / node-agent unit testing for the
+  request-transfer surface,
+- the second layer is SGLang pure-Python state-machine and coordinator testing
+  for publish / hydrate / claim / fallback semantics,
+- the third layer is controller-driven end-to-end validation on real SGLang
+  instances after the individual milestones are already green.
+
+Recommended Phase-3 milestones:
+
+- `M0`
+  - **What it is**:
+    Tensorcast request-transfer control-plane surface roundtrip.
+  - **What must be true when it is complete**:
+    `PublishManifest`, `EngineOwnedManifest`, `PublishResult.publish_manifest`,
+    and `hydrate(publish_manifest=...)` serialize, deserialize, and execute
+    through plan / node-agent plumbing without ambiguity.
+  - **What it does not include yet**:
+    real SGLang publish / hydrate semantics.
+- `M1`
+  - **What it is**:
+    SGLang-local source and target state models.
+  - **What must be true when it is complete**:
+    `RequestBundleState`, page publication registry, prepared-bundle table, and
+    prepared-hold bookkeeping all have explicit state machines with pure-Python
+    tests.
+  - **What it does not include yet**:
+    real Tensorcast publish / hydrate calls.
+- `M2`
+  - **What it is**:
+    rank-0 coordinator fanout and aggregation semantics.
+  - **What must be true when it is complete**:
+    one logical instance op fans out to required TP ranks, aggregates results,
+    and fails closed on missing or failed required ranks.
+  - **What it does not include yet**:
+    end-to-end artifact materialization.
+- `M3`
+  - **What it is**:
+    source-side `publish(...)` closure correctness.
+  - **What must be true when it is complete**:
+    publish can resolve active or retained source request state, freeze a
+    full-prompt page-granular closure target, adopt/wait/force missing pages
+    up to that boundary, and assemble one immutable `PublishManifest` while
+    surfacing any non-page-aligned prompt tail via `tail_valid_tokens`.
+  - **What it does not include yet**:
+    target-side prepared-bundle admission.
+- `M4`
+  - **What it is**:
+    target-side `hydrate(...)` install correctness.
+  - **What must be true when it is complete**:
+    hydrate validates compatibility, materializes required pages, installs one
+    prepared bundle plus holds, and cleans up correctly on required-rank
+    failure.
+  - **What it does not include yet**:
+    ordinary `/generate` claim / revalidation.
+- `M5`
+  - **What it is**:
+    ordinary `/generate(rid)` admission binding correctness.
+  - **What must be true when it is complete**:
+    incoming prompt tokenization is revalidated against
+    `prompt_token_digest` / `cutoff_token_count`; clean prepared bundles are
+    claimed exactly once; stale or incompatible records warn and fall back.
+  - **What it does not include yet**:
+    remote end-to-end controller validation on real instances.
+- `M6`
+  - **What it is**:
+    single-controller end-to-end prompt-only request-bundle handoff.
+  - **What must be true when it is complete**:
+    a controller can serve on source, publish a full-prompt page-granular
+    snapshot, optionally prefetch, hydrate on target, and resume through
+    ordinary SGLang ingress.
+
+### Phase 3A - SGLang Instance-Agent and Coordinator
+
+Current status:
+
+- `M1` state models and request-bundle bookkeeping now live under
+  `sglang/python/sglang/srt/tensorcast/request_bundle/`, with the store-facing
+  bridge remaining in
+  `sglang/python/sglang/srt/mem_cache/storage/tensorcast_store/`.
+- `M2` runtime coordinator, directory registration, rank-0 fanout /
+  aggregation, and the instance-agent runtime now live under
+  `sglang/python/sglang/srt/tensorcast/instance_ops/`.
+- `M3` has now been split into:
+  - local-rank publish closure on each scheduler process,
+  - plus a separate group-level publish-manifest aggregation step that combines
+    one local result per required rank.
+- `M4` has now been split into:
+  - local-rank hydrate install and prepared-bundle state on each scheduler
+    process,
+  - plus a separate group-level aggregation step that combines one local
+    hydrate result per required rank.
+- `M3`, `M4`, `M5`, and `evict_local(...)` runtime semantics now live under
+  `sglang/python/sglang/srt/tensorcast/request_bundle/` and are wired into the
+  real backend through `RequestBundleManager`.
+- Live ordinary text `/generate` prepared-bundle claim / cleanup wiring is
+  connected to the real `Scheduler` lifecycle for the Tensorcast HiCache
+  backend.
+- Local-rank live source-request tracking / progress observation / cleanup is
+  connected to the real `Scheduler` lifecycle for ordinary text `/generate`.
+- Local-rank page publication state transitions are now driven by real
+  `batch_set_v1(...)` outcomes on the active Tensorcast store path, so the page
+  publication registry reflects background publication progress instead of only
+  pure-Python test fixtures.
+- Local-rank store state intentionally remains per-scheduler-process, but rank
+  0 now performs real cross-rank `publish` / `hydrate` / `evict_local`
+  fanout-and-aggregation over the live scheduler control path.
+- The current coordinator runtime reuses SGLang's existing collective RPC /
+  object-group control path and is explicitly limited to `dp_size == 1`.
+- Local `hydrate(...)` now materializes host-resident prepared pages plus
+  prepared-hold state on each scheduler process, and ordinary `/generate(rid)`
+  consumes that prepared state by installing a host prefix into the normal
+  HiRadix path before decode.
+- A rank-0 `launch_server()`-managed Tensorcast instance-agent sidecar gRPC
+  ingress is now wired for the Tensorcast HiCache backend.
+- That ingress reuses a dedicated `instance_agent_execution_endpoint`,
+  forwards only
+  `publish` / `hydrate` / `evict_local` through the existing
+  scheduler `rpc_ipc_name`, and preserves the scheduler-owned coordinator
+  semantics.
+- Remaining Phase 3 gaps are now remote validation and true multi-node
+  external-caller execution hardening, not the instance-agent ingress boundary
+  itself.
+
+- [x] Add the SGLang-side instance-agent boundary:
+  - [x] Implement Tensorcast `NodeAgent` semantics as a `launch_server()`-managed
+    instance-agent sidecar for the logical SGLang instance.
+  - [x] Co-locate the SGLang `EngineAdapter` with that instance-agent service.
+  - [x] Keep the Tensorcast daemon as worker/data-plane host, not as owner of instance-step execution.
+  - [x] Add typed SGLang-internal instance-op request / result objects for
+    `publish`, `hydrate`, and `evict_local`.
+  - [x] Add pure-Python tests for those typed request / result objects and
+    per-rank result aggregation.
+- [x] Add the rank-0 coordinator role:
+  - [x] Rank 0 owns the logical `instance_id` / coordinator-epoch runtime lifecycle.
+  - [x] Rank 0 owns Tensorcast directory registration for the instance-agent sidecar execution endpoint.
+  - [x] Rank 0 receives `publish`, `hydrate`, and `evict_local` calls for the logical instance.
+  - [x] Rank 0 fans out to the required TP ranks and aggregates success/failure.
+  - [x] Group-scoped success requires all required ranks to succeed.
+  - [x] Make required-rank timeouts and missing-rank handling explicit and fail-closed.
+  - [x] Reuse the real scheduler collective RPC / object-group path rather than a test-only coordinator fanout shim.
+  - [x] Add coordinator unit tests for all-success, one-rank-failure,
+    timeout, and idempotent retry cases.
+- [x] Add SGLang-owned request bundle bookkeeping:
+  - [x] Keep request-bundle metadata inside SGLang, not in a Tensorcast registry.
+  - [x] Add a page publication registry inside SGLang integration code.
+  - [x] Add request-bundle snapshot state needed to decide publish cutoff and ordered page membership.
+  - [x] Keep the snapshot logic non-blocking to engine execution except where an explicit publish must wait for pending page publication to reach the requested cutoff.
+  - [x] Explicitly model page publication states needed by publish closure:
+    `ready`, `inflight`, `absent`, `failed`.
+  - [x] Explicitly model page-aligned cutoff clipping and `snapshot_seq`
+    advancement.
+  - [x] Connect local-rank live source request tracking / progress / cleanup to
+    the real `Scheduler` lifecycle for ordinary text `/generate`.
+  - [x] Reflect passive background `batch_set_v1(...)` publication outcomes
+    into the local-rank page publication registry so `ready`, `inflight`, and
+    retryable `absent` transitions come from the real store path.
+  - [x] Add pure-Python tests for page publication registry transitions,
+    request-bundle state transitions, page-aligned cutoff clipping, and publish
+    retry generation advancement.
+  - [x] Add store-wiring tests for background `batch_set_v1(...)` success,
+    per-item failure rollback, and publish-refresh preservation of inflight
+    page state.
+- [x] Define decode-side prepared state:
+  - [x] Hydrate prepares a target-local request bundle.
+  - [x] Ordinary decode ingress later consumes that prepared state.
+  - [x] Hydrate itself must not silently start decode.
+  - [x] Store prepared-bundle state separately from live request state.
+  - [x] Store prepared-hold references separately from HiCache prefix-match hot
+    state.
+  - [x] Add pure-Python tests for one-shot claim, stale prepared record
+    fallback, and live-request conflict handling.
 
 ### Phase 3B - Tensorcast Request-Transfer Surface Extensions
 
-- [ ] Extend Tensorcast result/control types:
-  - [ ] Add `EngineOwnedManifest` as an opaque engine-owned payload.
-  - [ ] Add `PublishManifest` as the controller-visible immutable transfer handle.
-  - [ ] Extend `PublishResult` to carry `publish_manifest`.
-- [ ] Extend plan and node-agent APIs:
-  - [ ] Add `hydrate(publish_manifest=...)`.
-  - [ ] Preserve legacy `hydrate(engine_request_id=...)` only as a compatibility surface for controller-side cached manifests.
-  - [ ] Ensure the controller, not the target instance, owns any compatibility cache from `engine_request_id` to the last known `PublishManifest`.
-- [ ] Extend proto serialization and Python APIs:
-  - [ ] Update plan proto.
-  - [ ] Update node-agent proto.
-  - [ ] Update Python plan builders and result deserialization.
-  - [ ] Update executor/server serialization paths.
-- [ ] Add Tensorcast tests for the new request-transfer handle semantics.
+- [x] Extend Tensorcast result/control types:
+  - [x] Add `EngineOwnedManifest` as an opaque engine-owned payload.
+  - [x] Add `PublishManifest` as the controller-visible immutable transfer handle.
+  - [x] Extend `PublishResult` to carry `publish_manifest`.
+  - [x] Make manifest digest binding and legacy alias behavior explicit.
+- [x] Extend plan and node-agent APIs:
+  - [x] Add `hydrate(publish_manifest=...)`.
+  - [x] Preserve legacy `hydrate(engine_request_id=...)` only as a compatibility surface for controller-side cached manifests.
+  - [x] Ensure the controller, not the target instance, owns any compatibility cache from `engine_request_id` to the last known `PublishManifest`.
+  - [x] Define fail-closed behavior for zero or multiple cached manifest matches
+    in the compatibility shim.
+- [x] Extend proto serialization and Python APIs:
+  - [x] Update plan proto.
+  - [x] Update node-agent proto.
+  - [x] Update Python plan builders and result deserialization.
+  - [x] Update executor/server serialization paths.
+  - [x] Update or add Tensorcast tests for:
+    - [x] plan-spec roundtrip of `PublishManifest`,
+    - [x] node-agent execution of `hydrate(publish_manifest=...)`,
+    - [x] compatibility-shim failure semantics for zero / one / many cached
+      manifest matches,
+    - [x] opaque `EngineOwnedManifest` payload passthrough.
+- [x] Add Tensorcast tests for the new request-transfer handle semantics.
 
 ### Phase 3C - SGLang EngineAdapter Publish/Hydrate/Evict
 
-- [ ] Implement source-side `publish(...)`:
-  - [ ] Resolve source request state from SGLang-owned request metadata.
-  - [ ] Ensure the publish snapshot covers the full intended request cutoff.
-  - [ ] Reuse already-published substrate pages when possible rather than re-uploading every page.
-  - [ ] Return a `PublishManifest` containing:
+- [x] Implement source-side `publish(...)`:
+  - [x] Resolve source request state from SGLang-owned request metadata.
+  - [x] Resolve retained prompt-snapshot state after the ordinary source
+    request completes, so post-completion `publish()` stays possible within a
+    bounded retention window.
+  - [x] Reject unsupported v1 shapes early:
+    - [x] no batch request transfer,
+    - [x] no parallel-sampling transfer,
+    - [x] no session-lineage transfer.
+  - [x] Allow `publish()` to be invoked after the source has already emitted
+    decode tokens while keeping snapshot membership prompt-only.
+  - [x] Ensure `publish()` targets the request's full prompt token count and
+    only reports success after page-granular closure for that boundary.
+  - [x] Allow bounded waiting for prompt prefill / page publication needed to
+    close that full prompt boundary, while still refusing to chase decode
+    continuation or any newer prompt mutation.
+  - [x] For the initial SGLang v1 profile, keep the byte-artifact closure
+    page-granular while carrying any non-page-aligned prompt tail through
+    `tail_valid_tokens` instead of directly transferring a partial tail page.
+  - [x] Keep the published generation prompt-only:
+    - [x] emitted decode tokens do not extend cutoff/page membership,
+    - [x] decode-only KV is excluded from the published generation.
+  - [x] Gather required-rank ordered page membership for exactly that cutoff.
+  - [x] Close the cutoff over the page publication registry:
+    - [x] reuse `ready` pages,
+    - [x] join or wait `inflight` pages,
+    - [x] force flush `absent` pages if local bytes still exist,
+    - [x] fail closed on `failed` or unrecoverable missing pages.
+  - [x] Reuse already-published substrate pages when possible rather than re-uploading every page.
+  - [x] Assemble one `PublishManifest` containing:
+    - [x] generic artifact-manifest data,
+    - [x] compatibility envelope,
+    - [x] `prompt_token_digest`,
+    - [x] `cutoff_token_count`,
+    - [x] `tail_valid_tokens` for non-page-aligned prompt tails while aligned
+      prompts still emit `0`.
+  - [x] Return a `PublishManifest` containing:
     - generic Tensorcast manifest data,
     - opaque `EngineOwnedManifest` needed by SGLang to resume decode.
-- [ ] Implement target-side `hydrate(...)`:
-  - [ ] Accept `publish_manifest=...` as the canonical v1 path.
-  - [ ] Materialize the request bundle into target-local prepared state.
-  - [ ] Separate transport success from decode-usability filtering.
-  - [ ] Only after successful prepare should the ordinary decode request be admitted on the target instance.
-- [ ] Implement `evict_local(...)`:
-  - [ ] Remove target-local prepared/live request bundle state.
-  - [ ] Keep local evict semantics distinct from global page deletion.
-- [ ] Add optional worker warmup:
-  - [ ] Use `prefetch_manifest_result(...)` only as an optimization.
-  - [ ] Keep `prefetch` orthogonal to correctness of `hydrate`.
+  - [x] Keep publish execution split into:
+    - one local-rank closure result per scheduler process,
+    - one later group-level aggregation step that combines all required ranks
+      into the controller-visible `PublishManifest`.
+  - [x] Add unit tests for:
+    - [x] ready-only publish,
+    - [x] wait-on-inflight publish,
+    - [x] force-flush missing tail publish,
+    - [x] full-prompt closure waits for prompt-page publication rather than
+      committing a smaller visible-prefix generation,
+    - [x] non-page-aligned prompt tail is surfaced via `tail_valid_tokens`
+      without direct tail-page transfer,
+    - [x] live-request released before closure failure,
+    - [x] group-level aggregation across one local publish result per rank,
+    - [x] mid-decode prompt-only publish,
+    - [x] post-completion retained prompt-snapshot publish.
+- [x] Implement target-side `hydrate(...)`:
+  - [x] Accept `publish_manifest=...` as the canonical v1 path.
+  - [x] Validate manifest compatibility before any destructive local install.
+  - [x] Materialize the request bundle into target-local prepared state.
+  - [x] Keep v1 hydrate distinct from SGLang PD-disaggregation prebuilt decode semantics; hydrate prepares state but does not directly start decode.
+  - [x] Separate transport success from decode-usability filtering.
+  - [x] Only after successful prepare should the ordinary decode request be admitted on the target instance.
+  - [x] Ordinary `/generate(rid)` must re-run incoming prompt tokenization / normalization and verify `prompt_token_digest` plus `cutoff_token_count` before claiming a prepared bundle.
+  - [x] Install prepared-hold references keyed by slot token / generation rather
+    than by page start alone.
+  - [x] Make repeated `hydrate()` with the same manifest an explicit idempotent
+    retry policy.
+  - [x] Keep hydrate execution split into:
+    - one local-rank install result plus local prepared-bundle state per
+      scheduler process,
+    - one later group-level aggregation step that combines all required ranks
+      into the fail-closed controller-visible hydrate result.
+  - [x] Add unit tests for:
+    - [x] compatibility mismatch fail-closed,
+    - [x] local-rank hydrate failure,
+    - [x] successful local prepared-bundle install,
+    - [x] idempotent retry with the same manifest,
+    - [x] group-level aggregation across one local hydrate result per rank.
+- [x] Implement ordinary `/generate(rid)` prepared-bundle binding:
+  - [x] Re-run the same prompt tokenization / normalization as ordinary SGLang
+    admission.
+  - [x] Validate `prompt_token_digest` and `cutoff_token_count` before claim.
+  - [x] CAS-claim exactly one clean prepared bundle generation.
+  - [x] Warning + fall back to the normal SGLang path for stale, tainted, or
+    incompatible prepared records.
+  - [x] Fail closed for active claim conflicts or multiple clean prepared
+    generations.
+  - [x] Add unit tests for:
+    - [x] exact-match successful claim,
+    - [x] prompt mismatch fallback,
+    - [x] stale-record fallback,
+    - [x] claimed-conflict fail-closed,
+    - [x] multiple-clean-generation fail-closed.
+- [x] Implement `evict_local(...)`:
+  - [x] Remove target-local prepared/live request bundle state.
+  - [x] Keep local evict semantics distinct from global page deletion.
+  - [x] Release prepared holds and clean any target-local bookkeeping without
+    deleting shared page artifacts.
+  - [x] Add unit tests for prepared-only cleanup and post-consume cleanup.
+- [x] Add optional worker warmup:
+  - [x] Use `prefetch_manifest_result(...)` only as an optimization.
+  - [x] Keep `prefetch` orthogonal to correctness of `hydrate`.
+  - [x] Add a test showing that `hydrate()` still succeeds without worker
+    prefetch.
 
 ### Phase 3D - Caller / Controller Validation
 
-- [ ] Add a realistic external caller example for PD handoff:
-  - [ ] choose source and target instances,
-  - [ ] prefill on source,
-  - [ ] publish on source,
-  - [ ] optionally prefetch on target host daemon,
-  - [ ] hydrate on target,
-  - [ ] resume decode on target.
-- [ ] Add local integration tests for single-controller request transfer.
-- [ ] Keep the v1 restriction explicit:
-  - [ ] single controller,
-  - [ ] explicit `PublishManifest`,
-  - [ ] no generic cross-daemon multi-instance super-plan beyond current Tensorcast routing limits.
+Current status:
+
+- local controller/runtime validation in Tensorcast Python tests is green for:
+  - manifest-cache happy path,
+  - compatibility-shim zero / one / many match behavior,
+  - publish failure surfacing,
+  - hydrate failure surfacing.
+- a realistic external caller benchmark scaffold now exists under
+  `benchmark/tensorcast_benchmark/kv/request_transfer/` with:
+  - one-runtime controller flow,
+  - local and remote topology orchestration,
+  - source ordinary `/generate`,
+  - controller `publish`,
+  - optional worker warmup,
+  - controller `hydrate`,
+  - and target ordinary `/generate` verification hooks.
+- the latest local one-prompt correctness run now reaches:
+  - source ordinary `/generate` success,
+  - controller-side `publish` success for the full prompt page-granular
+    closure,
+  - controller-side `hydrate` success on the target instance,
+  - target ordinary `/generate(rid)` success,
+  - prepared-bundle attach in target logs on all required ranks,
+  - and `prepared_bundle_verified` green with
+    `cached_tokens == cutoff_token_count - tail_valid_tokens`.
+- remote `M6` validation is still pending.
+
+- [x] Add a realistic external caller example for controller-driven
+  prompt-only request-bundle reuse:
+  - [x] choose source and target instances,
+  - [x] serve on source,
+  - [x] publish the full prompt page-granular closure on source,
+  - [x] optionally prefetch on target host daemon,
+  - [x] hydrate on target,
+  - [x] resume decode on target.
+- [x] Add local integration tests for single-controller request transfer:
+  - [x] controller-side manifest cache happy path,
+  - [x] controller-side compatibility shim zero / one / many match behavior,
+  - [x] controller-visible source publish failure and target hydrate failure
+    surfacing.
+- [ ] Add remote end-to-end validation for `M6`:
+  - [ ] source ordinary serving instance prefill,
+  - [ ] controller-side publish,
+  - [ ] target ordinary serving instance hydrate,
+  - [ ] target ordinary `/generate` claim via the same stable `rid`,
+  - [ ] log-based verification that ordinary `/generate` used the prepared
+    bundle rather than ordinary prefix prefetch.
+- [x] Keep the v1 restriction explicit:
+  - [x] single controller,
+  - [x] explicit `PublishManifest`,
+  - [x] no generic cross-daemon multi-instance super-plan beyond current Tensorcast routing limits.
+  - [x] require one explicit stable caller `rid` per transferred request.
+  - [x] reject batch-request, parallel-sampling, and session-lineage handoff in the initial profile.
+  - [x] keep the published generation at the request's prompt-only boundary rather than decode-token continuation.
+  - [x] allow `publish()` invocation after source-side decode has started or after the ordinary source request completes, as long as only prompt-only KV is published.
+  - [x] leave DP-replica routing for the post-hydrate ordinary `/generate` out of scope for the initial implementation.
+  - [x] leave decode-only target instances out of scope for the initial implementation; v1 first targets ordinary serving instances that run the first decode step locally.
+  - [x] ordinary `/generate(rid)` should claim a clean prepared bundle when available, but warning + fall back to the normal SGLang path if only stale/tainted/incompatible prepared records exist.
 
 ### Phase 3 Exit Criteria
 
-- [ ] A controller can publish one request's KV snapshot from a source instance.
-- [ ] A controller can hydrate that snapshot on a target instance using `PublishManifest`.
-- [ ] The target instance can resume decode using ordinary SGLang ingress.
-- [ ] The integration keeps request-bundle metadata owned by SGLang, not Tensorcast core.
+- [x] Milestones `M0` through `M5` each have self-contained unit or local
+  integration coverage and are green before `M6` remote validation.
+- [x] A controller can publish one request's full prompt, page-granular,
+  prompt-only snapshot from a source instance.
+- [x] A controller can hydrate that snapshot on a target instance using
+  `PublishManifest`.
+- [x] The target instance can reuse that published prompt-only snapshot through
+  ordinary SGLang ingress without rerunning prefill for the closed pages.
+- [x] Prepared-bundle claim revalidates incoming prompt tokenization against
+  `prompt_token_digest` and `cutoff_token_count`.
+- [x] The integration keeps request-bundle metadata owned by SGLang, not Tensorcast core.
 
 ## Phase 4 - Hardening, Failure Semantics, and Performance
 
@@ -1057,19 +1363,96 @@ The most important implementation boundary is:
 - `sglang/python/sglang/srt/mem_cache/storage/tensorcast_store/client.py`
 - `sglang/python/sglang/srt/mem_cache/storage/tensorcast_store/host_allocator.py`
 - `sglang/python/sglang/srt/mem_cache/host_shared_slot_state.py`
-- `sglang/python/sglang/test/mem_cache/tensorcast/test_tensorcast_store.py`
-- `sglang/python/sglang/test/mem_cache/tensorcast/test_tensorcast_host_allocator.py`
-- `sglang/python/sglang/test/mem_cache/test_memory_pool_host_page_blob_direct.py`
-- `sglang/python/sglang/test/mem_cache/test_host_shared_slot_state.py`
+- `sglang/python/sglang/test/tensorcast/test_tensorcast_store.py`
+- `sglang/python/sglang/test/tensorcast/test_tensorcast_host_allocator.py`
+- `sglang/python/sglang/test/tensorcast/test_memory_pool_host_page_blob_direct.py`
+- `sglang/python/sglang/test/tensorcast/test_host_shared_slot_state.py`
 - `sglang/benchmark/tensorcast_benchmark/kv/share_local/scripts/tensorcast_service.sh`
 
-### New SGLang files still likely needed for Phase 3
+### Phase 3 SGLang file map
 
-- `sglang/python/sglang/srt/tensorcast/instance_agent.py`
-- `sglang/python/sglang/srt/tensorcast/coordinator.py`
-- `sglang/python/sglang/srt/tensorcast/engine_adapter.py`
-- `sglang/python/sglang/srt/tensorcast/page_publication_registry.py`
-- `sglang/python/sglang/srt/tensorcast/request_bundle_state.py`
+Already added for `M1` groundwork:
+
+- `sglang/python/sglang/srt/tensorcast/request_bundle/request_bundle_types.py`
+- `sglang/python/sglang/srt/tensorcast/request_bundle/request_bundle_state.py`
+- `sglang/python/sglang/srt/tensorcast/request_bundle/bundle_manager.py`
+- `sglang/python/sglang/srt/tensorcast/instance_ops/instance_ops_types.py`
+- `sglang/python/sglang/srt/mem_cache/storage/tensorcast_store/tensorcast_store.py`
+
+Already added for `M2`:
+
+- `sglang/python/sglang/srt/tensorcast/instance_ops/instance_ops_coordinator.py`
+- `sglang/python/sglang/srt/tensorcast/instance_ops/instance_directory.py`
+- `sglang/python/sglang/srt/tensorcast/instance_ops/instance_ops_runtime.py`
+- `sglang/python/sglang/srt/tensorcast/instance_ops/instance_agent.py`
+- `sglang/python/sglang/srt/tensorcast/instance_ops/instance_agent_service.py`
+- `sglang/python/sglang/srt/mem_cache/storage/tensorcast_store/config.py`
+- `sglang/python/sglang/srt/managers/scheduler.py`
+- `sglang/python/sglang/srt/managers/scheduler_tensorcast_instance_ops_mixin.py`
+- `sglang/python/sglang/srt/managers/io_struct.py`
+- `sglang/python/sglang/srt/entrypoints/engine.py`
+- `sglang/python/sglang/srt/entrypoints/http_server.py`
+
+Already added for `M3`:
+
+- `sglang/python/sglang/srt/tensorcast/request_bundle/request_bundle_publish.py`
+
+Already added for `M4`:
+
+- `sglang/python/sglang/srt/tensorcast/request_bundle/request_bundle_hydrate.py`
+
+Already added for `M5`:
+
+- `sglang/python/sglang/srt/tensorcast/request_bundle/prepared_bundle_admission.py`
+
+Already added for `evict_local(...)`:
+
+- `sglang/python/sglang/srt/tensorcast/request_bundle/prepared_bundle_evict.py`
+
+Remaining SGLang-side Phase-3 work is expected to land mainly in:
+
+- any narrow runtime glue discovered during remote `M6` validation.
+
+### Phase 3 SGLang test map
+
+Already added for `M1`:
+
+- `sglang/python/sglang/test/tensorcast/test_request_bundle_state.py`
+- `sglang/python/sglang/test/tensorcast/test_tensorcast_store.py`
+- `sglang/python/sglang/test/tensorcast/test_request_bundle_manager.py`
+
+Already added for `M2`:
+
+- `sglang/python/sglang/test/tensorcast/test_instance_ops_coordinator.py`
+- `sglang/python/sglang/test/tensorcast/test_instance_directory.py`
+- `sglang/python/sglang/test/tensorcast/test_instance_ops_runtime.py`
+- `sglang/python/sglang/test/tensorcast/test_instance_ops_scheduler_mixin.py`
+- `sglang/python/sglang/test/tensorcast/test_instance_agent.py`
+
+Already added for `M3`:
+
+- `sglang/python/sglang/test/tensorcast/test_request_bundle_publish.py`
+
+Already added for `M4`:
+
+- `sglang/python/sglang/test/tensorcast/test_request_bundle_hydrate.py`
+
+Already added for `M5`:
+
+- `sglang/python/sglang/test/tensorcast/test_prepared_bundle_admission.py`
+
+Already added for `evict_local(...)`:
+
+- `sglang/python/sglang/test/tensorcast/test_prepared_bundle_evict.py`
+
+Additional local integration coverage already added:
+
+- the existing files above now also cover local manager, scheduler-mixin, and
+  instance-agent integration paths rather than only isolated state machines.
+
+Remaining Phase-3 validation is remote `M6` end-to-end verification plus any
+runtime hardening it uncovers; there is no known missing standalone unit-test
+module at this point.
 
 ### Tensorcast files to modify
 
@@ -1134,7 +1517,17 @@ Phase-3 request-transfer areas remain:
 - `tensorcast/tensorcast/node_agent/server.py`
 - `tensorcast/tests/python/test_kvcache_adapter.py`
 - `tensorcast/tests/python/node_agent/test_plan_execution.py`
+- `tensorcast/tests/python/api/test_plan_spec.py`
 - `tensorcast/tools/build_proto_python.sh`
+
+Tensorcast tests that should gain Phase-3 coverage:
+
+- `tensorcast/tests/python/api/test_plan_spec.py`
+  - `PublishManifest` / `hydrate(publish_manifest=...)` plan roundtrip
+- `tensorcast/tests/python/node_agent/test_plan_execution.py`
+  - explicit-handle hydrate execution and compatibility-shim failures
+- `tensorcast/tests/python/test_kvcache_adapter.py`
+  - opaque `EngineOwnedManifest` passthrough at the adapter boundary
 
 ### Optional Tensorcast files that may need targeted fixes
 

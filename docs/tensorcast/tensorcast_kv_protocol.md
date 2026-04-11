@@ -6,8 +6,10 @@ Tensorcast in two scenarios:
 1. **Prefix share**
    - many requests share reusable prefix KV through a distributed KV pool.
 2. **Request-level transfer**
-   - one request's KV state is handed off from a source prefill instance to a
-     target decode instance for PD-disaggregated inference.
+   - one request's prompt-only KV state is published from a source serving
+     instance with full-prompt, page-granular closure semantics and hydrated
+     into a target serving instance so the target can continue through
+     ordinary `/generate` without rerunning prefill.
 
 This document freezes the semantic contract that the SGLang Tensorcast KV
 integration must satisfy:
@@ -28,8 +30,8 @@ Status:
   request-level transfer control plane:
   `connect`, `directory`, `plan`, `publish`, `hydrate`,
   `prefetch_manifest_result`, `evict_local`.
-- For the target SGLang KV protocol, two additional request-transfer surfaces
-  are required but are not implemented in Tensorcast core today:
+- Tensorcast core now also provides the explicit-handle request-transfer
+  surfaces required by the SGLang KV protocol:
   - `PublishResult.publish_manifest`, a controller-visible transfer handle that
     combines generic artifact manifest data with opaque engine-owned resume
     metadata.
@@ -38,12 +40,25 @@ Status:
     `engine_request_id`.
 - Prefix share is expected to use a Tensorcast-backed internal SGLang data
   plane, not per-request external plan orchestration.
-- The SGLang KV-specific in-process instance-agent / `EngineAdapter`
-  integration is not implemented yet.
+- The SGLang KV-specific instance-agent sidecar / `EngineAdapter` integration
+  is substantially implemented in-repo today:
+  - local-rank request-transfer state machines exist in the Tensorcast HiCache
+    backend,
+  - ordinary `/generate` lifecycle hooks already track live requests and
+    prepared-bundle claim / cleanup,
+  - rank-0 `publish` / `hydrate` / `evict_local` fanout now runs through the
+    real scheduler control path,
+  - an instance-scoped `launch_server()`-managed sidecar `NodeAgent` ingress
+    plus directory registration / heartbeat are wired for the execution
+    endpoint,
+  - ordinary `/generate(rid)` can now claim and consume a prepared bundle after
+    successful hydrate,
+  - local external-caller end-to-end validation is green,
+  - and remote external-controller end-to-end validation is still pending.
 - Therefore this document mixes:
   - the already-implemented prefix-share contract, and
-  - the still-target request-transfer contract that is not implemented end to
-    end in SGLang today.
+  - the request-transfer contract whose remote end-to-end validation is not
+    complete yet.
 
 Installation prerequisite:
 - Inference servers that will execute Tensorcast plans must have Tensorcast
@@ -56,22 +71,24 @@ Installation prerequisite:
 ## 0) Roles and Terms
 
 - **Caller / Controller / Router**: an external control-plane program that
-  chooses prefill and decode instances, issues HTTP requests to SGLang, and
+  chooses source and target instances, issues HTTP requests to SGLang, and
   submits Tensorcast plans.
-- **P instance (source / prefill instance)**: the SGLang instance that performs
-  prefill and owns the source KV live state.
-- **D instance (target / decode instance)**: the SGLang instance that will
-  resume decode after KV transfer.
+- **P instance (source instance)**: the SGLang instance that owns the source
+  prompt-only KV state for the request and any retained publishable prompt
+  snapshot.
+- **D instance (target instance)**: the SGLang instance that will hydrate that
+  prompt-only snapshot and later continue through ordinary `/generate`.
 - **Tensorcast daemon / worker**: the node-local Tensorcast runtime that serves
   worker actions such as prefetch and pinning.
 - **NodeAgent / InstanceAgent**: the instance-scoped execution host boundary for
   Tensorcast instance steps. The current Tensorcast repository provides a
   standalone `NodeAgent` reference host. In the SGLang v1 integration, this
-  boundary is implemented as an in-process instance-agent inside the logical
-  SGLang instance rather than as a daemon-internal component.
+  boundary is implemented as an instance-scoped sidecar service launched by
+  `launch_server()` for the logical SGLang instance rather than as a
+  daemon-internal component.
 - **SGLang EngineAdapter**: the SGLang-side integration layer, co-located with
-  the in-process instance-agent, that translates Tensorcast instance actions
-  into SGLang KV operations.
+  the instance-agent sidecar, that translates Tensorcast instance actions into
+  SGLang KV operations.
 - **Logical SGLang instance**: one serving instance as seen by the external
   caller. It MAY internally consist of multiple TP-rank processes that jointly
   own one request's KV state.
@@ -157,18 +174,24 @@ The v1 prefix-share path targets this operational outcome:
 
 The v1 request-transfer path targets this operational outcome:
 
-1. The controller chooses a source prefill instance and a target decode
-   instance.
-2. The source instance performs prefill for a request.
+1. The controller chooses a source ordinary serving instance and a target
+   ordinary serving instance.
+2. The source instance serves a request and builds prompt-prefill KV for that
+   request. It MAY already have emitted decode tokens by the time the
+   controller decides to transfer.
 3. The controller asks the source instance, through Tensorcast, to publish the
-   full KV state needed to resume decode elsewhere.
+   request's prompt-only KV snapshot for that request. This published snapshot
+   excludes source-emitted decode tokens and decode-only KV, closes all
+   page-granular prompt pages for the full prompt boundary, and carries any
+   non-page-aligned tail only through `tail_valid_tokens`.
 4. Optionally, the controller asks the target host daemon to prefetch the
    published artifacts for performance.
 5. The controller asks the target instance, through Tensorcast, to hydrate that
-   KV state into its engine-local runtime.
-6. The controller resumes decode on the target instance through the ordinary
-   SGLang serving ingress, using the same logical request id / `rid` that the
-   target hydrate phase prepared.
+   prompt-only snapshot into its engine-local prepared runtime state.
+6. The controller sends the same prompt to the target instance through the
+   ordinary SGLang serving ingress, using the same logical request id / `rid`
+   that the target hydrate phase prepared, so the target can reuse the hydrated
+   prompt prefix and execute the first decode step locally.
 
 ### 1.4 Out of scope for v1
 
@@ -190,6 +213,28 @@ The following are out of scope for this protocol version:
 - Storing request-resume metadata as a standalone Tensorcast dataplane byte
   artifact. v1 carries that information as `EngineOwnedManifest` in the control
   plane.
+- Session-append or branch-lineage handoff where one logical request id may
+  refer to multiple live conversational branches.
+- Batch-request or parallel-sampling handoff where one external caller action
+  expands into multiple scheduler `rid` values.
+- Full visible-transcript handoff that includes source-emitted decode tokens or
+  decode-only KV. In the baseline v1 SGLang profile, `publish()` MAY be
+  invoked after decode has already begun, but the published snapshot is still
+  limited to the request's prompt-only boundary and excludes emitted decode
+  tokens.
+- A publish call that keeps chasing future decode continuation or any prompt
+  mutation beyond the request's fixed prompt boundary. The baseline v1 profile
+  targets the full prompt for the request, MAY wait up to its deadline for
+  prompt-page publication to close that boundary, and MUST NOT treat decode
+  continuation as part of the publish scope.
+- Solving DP-replica routing for the post-hydrate ordinary `/generate` request.
+  The initial v1 implementation assumes the deployment or controller already
+  routes both `hydrate()` and the subsequent ordinary request to the same
+  concrete target serving instance.
+- Targeting SGLang's current decode-only disaggregation instances as the
+  post-hydrate runtime. The initial v1 implementation targets ordinary serving
+  instances that accept normal `/generate` ingress and run the first decode
+  step locally.
 
 ---
 
@@ -421,7 +466,7 @@ tensorcast_directory:
   instance_id: sgl-inst-17
   daemon_id: daemon-a
   engine: sglang
-  execution_host_kind: sglang_inproc_instance_agent.v1
+  execution_host_kind: node_agent_grpc
   execution_endpoint: 10.0.0.5:7310
   capability_flags:
     - instance_publish
@@ -440,10 +485,12 @@ sglang_side_metadata:
 
 Normative rules:
 
-- `execution_endpoint` MUST identify the coordinator-hosted in-process
-  instance-agent execution ingress for routed Tensorcast instance steps.
-- `execution_host_kind` SHOULD identify the SGLang in-process instance-agent
-  host shape explicitly.
+- `execution_endpoint` MUST identify the coordinator-hosted instance-agent
+  sidecar execution ingress for routed Tensorcast instance steps.
+- `execution_host_kind` MUST match the actual transport host shape exposed by
+  the implementation; the current SGLang integration uses the generic
+  `node_agent_grpc` value and relies on `engine=sglang` plus capability flags
+  to identify the SGLang profile.
 - `serving_http_endpoint` is not currently a standard Tensorcast directory
   field; callers SHOULD obtain it from SGLang-side discovery/telemetry rather
   than from Tensorcast directory APIs.
@@ -524,6 +571,9 @@ await SglClient(p_meta.http_addr).completion(
 )
 
 # Phase 1: source publish
+# This call may happen while the source request is still active or after the
+# source request has already produced output. The published snapshot still
+# covers only the request's prompt-only boundary.
 ctx1 = tc.context(
     request_id=f"kv-publish:{logical_request_id}",
     deadline_ms=15_000,
@@ -570,13 +620,13 @@ await SglClient(d_meta.http_addr).completion(
 
 Notes:
 
-- `PublishResult.publish_manifest` and `hydrate(publish_manifest=...)` are
-  required target surfaces for the SGLang KV integration, but they are not
-  implemented in Tensorcast core today.
-- Current Tensorcast core still exposes the legacy
-  `publish(...).artifact_result.manifest` and `hydrate(engine_request_id=...)`
-  surface. The protocol below treats that legacy hydrate form as compatibility
-  mode only.
+- `PublishResult.publish_manifest` and `hydrate(publish_manifest=...)` are the
+  preferred target surfaces for the SGLang KV integration and are implemented
+  in current Tensorcast core.
+- Tensorcast core also still exposes the legacy
+  `publish(...).artifact_result.manifest` alias and
+  `hydrate(engine_request_id=...)` compatibility surface. The protocol below
+  treats that legacy hydrate form as compatibility mode only.
 - The final decode continuation uses the ordinary SGLang request path. The
   target-side integration is expected to bind the caller-supplied
   `req_id=logical_request_id` to the prepared local request bundle created by
@@ -631,14 +681,20 @@ callers MUST treat the full `PublishManifest` as authoritative.
 
 ### 4.2 `engine_request_id` semantics for request transfer (MUST)
 
-For v1, `engine_request_id` is an adapter-local lookup handle for live request
-state.
+For v1, `engine_request_id` is an adapter-local lookup handle for source-side
+request state while that state is still publishable.
 
 It MUST be valid for:
 
 - source-side `publish(engine_request_id=...)`,
 - source- or target-side `evict_local(engine_request_id=...)`,
 - and any adapter-local live-request lookup the engine integration documents.
+
+For the SGLang v1 profile, this means `engine_request_id` MAY resolve either:
+
+- the active source request state while the request is still running, or
+- a retained prompt-snapshot record after the ordinary source request has
+  completed but before that retained publish window expires.
 
 It MUST NOT be treated as:
 
@@ -679,6 +735,42 @@ publish_manifest:
     payload: "<opaque engine-owned resume payload>"
 ```
 
+For the initial SGLang v1 profile, the opaque payload SHOULD minimally carry a
+compatibility envelope like:
+
+```yaml
+payload:
+  schema: sglang.request_bundle_payload.v1
+  transfer_mode: prefill_closed_prompt_reuse
+  logical_request_id: "req-123"
+  cutoff_token_count: 11712
+  frozen_last_page_index: 365
+  tail_valid_tokens: 0
+  prompt_token_digest:
+    alg: sha256
+    hex: "..."
+  compatibility:
+    model_fingerprint: llama3_70b_fp16_ckpt42
+    kv_layout_id: sglang_kv_page_v2_page_blob_direct_torch.float16_ps32_mha
+    dtype: float16
+    page_size: 32
+    tp_size: 2
+    pp_size: 1
+    attention_arch: mha
+    required_ranks:
+      - tp_rank: 0
+        pp_rank: 0
+      - tp_rank: 1
+        pp_rank: 0
+```
+
+The current SGLang payload keeps the compatibility name
+`prefill_closed_prompt_reuse`, but the normative v1 meaning is:
+
+- publish the request's full prompt-only boundary,
+- exclude emitted decode tokens and decode-only KV,
+- and let the target ordinary `/generate` run the first decode step locally.
+
 Normative rules:
 
 - `artifact_manifest` is the generic Tensorcast-visible artifact description
@@ -691,11 +783,36 @@ Normative rules:
   dataplane byte artifact.
 - `engine_owned_manifest.artifact_manifest_digest` MUST bind the opaque resume
   payload to the exact generic artifact manifest it was produced with.
+- `payload_sha256`, when present, SHOULD cover only the control-plane payload
+  bytes inside `engine_owned_manifest.payload`; it is not a second KV-page data
+  digest and it MUST NOT require hashing the underlying page payloads again.
+- The initial SGLang v1 profile SHOULD validate at least:
+  - `model_fingerprint`
+  - `kv_layout_id`
+  - `dtype`
+  - `page_size`
+  - `tp_size`
+  - `pp_size`
+  - `attention_arch`
+  - `required_ranks`
+  - `cutoff_token_count`
+  - `prompt_token_digest`
+- The initial SGLang v1 profile SHOULD treat `cutoff_token_count` as the full
+  prompt token count for the request rather than an aligned prefix cutoff.
+- The closed byte-artifact set still remains page-granular in v1.
+- If the full prompt ends inside a partially filled page, the source SHOULD
+  record the trailing prompt remainder in `tail_valid_tokens` rather than
+  failing the whole request-bundle publication.
+- The initial SGLang v1 profile SHOULD NOT directly transfer the partial tail
+  page bytes; `tail_valid_tokens` is the control-plane expression of that
+  remainder while the artifact closure stays page-granular.
+- If any required compatibility field mismatches on the target side,
+  `hydrate(publish_manifest=...)` MUST fail closed rather than attempting a
+  best-effort reinterpretation.
 
 `PublishResult.publish_manifest` and `hydrate(publish_manifest=...)` are target
-protocol surfaces for the SGLang KV integration. They are not implemented in
-Tensorcast core today and therefore must be added during the KV integration
-work.
+protocol surfaces for the SGLang KV integration and are implemented in current
+Tensorcast core.
 
 ### 4.4 Prefix-share identity semantics (MUST)
 
@@ -720,15 +837,54 @@ provided that the implementation can guarantee the required uniqueness,
 lifetime, and lookup semantics for source-side publish and local request-state
 operations.
 
+For the initial SGLang request-transfer profile, the recommended concrete
+mapping is:
+
+- `logical_request_id` is the controller-visible workflow identity for one
+  request handoff attempt,
+- SGLang `/generate` uses an explicit caller-provided `rid=logical_request_id`,
+- Tensorcast `publish(engine_request_id=...)` uses
+  `engine_request_id=logical_request_id`,
+- the target-side ordinary `/generate` after `hydrate()` also uses the same
+  caller-provided `rid=logical_request_id`,
+- and the target runtime is an ordinary serving instance that accepts normal
+  `/generate` ingress and executes the first decode step locally.
+
+This equality is a v1 integration profile, not a permanent Tensorcast protocol
+requirement. Future versions MAY decouple these identifiers once SGLang adds a
+more explicit request-transfer admission object.
+
 However, the protocol does not require these two identifiers to be equal.
 Future versions MAY refine source-side live-request lookup independently of the
 published transfer-handle format.
+
+The SGLang integration SHOULD reject the v1 request-transfer path when the
+serving ingress would auto-generate, rewrite, or fan out `rid`, including:
+
+- batch requests that produce multiple scheduler requests,
+- parallel sampling that regenerates per-sample `rid` values,
+- session append/replace flows that reinterpret one caller request against prior
+  lineage,
+- deployments where the ordinary post-hydrate `/generate` may be routed to a
+  different DP replica than the one that executed `hydrate()`,
+- target decode-only disaggregation instances that do not accept the same
+  ordinary `/generate` continuation shape,
+- or any other mode where one controller-visible logical request cannot map to
+  exactly one stable serving `rid`.
 
 ### 4.6 Multiple publish generations (MUST/SHOULD)
 
 Repeated `publish()` operations for the same `engine_request_id` MAY occur.
 Each successful publish MUST mint a distinct immutable `PublishManifest` for
 that snapshot generation.
+
+Such a generation MAY be produced either from an active source request or from
+a retained prompt-only snapshot after the source ordinary request completes.
+Regardless of invocation timing, the published generation still covers only the
+request's prompt-only KV state. For v1, the closed byte-artifact set remains
+page-granular; if the prompt ends inside a partially filled page,
+`tail_valid_tokens` records that trailing prompt tail while the partial tail
+page itself is not directly transferred.
 
 Controllers SHOULD pass the exact `PublishManifest` returned by the intended
 publish phase into the corresponding hydrate phase.
@@ -767,11 +923,14 @@ public controller contract.
 
 `plan.on_instance(P).publish(engine_request_id=E, ...)` MUST mean:
 
-- locate the source instance's current live request for `E` together with the
-  SGLang-owned request-bundle metadata for that live request,
+- locate the source instance's active request for `E`, or a retained
+  source-side prompt snapshot for `E`, together with the SGLang-owned
+  request-bundle metadata for that publishable source state,
 - freeze one fixed snapshot cutoff for this publish generation,
-- construct an immutable published snapshot containing all KV data required to
-  resume decode on another instance for exactly that cutoff,
+- construct an immutable published snapshot containing only the prompt-visible
+  prefix KV needed for the target ordinary `/generate` path to reuse that
+  prompt prefix and execute the first decode step locally for exactly that
+  cutoff,
 - establish closure for that snapshot over the shared Tensorcast substrate,
 - return a `PublishResult` whose `publish_manifest` describes that published
   snapshot.
@@ -785,6 +944,10 @@ It MUST be interpreted as:
 
 - finalize one substrate-backed request bundle whose exact cutoff and page
   membership are defined by SGLang-owned request-bundle metadata.
+
+Even if `publish()` is invoked after the source has already emitted one or more
+decode tokens, or after the source ordinary request has completed, those decode
+tokens and any decode-only KV MUST NOT become part of the published snapshot.
 
 That request-bundle metadata:
 
@@ -846,10 +1009,27 @@ This closure MUST be evaluated against one fixed publish cutoff:
   reach the shared substrate,
 - and it MUST NOT keep chasing newer tokens produced after that cutoff.
 
+For the initial SGLang v1 profile:
+
+- the chosen cutoff MUST be the request's full prompt token count; emitted
+  decode tokens MUST NOT extend the cutoff or page membership,
+- the closed artifact set remains page-granular in v1,
+- if the full prompt ends inside a partially filled page, that trailing prompt
+  remainder SHOULD be expressed through `tail_valid_tokens` rather than causing
+  the whole request-bundle publication to fail,
+- `publish()` MAY be invoked while the source request is still active, after it
+  has already emitted decode tokens, or after the ordinary source request has
+  completed, provided the adapter still retains a publishable prompt snapshot,
+- the baseline v1 profile MAY wait, up to the publish deadline, for prompt
+  prefill / page publication work needed to close that full prompt boundary,
+  but MUST NOT wait for decode continuation or any newer prompt mutation,
+- and `tail_valid_tokens` is the external encoding for a non-page-aligned
+  prompt tail while the v1 byte transfer itself remains page-granular.
+
 ### 5.4 Completeness (MUST)
 
-Publish MUST fail if the adapter cannot produce a complete snapshot sufficient
-for target-side decode continuation.
+Publish MUST fail if the adapter cannot produce a complete prompt-prefix
+snapshot sufficient for target-side ordinary `/generate` continuation.
 
 The source adapter MUST NOT silently publish a partial request state and claim
 success.
@@ -947,8 +1127,13 @@ Normative retention rules:
 - the validity window advertised by `PublishManifest.engine_owned_manifest`
   SHOULD be consistent with the retained artifact lifetime for that snapshot.
 
-The adapter MAY retain source-local live state independently of Tensorcast
-artifact TTL.
+The adapter MAY retain source-local prompt-snapshot state independently of
+Tensorcast artifact TTL so that `publish()` can still succeed for a short
+window after the ordinary source request completes.
+
+If that retained prompt snapshot expires or is explicitly cleaned, subsequent
+`publish(engine_request_id=...)` for the same source request MUST fail closed
+rather than attempting to reconstruct a snapshot from decode-only state.
 
 If the deployment later wants long-lived or durable request snapshots, the
 integration MAY use stronger Tensorcast retention/policy mechanisms behind the
@@ -981,7 +1166,7 @@ warmup.
 ### 6.2 Warmup target (MUST)
 
 If warmup is used, it MUST target the Tensorcast worker/daemon associated with
-the target decode instance `D`.
+the target instance `D`.
 
 ### 6.3 Readiness floor (MUST)
 
@@ -1011,6 +1196,9 @@ It MUST NOT assume stronger placement guarantees than that.
   form a decode-usable prefix / runnable state,
 - reconstruct decode-usable KV live state inside the target SGLang instance
   only from the artifact subset that is both available and engine-compatible,
+- prepare target-local reusable KV/cache state only; it MUST NOT inject a
+  prebuilt decode request, fabricate first-token output, or reuse SGLang's
+  existing PD-disaggregation prebuilt decode semantics,
 - return only when that local engine state is ready for decode continuation or
   the operation has failed.
 
@@ -1134,21 +1322,43 @@ For the SGLang v1 integration, the preferred continuation shape is:
 - and that ordinary request carries the same logical request id in the
   caller-visible `rid` field.
 
+Before claiming a prepared bundle for that ordinary request, the target-side
+admission path MUST:
+
+- run the same incoming prompt tokenization / normalization that ordinary
+  SGLang admission would otherwise use,
+- verify that the resulting prompt tokenization is compatible with the prepared
+  bundle envelope,
+- and at minimum re-check `cutoff_token_count` together with
+  `prompt_token_digest`.
+
 The target-side integration MUST therefore:
 
 - install one prepared local request bundle keyed by that logical request id on
   successful hydrate,
-- bind ordinary request admission for the same `rid` to that prepared local
-  request bundle,
-- and fail closed rather than silently fabricating a resume path if no prepared
-  bundle exists.
+- bind ordinary request admission for the same `rid` to one clean prepared
+  local request bundle when such a bundle exists,
+- claim that prepared bundle only after the incoming request passes the
+  tokenization revalidation described above,
+- fall back to the normal SGLang admission path if no usable prepared bundle
+  exists,
+- and never silently fabricate a successful resume from a stale, tainted, or
+  incompatible prepared record.
 
 Recommended conflict rules:
 
 - if the target already has a live request for the same logical request id,
   hydrate or resume admission SHOULD fail closed rather than overwrite it,
-- if multiple conflicting prepared-bundle generations exist for the same
+- if multiple clean conflicting prepared-bundle generations exist for the same
   logical request id, admission SHOULD fail closed rather than guess,
+- if only stale, tainted, failed, evicted, or compatibility-mismatched
+  prepared records exist for that logical request id, ordinary `/generate`
+  SHOULD log a warning, ignore those records for admission, and continue with
+  the normal SGLang path,
+- if the incoming ordinary request fails prompt revalidation against
+  `prompt_token_digest` / `cutoff_token_count`, ordinary `/generate` SHOULD log
+  a warning, skip prepared-bundle claim, and continue with the normal SGLang
+  path,
 - and one prepared bundle generation SHOULD be consumed by at most one ordinary
   decode admission in the v1 design.
 
