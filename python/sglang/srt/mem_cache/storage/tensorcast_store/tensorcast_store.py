@@ -22,11 +22,13 @@ from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.tensorcast_store.client import (
     DefaultTensorcastPageClient,
     TensorcastBatchExistsResult,
-    TensorcastBatchTransferResult,
     TensorcastPageClient,
 )
 from sglang.srt.mem_cache.storage.tensorcast_store.config import (
     TensorcastHiCacheConfig,
+)
+from sglang.srt.tensorcast.request_bundle.bundle_manager import (
+    RequestBundleManager,
 )
 
 logger = logging.getLogger(__name__)
@@ -109,6 +111,20 @@ class TensorcastStore(HiCacheStorage):
             engine_key_prefix=self._rank_suffix,
         )
         self._publication_stats = _TensorcastPublicationStats()
+        self._request_bundle_manager = RequestBundleManager(
+            tensorcast_config=self._tensorcast_config,
+            page_client=self._page_client,
+            mem_pool_host=mem_pool_host,
+            page_size=self.page_size,
+            dtype=self.dtype,
+            tp_size=self.tp_size,
+            pp_size=self.pp_size,
+            local_rank=self.local_rank,
+            pp_rank=self.pp_rank,
+            is_mla_backend=self.is_mla_backend,
+            layout_id=self._layout_id,
+            model_fingerprint=self._build_model_fingerprint(),
+        )
         self.register_mem_pool_host(mem_pool_host)
         logger.info(
             "Initialized Tensorcast HiCache backend: daemon=%s namespace=%s rank_suffix=%s layout_id=%s",
@@ -117,6 +133,10 @@ class TensorcastStore(HiCacheStorage):
             self._rank_suffix,
             self._layout_id,
         )
+
+    @property
+    def tensorcast_config(self) -> TensorcastHiCacheConfig:
+        return self._tensorcast_config
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         if self._tensorcast_config.host_allocator_enabled:
@@ -129,14 +149,14 @@ class TensorcastStore(HiCacheStorage):
                     "TensorCast allocator-backed host residency requires a live host_region_binding"
                 )
         super().register_mem_pool_host(mem_pool_host)
+        self._request_bundle_manager.register_mem_pool_host(mem_pool_host)
 
     def _build_rank_suffix(self) -> str:
         if self.is_mla_backend:
             return f"pp{self.pp_rank}of{self.pp_size}"
         if self.pp_size > 1:
             return (
-                f"tp{self.local_rank}of{self.tp_size}_"
-                f"pp{self.pp_rank}of{self.pp_size}"
+                f"tp{self.local_rank}of{self.tp_size}_pp{self.pp_rank}of{self.pp_size}"
             )
         return f"tp{self.local_rank}of{self.tp_size}"
 
@@ -150,6 +170,15 @@ class TensorcastStore(HiCacheStorage):
                 _sanitize_component(str(self.dtype)),
                 f"ps{self.page_size}",
                 attention_family,
+            ]
+        )
+
+    def _build_model_fingerprint(self) -> str:
+        return ":".join(
+            [
+                _sanitize_component(self._tensorcast_config.model_id),
+                _sanitize_component(self._tensorcast_config.model_version),
+                _sanitize_component(str(self.dtype)),
             ]
         )
 
@@ -171,9 +200,7 @@ class TensorcastStore(HiCacheStorage):
             self.mem_pool_host.get_data_page(index, flat=True) for index in page_starts
         ]
 
-    def _slot_tokens_enabled(
-        self, extra_info: HiCacheStorageExtraInfo | None
-    ) -> bool:
+    def _slot_tokens_enabled(self, extra_info: HiCacheStorageExtraInfo | None) -> bool:
         if extra_info is None or extra_info.extra_info is None:
             return False
         enabled = extra_info.extra_info.get("tensorcast_use_host_slot_tokens", False)
@@ -204,6 +231,10 @@ class TensorcastStore(HiCacheStorage):
                 break
             prefix_success += 1
         return prefix_success
+
+    @property
+    def request_bundle_manager(self) -> RequestBundleManager:
+        return self._request_bundle_manager
 
     def batch_exists(
         self,
@@ -306,11 +337,40 @@ class TensorcastStore(HiCacheStorage):
             self.mem_pool_host.host_region_binding if direct_put_enabled else None
         )
         batch_started_at = time.perf_counter()
-        result: TensorcastBatchTransferResult = self._page_client.batch_put(
-            keys,
-            pages,
-            slot_tokens=slot_tokens,
-            source_region_binding=source_region_binding,
+        self._request_bundle_manager.mark_pages_inflight(
+            page_hashes=keys,
+            now_ms=int(time.time() * 1000),
+        )
+        try:
+            result = self._page_client.batch_put(
+                keys,
+                pages,
+                slot_tokens=slot_tokens,
+                source_region_binding=source_region_binding,
+            )
+        except Exception as exc:
+            self._request_bundle_manager.mark_pages_result(
+                succeeded_page_hashes=(),
+                failed_page_hashes=keys,
+                now_ms=int(time.time() * 1000),
+                failure_reason=str(exc),
+            )
+            raise
+        succeeded_keys = [
+            key
+            for key, succeeded in zip(keys, result.success_mask, strict=True)
+            if succeeded
+        ]
+        failed_keys = [
+            key
+            for key, succeeded in zip(keys, result.success_mask, strict=True)
+            if not succeeded
+        ]
+        self._request_bundle_manager.mark_pages_result(
+            succeeded_page_hashes=succeeded_keys,
+            failed_page_hashes=failed_keys,
+            now_ms=int(time.time() * 1000),
+            failure_reason="background batch_set_v1 returned unsuccessful items",
         )
         batch_elapsed_s = time.perf_counter() - batch_started_at
         succeeded = sum(1 for item in result.success_mask if item)

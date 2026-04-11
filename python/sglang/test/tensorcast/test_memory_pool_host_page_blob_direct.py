@@ -5,15 +5,18 @@
 from __future__ import annotations
 
 import unittest
+import sys
 from types import SimpleNamespace
 
 import torch
 
-from sglang.test.mem_cache.test_support import (
+from sglang.test.tensorcast.test_support import (
     install_memory_pool_host_layout_import_stubs,
 )
 
 install_memory_pool_host_layout_import_stubs()
+
+sys.modules.pop("sglang.srt.mem_cache.memory_pool_host", None)
 
 from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost

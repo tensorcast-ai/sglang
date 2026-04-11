@@ -710,6 +710,35 @@ class HiRadixCache(RadixCache):
             return
         operation.mark_terminate()
 
+    def insert_host_prefix(
+        self,
+        key: RadixKey,
+        host_indices: torch.Tensor,
+        hash_values: list[str] | None = None,
+    ) -> int:
+        key, _ = self.maybe_bigram_convert(key)
+        if len(key) == 0:
+            return 0
+        if len(key) % self.page_size != 0:
+            raise ValueError("host prefix insertion requires page-aligned tokens")
+        resolved_host_indices = host_indices.to(dtype=torch.int64, copy=True)
+        if len(resolved_host_indices) != len(key):
+            raise ValueError(
+                "host prefix insertion requires one host index per aligned token"
+            )
+        resolved_hash_values = list(hash_values or [])
+        expected_hash_count = len(key) // self.page_size
+        if resolved_hash_values and len(resolved_hash_values) != expected_hash_count:
+            raise ValueError(
+                "host prefix insertion requires one page hash per aligned host page"
+            )
+        return self._insert_helper_host(
+            self.root_node,
+            key,
+            resolved_host_indices,
+            resolved_hash_values,
+        )
+
     def match_prefix(self, params: MatchPrefixParams):
         key = params.key
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)

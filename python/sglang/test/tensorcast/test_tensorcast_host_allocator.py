@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import torch
 
-from sglang.test.mem_cache.test_support import install_memory_pool_host_stub
+from sglang.test.tensorcast.test_support import install_memory_pool_host_stub
 
 
 class _FakeHostTensorAllocator:

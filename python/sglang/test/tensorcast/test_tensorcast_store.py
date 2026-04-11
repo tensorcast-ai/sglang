@@ -4,17 +4,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import unittest
 from types import SimpleNamespace
 
 import torch
 
-from sglang.test.mem_cache.test_support import install_memory_pool_host_stub
+from sglang.test.tensorcast.test_support import install_memory_pool_host_stub
 
 install_memory_pool_host_stub()
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageExtraInfo
+from sglang.srt.mem_cache.hicache_storage import get_hash_str
 from sglang.srt.mem_cache.host_shared_slot_state import (
     HostSharedPageSlotStaleTokenError,
 )
@@ -28,6 +30,10 @@ from sglang.srt.mem_cache.storage.tensorcast_store.client import (
 from sglang.srt.mem_cache.storage.tensorcast_store.host_allocator import (
     TensorcastHostRegionBinding,
 )
+from sglang.srt.tensorcast.request_bundle.request_bundle_types import (
+    PagePublicationState,
+    RankCoord,
+)
 from sglang.srt.mem_cache.storage.tensorcast_store.tensorcast_store import (
     TensorcastStore,
 )
@@ -40,6 +46,8 @@ class FakeTensorcastPageClient:
         self.last_get_slot_tokens: list[HostSharedPageSlotToken] | None = None
         self.last_put_source_region_binding: TensorcastHostRegionBinding | None = None
         self.last_get_target_region_binding: TensorcastHostRegionBinding | None = None
+        self.batch_put_callback: Callable[[list[str]], None] | None = None
+        self.batch_put_fail_keys: set[str] = set()
 
     def artifact_id_for(self, logical_key: str) -> str:
         return f"artifact::{logical_key}"
@@ -57,11 +65,18 @@ class FakeTensorcastPageClient:
         slot_tokens: list[HostSharedPageSlotToken] | None = None,
         source_region_binding: TensorcastHostRegionBinding | None = None,
     ) -> TensorcastBatchTransferResult:
-        self.last_put_slot_tokens = list(slot_tokens) if slot_tokens is not None else None
+        self.last_put_slot_tokens = (
+            list(slot_tokens) if slot_tokens is not None else None
+        )
         self.last_put_source_region_binding = source_region_binding
+        if self.batch_put_callback is not None:
+            self.batch_put_callback(logical_keys)
         success_mask: list[bool] = []
         duplicate_count = 0
         for logical_key, page in zip(logical_keys, pages, strict=True):
+            if logical_key in self.batch_put_fail_keys:
+                success_mask.append(False)
+                continue
             if logical_key in self.data:
                 duplicate_count += 1
                 success_mask.append(True)
@@ -84,7 +99,9 @@ class FakeTensorcastPageClient:
         slot_tokens: list[HostSharedPageSlotToken] | None = None,
         target_region_binding: TensorcastHostRegionBinding | None = None,
     ) -> TensorcastBatchTransferResult:
-        self.last_get_slot_tokens = list(slot_tokens) if slot_tokens is not None else None
+        self.last_get_slot_tokens = (
+            list(slot_tokens) if slot_tokens is not None else None
+        )
         self.last_get_target_region_binding = target_region_binding
         success_mask: list[bool] = []
         stop_copying = False
@@ -123,14 +140,52 @@ class FakeHostKVCache:
             page_start: (page_start // self.page_size) + 100
             for page_start in range(0, self.kv_buffer.numel(), self.page_size)
         }
+        self._free_page_starts: list[int] = list(
+            range(0, self.kv_buffer.numel(), self.page_size)
+        )
         self.reserve_calls: list[tuple[list[int], list[str] | None]] = []
         self.mark_get_inflight_calls: list[list[HostSharedPageSlotToken]] = []
-        self.commit_get_success_calls: list[tuple[list[HostSharedPageSlotToken], list[str] | None]] = []
+        self.commit_get_success_calls: list[
+            tuple[list[HostSharedPageSlotToken], list[str] | None]
+        ] = []
         self.fail_get_calls: list[list[HostSharedPageSlotToken]] = []
+        self.free_calls: list[list[int]] = []
 
     @property
     def host_region_binding(self) -> object | None:
         return self._host_region_binding
+
+    def alloc(self, need_size: int) -> torch.Tensor | None:
+        if need_size % self.page_size != 0:
+            raise ValueError("need_size must remain page aligned")
+        page_count = need_size // self.page_size
+        if len(self._free_page_starts) < page_count:
+            return None
+        selected_page_starts = self._free_page_starts[:page_count]
+        self._free_page_starts = self._free_page_starts[page_count:]
+        return torch.tensor(
+            [
+                token_index
+                for page_start in selected_page_starts
+                for token_index in range(page_start, page_start + self.page_size)
+            ],
+            dtype=torch.int64,
+        )
+
+    def free(self, indices: torch.Tensor) -> int:
+        page_starts = sorted(
+            {
+                int(indices[offset].item())
+                for offset in range(0, indices.numel(), self.page_size)
+            }
+        )
+        self.free_calls.append(page_starts)
+        for page_start in page_starts:
+            if page_start not in self._free_page_starts:
+                self._free_page_starts.append(page_start)
+            self._slot_generations[page_start] += 1
+        self._free_page_starts.sort()
+        return int(indices.numel())
 
     def get_data_page(self, index: int, flat: bool = True) -> torch.Tensor:
         page = self.kv_buffer[index // self.page_size]
@@ -159,7 +214,10 @@ class FakeHostKVCache:
         logical_keys: list[str] | None = None,
     ) -> tuple[HostSharedPageSlotToken, ...]:
         self.reserve_calls.append(
-            (list(page_starts), list(logical_keys) if logical_keys is not None else None)
+            (
+                list(page_starts),
+                list(logical_keys) if logical_keys is not None else None,
+            )
         )
         return self.slot_tokens_for_page_starts(page_starts)
 
@@ -174,7 +232,10 @@ class FakeHostKVCache:
         logical_keys: list[str] | None = None,
     ) -> None:
         self.commit_get_success_calls.append(
-            (list(slot_tokens), list(logical_keys) if logical_keys is not None else None)
+            (
+                list(slot_tokens),
+                list(logical_keys) if logical_keys is not None else None,
+            )
         )
 
     def fail_page_get(self, slot_tokens: list[HostSharedPageSlotToken]) -> None:
@@ -194,7 +255,10 @@ class StaleCommitHostKVCache(FakeHostKVCache):
         logical_keys: list[str] | None = None,
     ) -> None:
         self.stale_commit_attempts.append(
-            (list(slot_tokens), list(logical_keys) if logical_keys is not None else None)
+            (
+                list(slot_tokens),
+                list(logical_keys) if logical_keys is not None else None,
+            )
         )
         raise HostSharedPageSlotStaleTokenError(
             "stale slot token rejected before page becomes visible"
@@ -236,11 +300,15 @@ class TensorcastStoreTest(unittest.TestCase):
         )
 
         host_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
-        self.assertEqual(store.batch_set_v1(["hash_a", "hash_b"], host_indices), [True, True])
+        self.assertEqual(
+            store.batch_set_v1(["hash_a", "hash_b"], host_indices), [True, True]
+        )
         self.assertEqual(store.batch_exists(["hash_a", "hash_b"]), 2)
 
         host_cache.kv_buffer.zero_()
-        self.assertEqual(store.batch_get_v1(["hash_a", "hash_b"], host_indices), [True, True])
+        self.assertEqual(
+            store.batch_get_v1(["hash_a", "hash_b"], host_indices), [True, True]
+        )
         self.assertTrue(
             torch.equal(
                 host_cache.kv_buffer.flatten(),
@@ -300,11 +368,15 @@ class TensorcastStoreTest(unittest.TestCase):
         host_indices = torch.tensor([0, 1], dtype=torch.int64)
         self.assertEqual(store.batch_set_v1(["hash_dup"], host_indices), [True])
 
-        host_cache.kv_buffer = torch.tensor([9.0, 10.0], dtype=torch.float32).reshape(1, 2)
+        host_cache.kv_buffer = torch.tensor([9.0, 10.0], dtype=torch.float32).reshape(
+            1, 2
+        )
         self.assertEqual(store.batch_set_v1(["hash_dup"], host_indices), [True])
         self.assertEqual(store._publication_stats.duplicate_pages, 1)
         self.assertTrue(
-            torch.equal(client.data["hash_dup"], torch.tensor([7.0, 8.0], dtype=torch.float32))
+            torch.equal(
+                client.data["hash_dup"], torch.tensor([7.0, 8.0], dtype=torch.float32)
+            )
         )
 
     def test_tensorcast_store_batch_exists_stops_at_first_missing_key(self) -> None:
@@ -445,7 +517,9 @@ class TensorcastStoreTest(unittest.TestCase):
         )
 
         host_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
-        self.assertEqual(store.batch_set_v1(["hash_a", "hash_b"], host_indices), [True, True])
+        self.assertEqual(
+            store.batch_set_v1(["hash_a", "hash_b"], host_indices), [True, True]
+        )
         self.assertEqual(
             client.last_put_slot_tokens,
             [
@@ -486,7 +560,9 @@ class TensorcastStoreTest(unittest.TestCase):
         host_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
         host_cache.kv_buffer.zero_()
 
-        self.assertEqual(store.batch_get_v1(["hash_a", "hash_b"], host_indices), [True, True])
+        self.assertEqual(
+            store.batch_get_v1(["hash_a", "hash_b"], host_indices), [True, True]
+        )
         self.assertEqual(
             client.last_get_slot_tokens,
             [
@@ -501,20 +577,24 @@ class TensorcastStoreTest(unittest.TestCase):
         )
         self.assertEqual(
             host_cache.mark_get_inflight_calls,
-            [[
-                HostSharedPageSlotToken(slot_index=0, slot_generation=100),
-                HostSharedPageSlotToken(slot_index=1, slot_generation=101),
-            ]],
-        )
-        self.assertEqual(
-            host_cache.commit_get_success_calls,
-            [(
+            [
                 [
                     HostSharedPageSlotToken(slot_index=0, slot_generation=100),
                     HostSharedPageSlotToken(slot_index=1, slot_generation=101),
-                ],
-                ["hash_a", "hash_b"],
-            )],
+                ]
+            ],
+        )
+        self.assertEqual(
+            host_cache.commit_get_success_calls,
+            [
+                (
+                    [
+                        HostSharedPageSlotToken(slot_index=0, slot_generation=100),
+                        HostSharedPageSlotToken(slot_index=1, slot_generation=101),
+                    ],
+                    ["hash_a", "hash_b"],
+                )
+            ],
         )
         self.assertEqual(host_cache.fail_get_calls, [])
         self.assertTrue(
@@ -560,10 +640,12 @@ class TensorcastStoreTest(unittest.TestCase):
         )
         self.assertEqual(
             host_cache.commit_get_success_calls,
-            [(
-                [HostSharedPageSlotToken(slot_index=0, slot_generation=100)],
-                ["hash_a"],
-            )],
+            [
+                (
+                    [HostSharedPageSlotToken(slot_index=0, slot_generation=100)],
+                    ["hash_a"],
+                )
+            ],
         )
         self.assertEqual(
             host_cache.fail_get_calls,
@@ -608,10 +690,12 @@ class TensorcastStoreTest(unittest.TestCase):
         self.assertEqual(host_cache.commit_get_success_calls, [])
         self.assertEqual(
             host_cache.stale_commit_attempts,
-            [(
-                [HostSharedPageSlotToken(slot_index=0, slot_generation=100)],
-                ["hash_a"],
-            )],
+            [
+                (
+                    [HostSharedPageSlotToken(slot_index=0, slot_generation=100)],
+                    ["hash_a"],
+                )
+            ],
         )
         self.assertEqual(host_cache.fail_get_calls, [])
 
@@ -633,6 +717,87 @@ class TensorcastStoreTest(unittest.TestCase):
         self.assertLessEqual(len(compact_layout), 19)
         self.assertEqual(engine_key_payload[:7], b"tp0of2:")
         self.assertEqual(len(engine_key_payload), 39)
+
+    def test_batch_set_updates_live_page_publication_state(self) -> None:
+        client = FakeTensorcastPageClient()
+        host_cache = FakeHostKVCache([1.0, 2.0], page_size=2)
+        store = TensorcastStore(
+            build_storage_config(tp_rank=0),
+            host_cache,
+            page_client=client,
+        )
+        manager = store.request_bundle_manager
+        rank = RankCoord(tp_rank=0, pp_rank=0)
+        prompt_token_ids = [401, 402]
+        page_hash = get_hash_str(prompt_token_ids)
+        manager.start_live_request_tracking(
+            logical_request_id="rid-batch-set",
+            engine_request_id="rid-batch-set",
+            prompt_token_ids=prompt_token_ids,
+            requested_at_ms=100,
+        )
+        manager.observe_live_request_progress(
+            logical_request_id="rid-batch-set",
+            visible_prompt_token_count=2,
+            emitted_decode_token_count=0,
+            now_ms=110,
+        )
+
+        def verify_inflight(_: list[str]) -> None:
+            pages = manager.page_publication_registry.snapshot_rank(
+                logical_request_id="rid-batch-set",
+                rank=rank,
+            )
+            self.assertEqual(len(pages), 1)
+            self.assertEqual(pages[0].publication_state, PagePublicationState.INFLIGHT)
+
+        client.batch_put_callback = verify_inflight
+        host_indices = torch.tensor([0, 1], dtype=torch.int64)
+
+        self.assertEqual(store.batch_set_v1([page_hash], host_indices), [True])
+
+        pages = manager.page_publication_registry.snapshot_rank(
+            logical_request_id="rid-batch-set",
+            rank=rank,
+        )
+        self.assertEqual(pages[0].publication_state, PagePublicationState.READY)
+        self.assertEqual(pages[0].artifact_id, f"artifact::{page_hash}")
+
+    def test_batch_set_failure_returns_live_page_to_absent(self) -> None:
+        client = FakeTensorcastPageClient()
+        host_cache = FakeHostKVCache([1.0, 2.0], page_size=2)
+        store = TensorcastStore(
+            build_storage_config(tp_rank=0),
+            host_cache,
+            page_client=client,
+        )
+        manager = store.request_bundle_manager
+        rank = RankCoord(tp_rank=0, pp_rank=0)
+        prompt_token_ids = [501, 502]
+        page_hash = get_hash_str(prompt_token_ids)
+        client.batch_put_fail_keys.add(page_hash)
+        manager.start_live_request_tracking(
+            logical_request_id="rid-batch-fail",
+            engine_request_id="rid-batch-fail",
+            prompt_token_ids=prompt_token_ids,
+            requested_at_ms=100,
+        )
+        manager.observe_live_request_progress(
+            logical_request_id="rid-batch-fail",
+            visible_prompt_token_count=2,
+            emitted_decode_token_count=0,
+            now_ms=110,
+        )
+
+        host_indices = torch.tensor([0, 1], dtype=torch.int64)
+        self.assertEqual(store.batch_set_v1([page_hash], host_indices), [False])
+
+        pages = manager.page_publication_registry.snapshot_rank(
+            logical_request_id="rid-batch-fail",
+            rank=rank,
+        )
+        self.assertEqual(pages[0].publication_state, PagePublicationState.ABSENT)
+        self.assertIsNone(pages[0].artifact_id)
 
 
 if __name__ == "__main__":
