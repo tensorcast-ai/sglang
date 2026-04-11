@@ -31,6 +31,10 @@ class TensorcastHiCacheConfig(BaseModel):
     host_allocator_enabled: bool = False
     host_allocator_region_ttl_ms: int = 0
     host_allocator_region_name: str = "sglang_tensorcast_host_pool"
+    instance_directory_address: str = ""
+    instance_agent_execution_endpoint: str = ""
+    instance_signals_endpoint: str = ""
+    instance_directory_heartbeat_interval_ms: int = 10_000
 
     @classmethod
     def from_storage_config(

@@ -131,6 +131,11 @@ class SchedulerOutputProcessorMixin:
                     if req.time_stats.prefill_finished_ts == 0.0:
                         req.time_stats.prefill_finished_ts = time.time()
 
+                    self._maybe_observe_tensorcast_live_request_progress(
+                        req,
+                        emitted_decode_token_count=len(req.output_ids),
+                    )
+
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
                     req.check_finished()
@@ -142,6 +147,7 @@ class SchedulerOutputProcessorMixin:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
+                        self._maybe_observe_tensorcast_live_request_progress(req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -274,6 +280,7 @@ class SchedulerOutputProcessorMixin:
                         release_kv_cache(req, self.tree_cache)
                     else:
                         self.tree_cache.cache_unfinished_req(req)
+                        self._maybe_observe_tensorcast_live_request_progress(req)
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
@@ -345,6 +352,7 @@ class SchedulerOutputProcessorMixin:
 
             for _token_idx, next_token_id in enumerate(next_token_ids):
                 req.output_ids.append(next_token_id)
+                self._maybe_observe_tensorcast_live_request_progress(req)
                 req.check_finished()
                 if req.finished():
                     release_kv_cache(req, self.tree_cache)
@@ -352,6 +360,7 @@ class SchedulerOutputProcessorMixin:
                     break
 
                 self.tree_cache.cache_unfinished_req(req)
+                self._maybe_observe_tensorcast_live_request_progress(req)
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
@@ -405,6 +414,7 @@ class SchedulerOutputProcessorMixin:
                 # Only spec v2's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
+            self._maybe_observe_tensorcast_live_request_progress(req)
 
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
@@ -901,6 +911,8 @@ class SchedulerOutputProcessorMixin:
                     # because of the one additional delayed token. This "continue" prevented the dummy output.
                     continue
                 req.finished_output = True
+                self._maybe_cleanup_tensorcast_prepared_bundle(req)
+                self._maybe_cleanup_tensorcast_live_request(req)
                 if req.finished_len is None:
                     req.finished_len = len(req.output_ids)
                 should_output = True

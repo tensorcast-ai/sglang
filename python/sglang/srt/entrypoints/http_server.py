@@ -138,6 +138,12 @@ from sglang.srt.metrics.func_timer import enable_func_timer
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     parse_remote_instance_transfer_engine_info_from_scheduler_infos,
 )
+from sglang.srt.tensorcast.instance_ops.instance_agent import (
+    maybe_build_tensorcast_instance_agent_config,
+)
+from sglang.srt.tensorcast.instance_ops.instance_agent_service import (
+    TensorcastInstanceAgentServiceHandle,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
@@ -1758,6 +1764,15 @@ def launch_server(
         )
     )
 
+    tensorcast_instance_agent_service: TensorcastInstanceAgentServiceHandle | None = (
+        None
+    )
+    multi_tokenizer_args_shm = None
+    instance_agent_config = maybe_build_tensorcast_instance_agent_config(
+        server_args=server_args,
+        instance_ops_ipc_name=port_args.instance_ops_ipc_name,
+    )
+
     if server_args.enable_metrics:
         add_prometheus_track_response_middleware(app)
 
@@ -1801,6 +1816,12 @@ def launch_server(
         )
 
     try:
+        if instance_agent_config is not None:
+            tensorcast_instance_agent_service = TensorcastInstanceAgentServiceHandle(
+                instance_agent_config
+            )
+            tensorcast_instance_agent_service.start()
+
         # Update logging configs
         set_uvicorn_logging_configs(server_args)
 
@@ -1838,6 +1859,8 @@ def launch_server(
                 workers=server_args.tokenizer_worker_num,
             )
     finally:
+        if tensorcast_instance_agent_service is not None:
+            tensorcast_instance_agent_service.stop()
         if server_args.tokenizer_worker_num > 1:
             multi_tokenizer_args_shm.unlink()
             _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()

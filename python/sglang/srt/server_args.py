@@ -5299,6 +5299,9 @@ class PortArgs:
     # The ipc filename for rpc call between Engine and Scheduler
     rpc_ipc_name: str
 
+    # The ipc filename for TensorCast instance-op calls between InstanceAgent and Scheduler
+    instance_ops_ipc_name: str
+
     # The ipc filename for Scheduler to send metrics
     metrics_ipc_name: str
 
@@ -5338,6 +5341,7 @@ class PortArgs:
                 detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                instance_ops_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
             )
@@ -5361,9 +5365,10 @@ class PortArgs:
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
             metrics_ipc_name = port_base + 3
+            instance_ops_port = port_base + 4
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
-                scheduler_input_port = port_base + 4
+                scheduler_input_port = port_base + 5
             else:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
@@ -5376,6 +5381,7 @@ class PortArgs:
                     wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(rpc_port, "rpc_port")
                     wait_port_available(metrics_ipc_name, "metrics_ipc_name")
+                    wait_port_available(instance_ops_port, "instance_ops_port")
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
                 if dp_rank is None or worker_ports is None:
@@ -5392,6 +5398,7 @@ class PortArgs:
                 detokenizer_ipc_name=f"tcp://{dist_init_host}:{detokenizer_port}",
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
+                instance_ops_ipc_name=f"tcp://{dist_init_host}:{instance_ops_port}",
                 metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
             )

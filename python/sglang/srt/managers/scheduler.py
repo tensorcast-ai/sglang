@@ -160,6 +160,9 @@ from sglang.srt.managers.scheduler_runtime_checker_mixin import (
     SchedulerRuntimeCheckerMixin,
     create_scheduler_watchdog,
 )
+from sglang.srt.managers.scheduler_tensorcast_instance_ops_mixin import (
+    SchedulerTensorcastInstanceOpsMixin,
+)
 from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
@@ -242,6 +245,7 @@ class EmbeddingBatchResult:
 
 class Scheduler(
     SchedulerOutputProcessorMixin,
+    SchedulerTensorcastInstanceOpsMixin,
     SchedulerUpdateWeightsMixin,
     SchedulerProfilerMixin,
     SchedulerMetricsMixin,
@@ -308,6 +312,7 @@ class Scheduler(
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
+        self.init_tensorcast_instance_ops()
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
 
         # Distributed rank info
@@ -351,6 +356,7 @@ class Scheduler(
 
         # Init cache and memory pool
         self.init_cache_with_memory_pool()
+        self._configure_tensorcast_instance_ops_runtime()
 
         # Init running status
         self.init_running_status()
@@ -412,6 +418,9 @@ class Scheduler(
             self.recv_from_rpc = get_zmq_socket(
                 context, zmq.DEALER, port_args.rpc_ipc_name, False
             )
+            self.recv_from_instance_ops = get_zmq_socket(
+                context, zmq.DEALER, port_args.instance_ops_ipc_name, True
+            )
 
             send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
@@ -435,11 +444,13 @@ class Scheduler(
                     [
                         self.recv_from_tokenizer,
                         self.recv_from_rpc,
+                        self.recv_from_instance_ops,
                     ]
                 )
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
+            self.recv_from_instance_ops = None
             self.send_to_tokenizer = SenderWrapper(None)
             self.send_to_detokenizer = SenderWrapper(None)
 
@@ -1068,6 +1079,9 @@ class Scheduler(
                 (ContinueGenerationReqInput, self.continue_generation),
             ]
         )
+        self._request_dispatcher += TypeBasedDispatcher(
+            self.tensorcast_instance_op_dispatch_entries()
+        )
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -1212,6 +1226,17 @@ class Scheduler(
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
+
+                while True:
+                    try:
+                        if self.recv_limit_reached(len(recv_reqs)):
+                            break
+                        recv_instance_op = self.recv_from_instance_ops.recv_pyobj(
+                            zmq.NOBLOCK
+                        )
+                    except zmq.ZMQError:
+                        break
+                    recv_reqs.append(recv_instance_op)
             else:
                 recv_reqs = None
         else:
@@ -1331,11 +1356,14 @@ class Scheduler(
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
-                if not isinstance(output, RpcReqOutput):
-                    self.send_to_tokenizer.send_output(output, recv_req)
-                else:
+                if isinstance(output, RpcReqOutput):
                     if self.recv_from_rpc is not None:
                         self.recv_from_rpc.send_pyobj(output)
+                elif self._dispatch_output_uses_instance_ops_channel(output):
+                    if self.recv_from_instance_ops is not None:
+                        self.recv_from_instance_ops.send_pyobj(output)
+                else:
+                    self.send_to_tokenizer.send_output(output, recv_req)
 
     def init_req_max_new_tokens(self, req):
         req.sampling_params.max_new_tokens = min(
@@ -1575,6 +1603,11 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if not self._maybe_bind_tensorcast_prepared_bundle(req, recv_req):
+            self._add_request_to_queue(req)
+            return
+        self._maybe_start_tensorcast_live_request(req, recv_req)
+
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
@@ -1592,6 +1625,9 @@ class Scheduler(
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
+            self._maybe_consume_tensorcast_prepared_bundle(req)
+            if req.to_finish is not None:
+                return
             req.init_next_round_input(self.tree_cache)
             if req.last_node.backuped:
                 # only to initiate the prefetch if the last node is backuped
@@ -1821,6 +1857,7 @@ class Scheduler(
 
     def stash_chunked_request(self, req: Req):
         self.tree_cache.cache_unfinished_req(req, chunked=True)
+        self._maybe_observe_tensorcast_live_request_progress(req)
         # Chunked request keeps its rid but will get a new req_pool_idx
         if self.tp_worker.model_runner.mambaish_config is not None:
             self.req_to_token_pool.free(req.req_pool_idx, free_mamba_cache=False)
@@ -2959,6 +2996,7 @@ def run_scheduler_process(
         trace_set_thread_info(thread_label, tp_rank, dp_rank)
 
     # Create a scheduler and run the event loop
+    scheduler: Scheduler | None = None
     try:
         scheduler = Scheduler(
             server_args,
@@ -3020,3 +3058,9 @@ def run_scheduler_process(
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
+    finally:
+        if scheduler is not None:
+            try:
+                scheduler._shutdown_tensorcast_instance_ops_runtime()
+            except Exception:
+                logger.exception("Tensorcast instance-ops shutdown failed")
