@@ -695,6 +695,7 @@ def build_tensorcast_configs(
         payload = json.loads(json.dumps(daemon_cfg))
         payload["server"]["listen"]["port"] = daemon_port
         payload["server"]["advertise"]["host"] = advertise_host
+        payload["server"]["p2p_listen"]["host"] = advertise_host
         payload["server"]["p2p_listen"]["port"] = p2p_port
         payload["engine"]["memory_tiers"]["stable_bytes"] = (
             config.tensorcast_daemon_stable_bytes
