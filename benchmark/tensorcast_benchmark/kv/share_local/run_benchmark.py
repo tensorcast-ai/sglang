@@ -56,7 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-name", default="")
     parser.add_argument("--prompt-count", type=int, default=10)
     parser.add_argument("--pair-rps", type=float, default=1.0)
-    parser.add_argument("--settle-ms", type=int, default=1000)
+    parser.add_argument("--settle-ms", type=int, default=20000)
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--tp-size", type=int, default=2)

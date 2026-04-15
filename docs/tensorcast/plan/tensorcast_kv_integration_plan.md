@@ -1251,7 +1251,19 @@ Current status:
   - prepared-bundle attach in target logs on all required ranks,
   - and `prepared_bundle_verified` green with
     `cached_tokens == cutoff_token_count - tail_valid_tokens`.
-- remote `M6` validation is still pending.
+- the latest remote one-prompt correctness run
+  (`20260412-144250_request_transfer_tp2_pairs1`) now reaches:
+  - `topology_mode=remote` with source and target on distinct workers,
+  - source ordinary `/generate` success,
+  - controller-side `publish` success for the full prompt page-granular
+    closure,
+  - controller-side `hydrate` success on the target instance,
+  - target ordinary `/generate(rid)` success,
+  - prepared-bundle attach in target logs on all required ranks,
+  - no prepared-bundle fallback / fail-closed / consume-failed markers in the
+    target log, and
+  - `prepared_bundle_verified` green with
+    `cached_tokens == cutoff_token_count - tail_valid_tokens`.
 
 - [x] Add a realistic external caller example for controller-driven
   prompt-only request-bundle reuse:
@@ -1266,12 +1278,12 @@ Current status:
   - [x] controller-side compatibility shim zero / one / many match behavior,
   - [x] controller-visible source publish failure and target hydrate failure
     surfacing.
-- [ ] Add remote end-to-end validation for `M6`:
-  - [ ] source ordinary serving instance prefill,
-  - [ ] controller-side publish,
-  - [ ] target ordinary serving instance hydrate,
-  - [ ] target ordinary `/generate` claim via the same stable `rid`,
-  - [ ] log-based verification that ordinary `/generate` used the prepared
+- [x] Add remote end-to-end validation for `M6`:
+  - [x] source ordinary serving instance prefill,
+  - [x] controller-side publish,
+  - [x] target ordinary serving instance hydrate,
+  - [x] target ordinary `/generate` claim via the same stable `rid`,
+  - [x] log-based verification that ordinary `/generate` used the prepared
     bundle rather than ordinary prefix prefetch.
 - [x] Keep the v1 restriction explicit:
   - [x] single controller,

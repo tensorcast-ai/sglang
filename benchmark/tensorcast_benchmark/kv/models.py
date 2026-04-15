@@ -125,11 +125,16 @@ class BenchmarkConfig(BaseModel):
             )
         if (
             self.hicache_storage_backend == "tensorcast"
-            and self.tensorcast_daemon_mode not in {"share", "separate"}
         ):
-            raise ValueError(
-                "tensorcast_daemon_mode must be share or separate when backend is tensorcast"
-            )
+            if self.hicache_mem_layout != "page_blob_direct":
+                raise ValueError(
+                    "tensorcast backend requires hicache_mem_layout=page_blob_direct, "
+                    f"got {self.hicache_mem_layout!r}"
+                )
+            if self.tensorcast_daemon_mode not in {"share", "separate"}:
+                raise ValueError(
+                    "tensorcast_daemon_mode must be share or separate when backend is tensorcast"
+                )
         if self.tensorcast_host_allocator_enabled:
             if self.hicache_storage_backend != "tensorcast":
                 raise ValueError(

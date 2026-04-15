@@ -76,6 +76,7 @@ class SGLangClient:
         self._session = session
         self._owns_session = session is None
         self._last_request_completed_monotonic: float | None = None
+        self._active_request_count = 0
 
     async def __aenter__(self) -> "SGLangClient":
         await self._ensure_session(refresh_if_idle=False)
@@ -104,6 +105,7 @@ class SGLangClient:
             not refresh_if_idle
             or not self._owns_session
             or self._last_request_completed_monotonic is None
+            or self._active_request_count > 0
         ):
             return
         idle_seconds = (
@@ -160,37 +162,42 @@ class SGLangClient:
             payload.update(extra_body)
 
         url = f"{self._base_url}/generate"
+
         async def _generate_once() -> StreamGenerateResult:
             await self._ensure_session(refresh_if_idle=True)
             start = time.perf_counter()
             first_token_ms: float | None = None
             last_text = ""
             final_chunk: _GenerateChunk | None = None
-            async with self._session.post(url, json=payload) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    raise SGLangHTTPError(
-                        f"POST {url} failed: {response.status} {error_text}"
-                    )
-                async for chunk_bytes in response.content:
-                    chunk_bytes = chunk_bytes.strip()
-                    if not chunk_bytes:
-                        continue
-                    chunk = chunk_bytes.decode("utf-8")
-                    if not chunk.startswith("data:"):
-                        continue
-                    body = chunk[5:].strip()
-                    if body == "[DONE]":
-                        break
-                    parsed = _GenerateChunk.model_validate(json.loads(body))
-                    if (
-                        parsed.text
-                        and first_token_ms is None
-                        and parsed.text != last_text
-                    ):
-                        first_token_ms = (time.perf_counter() - start) * 1000.0
-                    last_text = parsed.text
-                    final_chunk = parsed
+            self._active_request_count += 1
+            try:
+                async with self._session.post(url, json=payload) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        raise SGLangHTTPError(
+                            f"POST {url} failed: {response.status} {error_text}"
+                        )
+                    async for chunk_bytes in response.content:
+                        chunk_bytes = chunk_bytes.strip()
+                        if not chunk_bytes:
+                            continue
+                        chunk = chunk_bytes.decode("utf-8")
+                        if not chunk.startswith("data:"):
+                            continue
+                        body = chunk[5:].strip()
+                        if body == "[DONE]":
+                            break
+                        parsed = _GenerateChunk.model_validate(json.loads(body))
+                        if (
+                            parsed.text
+                            and first_token_ms is None
+                            and parsed.text != last_text
+                        ):
+                            first_token_ms = (time.perf_counter() - start) * 1000.0
+                        last_text = parsed.text
+                        final_chunk = parsed
+            finally:
+                self._active_request_count = max(self._active_request_count - 1, 0)
 
             latency_ms = (time.perf_counter() - start) * 1000.0
             self._last_request_completed_monotonic = time.monotonic()
@@ -212,7 +219,7 @@ class SGLangClient:
             try:
                 return await _generate_once()
             except aiohttp.ServerDisconnectedError:
-                if attempt == 1 or not self._owns_session:
+                if attempt == 1 or not self._owns_session or self._active_request_count > 0:
                     raise
                 await self._reset_owned_session()
         raise RuntimeError("unreachable")

@@ -133,11 +133,30 @@ default. This is benchmark-only behavior so the HiCache storage prefetch path is
 actually exercised with small prompts; override it with
 `--tensorcast-prefetch-threshold` if needed.
 
+Tensorcast runs in this benchmark must use:
+
+- `--hicache-mem-layout page_blob_direct`
+- `--hicache-io-backend direct`
+- `--tensorcast-host-allocator-enabled` for the allocator-backed zero-copy host slab path
+
+Do not reuse Mooncake's `page_first_direct` setting here. `page_first_direct`
+is valid for Mooncake, but Tensorcast `share_local` only supports
+`page_blob_direct`.
+
+Note that `page_blob_direct` alone is not enough to remove `host_fill_ms` from
+Tensorcast batch get. The zero-copy path only activates when the Tensorcast host
+allocator is enabled, so the benchmark must also pass
+`--tensorcast-host-allocator-enabled` together with
+`--hicache-io-backend direct`.
+
 ```bash
 /home/i-zhouyuhan/.local/bin/uv run --active --no-project --offline \
 python -m tensorcast_benchmark.kv.share_local.run_benchmark \
   --hicache-storage-backend tensorcast \
   --tensorcast-daemon-mode share \
+  --hicache-mem-layout page_blob_direct \
+  --hicache-io-backend direct \
+  --tensorcast-host-allocator-enabled \
   --brainctl-charged-group codesign \
   --model-path /mnt/step2-alignment-jfs/zane/opensources_model/Qwen3-14B \
   --tp-size 2 \
@@ -167,6 +186,9 @@ This configuration was validated on March 24, 2026 with:
 - dataset: `LongBench/hotpotqa.jsonl`
 - prompt filter: `length <= 35000`
 - Tensorcast daemon mode: `share`
+- HiCache layout: `page_blob_direct`
+- HiCache IO backend: `direct`
+- Tensorcast host allocator: enabled
 - result: `1/1` successful pairs showed lower TTFT on instance B
 - mean TTFT improvement: `67.75 ms`
 
@@ -181,6 +203,9 @@ Run the full command directly:
 python -m tensorcast_benchmark.kv.share_local.run_benchmark \
   --hicache-storage-backend tensorcast \
   --tensorcast-daemon-mode share \
+  --hicache-mem-layout page_blob_direct \
+  --hicache-io-backend direct \
+  --tensorcast-host-allocator-enabled \
   --existing-worker-process ws-ae2b460be336450b-worker-mjqbd \
   --model-path /mnt/step2-alignment-jfs/zane/opensources_model/Qwen3-32B \
   --tp-size 2 \
