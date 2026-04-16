@@ -1,0 +1,113 @@
+backend: mooncake
+
+workers:
+  entries:
+    - process_name: ""
+      gpu: 4
+      cpu: 64
+      memory: 500000
+      positive_tags: H800
+      negative_tags: ""
+    - process_name: ""
+      gpu: 4
+      cpu: 64
+      memory: 500000
+      positive_tags: H800
+      negative_tags: ""
+    - process_name: ""
+      gpu: 4
+      cpu: 64
+      memory: 500000
+      positive_tags: H800
+      negative_tags: ""
+    - process_name: ""
+      gpu: 4
+      cpu: 64
+      memory: 500000
+      positive_tags: H800
+      negative_tags: ""
+  keep_workers: true
+  require_distinct_nodes: true
+  rdma_required: true
+  verify_rdma_on_reuse: false
+  service_host_worker_index: 0
+  default_shape:
+    gpu: 4
+    cpu: 64
+    memory: 500000
+    positive_tags: H800
+    negative_tags: ""
+
+brainctl:
+  namespace: shai-core
+  charged_group: codesign
+  private_machine: group
+  mount: juicefs+s3://oss.i.shaipower.com/step2-alignment-jfs:/mnt/step2-alignment-jfs
+  max_wait_duration: 10m
+  worker_ready_timeout_s: 900
+  worker_poll_interval_s: 5
+
+transport:
+  use_rdma: true
+  rdma_smoke_mode: star
+  rdma_gid_index: 3
+  ib_write_bw_fixed_port: 18517
+  ib_write_bw_sweep_port: 18516
+  ib_write_bw_server_ready_sleep_s: 2.0
+
+workload:
+  model_path: /mnt/step2-alignment-jfs/zane/opensources_model/Qwen3-32B
+  model_name: ""
+  instance_port: 35000
+  tp_size: 2
+  page_size: 32
+  prompt_count: 10
+  rps: 0.5
+  settle_ms: 20000
+  max_new_tokens: 32
+  temperature: 0.0
+  data_path: /home/i-zhouyuhan/tot/thirdparty/sglang/benchmark/tensorcast_benchmark/kv/dataset/LongBench/hotpotqa.jsonl
+  min_prompt_chars: 10034
+  max_prompt_chars: 12697
+  request_timeout_s: 600
+  instance_ready_timeout_s: 1800
+  instance_health_poll_interval_s: 1.0
+  mem_fraction_static: 0.85
+  enable_hierarchical_cache: true
+  hicache_mem_layout: page_first_direct
+  hicache_io_backend: direct
+  hicache_ratio: 2.0
+  hicache_size_gb: 0
+  hicache_storage_prefetch_policy: wait_complete
+  trust_remote_code: false
+  extra_server_args: --log-level debug
+
+backend_config:
+  tensorcast:
+    namespace: share_remote
+    global_store_port: 50051
+    daemon_port: 50052
+    daemon_p2p_port: 65090
+    service_ready_timeout_s: 120
+    service_poll_interval_s: 2
+    cuda_home: /usr/local/cuda-12.4
+    nvidia_lib_dirs: /usr/local/cuda-12.9/compat:/usr/local/nvidia/lib64
+    daemon_stable_bytes: 64GB
+    byte_artifact_shard_count: 8
+    byte_artifact_lease_ttl_s: 30
+    byte_artifact_keepalive_interval_s: 10
+    payload_max_chunk_bytes: 1048576
+    max_batch_payload_bytes: 16777216
+    prefetch_threshold: 1
+    host_allocator_enabled: true
+    host_allocator_region_ttl_ms: 0
+    host_allocator_region_name: sglang_tensorcast_host_pool
+  mooncake:
+    http_metadata_server_port: 38080
+    master_port: 36051
+    prefetch_threshold: 1
+    protocol: rdma
+    device_name: ""
+    global_segment_size: 64gb
+    local_buffer_size: 0
+    eviction_high_watermark_ratio: 0.9
