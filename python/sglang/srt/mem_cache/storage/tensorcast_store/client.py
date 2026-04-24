@@ -53,6 +53,8 @@ class TensorcastBatchTransferResult:
 class TensorcastPageClient(Protocol):
     def artifact_id_for(self, logical_key: str) -> str: ...
 
+    def activate_stable_local_backing(self, region_id: str, *, slot_bytes: int) -> None: ...
+
     def batch_exists(self, logical_keys: list[str]) -> TensorcastBatchExistsResult: ...
 
     def batch_put(
@@ -267,6 +269,12 @@ class DefaultTensorcastPageClient:
     def close(self) -> None:
         self._put_staging.close()
         self._get_staging.close()
+
+    def activate_stable_local_backing(self, region_id: str, *, slot_bytes: int) -> None:
+        self._store.activate_stable_local_backing(
+            region_id,
+            slot_bytes=int(slot_bytes),
+        )
 
     def artifact_id_for(self, logical_key: str) -> str:
         artifact_id = self._artifact_id_cache.get(logical_key)

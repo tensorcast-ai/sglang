@@ -139,15 +139,30 @@ class TensorcastStore(HiCacheStorage):
         return self._tensorcast_config
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
+        host_region_binding = mem_pool_host.host_region_binding
         if self._tensorcast_config.host_allocator_enabled:
             if mem_pool_host.layout != "page_blob_direct":
                 raise ValueError(
                     "TensorCast allocator-backed host residency requires mem_pool_host.layout=page_blob_direct"
                 )
-            if mem_pool_host.host_region_binding is None:
+            if host_region_binding is None:
                 raise ValueError(
                     "TensorCast allocator-backed host residency requires a live host_region_binding"
                 )
+            slot_bytes = int(mem_pool_host.size_per_token) * int(mem_pool_host.page_size)
+            if slot_bytes <= 0:
+                raise ValueError(
+                    "TensorCast allocator-backed host residency requires positive slot_bytes"
+                )
+            self._page_client.activate_stable_local_backing(
+                str(host_region_binding.region_id),
+                slot_bytes=slot_bytes,
+            )
+            logger.info(
+                "Activated Tensorcast stable local backing region=%s slot_bytes=%d",
+                host_region_binding.region_id,
+                slot_bytes,
+            )
         super().register_mem_pool_host(mem_pool_host)
         self._request_bundle_manager.register_mem_pool_host(mem_pool_host)
 
