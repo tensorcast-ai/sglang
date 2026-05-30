@@ -21,6 +21,7 @@ RUN_SUMMARY_CSV_FIELDS = [
     "model_path",
     "tp_size",
     "prompt_count",
+    "reuse_interval_ms",
     "avg_prompt_length",
     "successful_prompt_groups",
     "failed_prompt_groups",
@@ -57,7 +58,9 @@ def discover_sglang_root(start: Path) -> Path:
     raise RuntimeError(f"Could not find sglang root from {start}")
 
 
-def create_run_id(backend: str, tp_size: int, worker_count: int, prompt_count: int) -> str:
+def create_run_id(
+    backend: str, tp_size: int, worker_count: int, prompt_count: int
+) -> str:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return (
         f"{timestamp}_{backend}_tp{tp_size}_workers{worker_count}_prompts{prompt_count}"
@@ -129,7 +132,9 @@ def load_yaml(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as file:
         payload = yaml.safe_load(file)
     if not isinstance(payload, dict):
-        raise RuntimeError(f"Expected YAML object at {path}, got {type(payload).__name__}")
+        raise RuntimeError(
+            f"Expected YAML object at {path}, got {type(payload).__name__}"
+        )
     return payload
 
 
@@ -185,6 +190,7 @@ def append_csv_row(path: Path, summary: ShareRemoteRunSummary) -> None:
         "model_path": summary.model_path,
         "tp_size": summary.tp_size,
         "prompt_count": summary.prompt_count,
+        "reuse_interval_ms": summary.reuse_interval_ms,
         "avg_prompt_length": summary.avg_prompt_length,
         "successful_prompt_groups": summary.successful_prompt_groups,
         "failed_prompt_groups": summary.failed_prompt_groups,

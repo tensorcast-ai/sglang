@@ -9,6 +9,7 @@ import json
 import os
 import shlex
 import shutil
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -48,6 +49,9 @@ BRAINCTL_PROXY_ENV_KEYS = (
 ORCHESTRATOR_LOG_PATH: Path | None = None
 RDMA_HELPER_ROOT = Path("/home/i-zhouyuhan/.codex/skills/brainctl-launch-remote-gpu")
 RDMA_DERIVE_SCRIPT = RDMA_HELPER_ROOT / "scripts" / "derive_nccl_ib_hca.py"
+TENSORCAST_STOP_TIMEOUT_S = 45.0
+TENSORCAST_STOP_WAIT_TIMEOUT_S = 60.0
+TENSORCAST_RUNTIME_RESET_TIMEOUT_S = 30.0
 
 
 def log(message: str) -> None:
@@ -107,10 +111,20 @@ def parse_config(config_path: Path) -> ShareRemoteBenchmarkConfig:
     workload_payload = raw_payload.get("workload")
     if isinstance(workload_payload, dict):
         data_path = workload_payload.get("data_path")
-        if isinstance(data_path, str) and data_path and not Path(data_path).is_absolute():
-            workload_payload["data_path"] = str((config_path.parent / data_path).resolve())
+        if (
+            isinstance(data_path, str)
+            and data_path
+            and not Path(data_path).is_absolute()
+        ):
+            workload_payload["data_path"] = str(
+                (config_path.parent / data_path).resolve()
+            )
         model_path = workload_payload.get("model_path")
-        if isinstance(model_path, str) and model_path and not Path(model_path).is_absolute():
+        if (
+            isinstance(model_path, str)
+            and model_path
+            and not Path(model_path).is_absolute()
+        ):
             candidate = (config_path.parent / model_path).resolve()
             if candidate.exists():
                 workload_payload["model_path"] = str(candidate)
@@ -226,7 +240,9 @@ def launch_worker(
     ]
     if spec.positive_tags.strip():
         cmd.append(f"--positive-tags={spec.positive_tags}")
-    negative_tags = [value for value in (spec.negative_tags.strip(), *extra_negative_tags) if value]
+    negative_tags = [
+        value for value in (spec.negative_tags.strip(), *extra_negative_tags) if value
+    ]
     if negative_tags:
         cmd.append(f"--negative-tags={','.join(negative_tags)}")
     cmd.extend(["--", "bash", "-lc", remote_cmd])
@@ -296,9 +312,10 @@ def exec_user(
     timeout_s: float | None = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    user = os.environ.get("USER", "").strip() or subprocess.check_output(
-        ["id", "-un"], text=True
-    ).strip()
+    user = (
+        os.environ.get("USER", "").strip()
+        or subprocess.check_output(["id", "-un"], text=True).strip()
+    )
     wrapped = (
         "set -euo pipefail; "
         f"if ! id -u {user} >/dev/null 2>&1; then echo missing user {user} >&2; exit 1; fi; "
@@ -327,6 +344,26 @@ def wait_for_condition(
         last_detail = detail
         if ok:
             return detail
+        time.sleep(poll_interval_s)
+    raise RuntimeError(f"Timed out waiting for {description}:\n{last_detail}")
+
+
+def wait_tcp_listen(
+    *,
+    host: str,
+    port: int,
+    timeout_s: float,
+    poll_interval_s: float,
+    description: str,
+) -> None:
+    deadline = time.monotonic() + timeout_s
+    last_detail = f"{host}:{port} not yet reachable"
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=2.0):
+                return
+        except OSError as exc:
+            last_detail = f"{host}:{port} connect failed: {exc}"
         time.sleep(poll_interval_s)
     raise RuntimeError(f"Timed out waiting for {description}:\n{last_detail}")
 
@@ -409,7 +446,7 @@ def start_remote_process(
         "fi; "
         f'nohup bash -lc {shlex.quote(command)} > "$LOG_PATH" 2>&1 < /dev/null & '
         'echo $! > "$PID_PATH"; '
-        f"echo STARTED worker={worker_index} name={shlex.quote(name)} PID=$(cat \"$PID_PATH\")"
+        f'echo STARTED worker={worker_index} name={shlex.quote(name)} PID=$(cat "$PID_PATH")'
     )
     exec_user(config, worker_process, remote_cmd)
 
@@ -467,7 +504,7 @@ def run_remote_environment_smoke_checks(
         f"test -x {shlex.quote(str(paths.venv_python))}; "
         f"test -x {shlex.quote(str(paths.uv_bin))}; "
         "nvidia-smi -L >/dev/null; "
-        f'mkdir -p {shlex.quote(str(smoke_file.parent))}; '
+        f"mkdir -p {shlex.quote(str(smoke_file.parent))}; "
         f"touch {shlex.quote(str(smoke_file))}; "
         f"echo SMOKE_OK > {shlex.quote(str(smoke_file))}; "
         f"test -s {shlex.quote(str(smoke_file))}; "
@@ -576,7 +613,7 @@ def capture_remote_rdma_inventory(
             "set -euo pipefail; "
             f"LOG_PATH={shlex.quote(str(log_path))}; "
             'mkdir -p "$(dirname "$LOG_PATH")"; '
-            f"{command} > \"$LOG_PATH\" 2>&1"
+            f'{command} > "$LOG_PATH" 2>&1'
         )
         exec_user(config, worker_process, remote_cmd, check=False)
 
@@ -647,7 +684,7 @@ def run_ib_write_bw_smoke(
             'mkdir -p "$(dirname "$LOG_PATH")"; '
             f"ib_write_bw {extra_args} -d {shlex.quote(client_rdma.preferred_ib_device)} "
             f"-x {config.transport.rdma_gid_index} -F --report_gbits -p {port} "
-            f"{shlex.quote(server_ip)} > \"$LOG_PATH\" 2>&1"
+            f'{shlex.quote(server_ip)} > "$LOG_PATH" 2>&1'
         ).strip()
         try:
             exec_user(
@@ -718,9 +755,212 @@ def cleanup_remote_tcp_ports(
         "  if command -v fuser >/dev/null 2>&1; then "
         "    fuser -k ${port}/tcp >/dev/null 2>&1 || true; "
         "  fi; "
+        '  PIDS=""; '
+        "  if command -v lsof >/dev/null 2>&1; then "
+        '    PIDS=$(lsof -tiTCP:${port} -sTCP:LISTEN 2>/dev/null | sort -u | tr "\\n" " "); '
+        "  elif command -v ss >/dev/null 2>&1; then "
+        '    PIDS=$(ss -ltnpH "sport = :${port}" 2>/dev/null '
+        '      | grep -o "pid=[0-9]\\+" '
+        "      | cut -d= -f2 "
+        "      | sort -u "
+        '      | tr "\\n" " "); '
+        "  fi; "
+        '  if [[ -n "${PIDS:-}" ]]; then '
+        "    kill ${PIDS} >/dev/null 2>&1 || true; "
+        "    sleep 2; "
+        "    for pid in ${PIDS}; do "
+        '      if kill -0 "${pid}" >/dev/null 2>&1; then '
+        '        kill -9 "${pid}" >/dev/null 2>&1 || true; '
+        "      fi; "
+        "    done; "
+        "  fi; "
         "done"
     )
     exec_user(config, worker_process, remote_cmd, check=False)
+
+
+def cleanup_remote_process_patterns(
+    config: ShareRemoteBenchmarkConfig,
+    worker_process: str,
+    *,
+    patterns: list[str],
+) -> None:
+    if not patterns:
+        return
+    joined_patterns = " ".join(shlex.quote(pattern) for pattern in patterns)
+    remote_cmd = (
+        "set -euo pipefail; "
+        'SELF_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d " " || true); '
+        f"for pattern in {joined_patterns}; do "
+        "  if command -v pgrep >/dev/null 2>&1; then "
+        '    PIDS=$(pgrep -f -- "$pattern" 2>/dev/null | sort -u | tr "\\n" " " || true); '
+        "  else "
+        '    PIDS=$(ps -ef | grep -E -- "$pattern" | grep -v grep | awk \'{print $2}\' | sort -u | tr "\\n" " " || true); '
+        "  fi; "
+        '  FILTERED_PIDS=""; '
+        "  for pid in ${PIDS:-}; do "
+        '    if ! kill -0 "${pid}" >/dev/null 2>&1; then '
+        "      continue; "
+        "    fi; "
+        '    PID_COMM=$(ps -o comm= -p "${pid}" 2>/dev/null | tr -d " " || true); '
+        '    if [[ "${PID_COMM:-}" == "su" || "${PID_COMM:-}" == "bash" || "${PID_COMM:-}" == "-bash" || "${PID_COMM:-}" == "sh" ]]; then '
+        "      continue; "
+        "    fi; "
+        '    PID_PGID=$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d " " || true); '
+        '    if [[ -n "${SELF_PGID:-}" && "${PID_PGID:-}" == "${SELF_PGID}" ]]; then '
+        "      continue; "
+        "    fi; "
+        '    FILTERED_PIDS="${FILTERED_PIDS} ${pid}"; '
+        "  done; "
+        '  PIDS="${FILTERED_PIDS# }"; '
+        '  if [[ -n "${PIDS:-}" ]]; then '
+        "    kill ${PIDS} >/dev/null 2>&1 || true; "
+        "    sleep 2; "
+        "    for pid in ${PIDS}; do "
+        '      if kill -0 "${pid}" >/dev/null 2>&1; then '
+        '        kill -9 "${pid}" >/dev/null 2>&1 || true; '
+        "      fi; "
+        "    done; "
+        "  fi; "
+        "done"
+    )
+    exec_user(config, worker_process, remote_cmd, check=False)
+
+
+def remote_process_port_cleanup_state(
+    config: ShareRemoteBenchmarkConfig,
+    worker_process: str,
+    *,
+    ports: list[int],
+    patterns: list[str],
+) -> tuple[bool, str]:
+    port_checks = ""
+    if ports:
+        joined_ports = " ".join(str(port) for port in ports)
+        port_checks = (
+            f"for port in {joined_ports}; do "
+            '  LINES=$(ss -ltnpH "sport = :${port}" 2>/dev/null || true); '
+            '  if [[ -n "${LINES:-}" ]]; then '
+            '    clean=0; echo "PORT ${port}"; echo "${LINES}"; '
+            "  fi; "
+            "done; "
+        )
+    pattern_checks = ""
+    if patterns:
+        joined_patterns = " ".join(shlex.quote(pattern) for pattern in patterns)
+        pattern_checks = (
+            f"for pattern in {joined_patterns}; do "
+            "  if command -v pgrep >/dev/null 2>&1; then "
+            '    PIDS=$(pgrep -f -- "$pattern" 2>/dev/null | sort -u | tr "\\n" " " || true); '
+            "  else "
+            '    PIDS=$(ps -ef | grep -E -- "$pattern" | grep -v grep | awk \'{print $2}\' | sort -u | tr "\\n" " " || true); '
+            "  fi; "
+            '  FILTERED_PIDS=""; '
+            "  for pid in ${PIDS:-}; do "
+            '    if ! kill -0 "${pid}" >/dev/null 2>&1; then '
+            "      continue; "
+            "    fi; "
+            '    PID_COMM=$(ps -o comm= -p "${pid}" 2>/dev/null | tr -d " " || true); '
+            '    if [[ "${PID_COMM:-}" == "su" || "${PID_COMM:-}" == "bash" || "${PID_COMM:-}" == "-bash" || "${PID_COMM:-}" == "sh" ]]; then '
+            "      continue; "
+            "    fi; "
+            '    PID_PGID=$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d " " || true); '
+            '    if [[ -n "${SELF_PGID:-}" && "${PID_PGID:-}" == "${SELF_PGID}" ]]; then '
+            "      continue; "
+            "    fi; "
+            '    FILTERED_PIDS="${FILTERED_PIDS} ${pid}"; '
+            "  done; "
+            '  PIDS="${FILTERED_PIDS# }"; '
+            '  if [[ -n "${PIDS:-}" ]]; then '
+            '    clean=0; echo "PROC ${pattern}"; '
+            "    for pid in ${PIDS}; do "
+            '      ps -p "${pid}" -o pid=,args= 2>/dev/null || true; '
+            "    done; "
+            "  fi; "
+            "done; "
+        )
+    remote_cmd = (
+        "set -euo pipefail; "
+        "clean=1; "
+        'SELF_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d " " || true); '
+        f"{port_checks}"
+        f"{pattern_checks}"
+        'if [[ "${clean}" -eq 1 ]]; then echo CLEAN; exit 0; fi; '
+        "exit 1"
+    )
+    completed = exec_user(
+        config,
+        worker_process,
+        remote_cmd,
+        timeout_s=30.0,
+        check=False,
+    )
+    detail = (completed.stdout + completed.stderr).strip() or "CLEAN"
+    return completed.returncode == 0 or detail.startswith("CLEAN"), detail
+
+
+def stop_tensorcast_runtime(
+    config: ShareRemoteBenchmarkConfig,
+    worker_process: str,
+    *,
+    paths: ShareRemotePaths,
+    runtime_home: Path,
+    stop_subcommand: str,
+    ports: list[int],
+    process_patterns: list[str],
+    pid_path: Path | None = None,
+    label: str,
+) -> None:
+    if pid_path is not None:
+        stop_remote_process(config, worker_process, pid_path)
+    try:
+        exec_user(
+            config,
+            worker_process,
+            build_tensorcast_service_remote_cmd(
+                paths,
+                tensorcast_home=runtime_home,
+                subcommand=stop_subcommand,
+                args=[str(int(TENSORCAST_STOP_TIMEOUT_S))],
+            ),
+            timeout_s=TENSORCAST_STOP_TIMEOUT_S + 15.0,
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"{label} stop command failed on {worker_process}: {exc}")
+    cleanup_remote_tcp_ports(
+        config,
+        worker_process,
+        ports=ports,
+    )
+    cleanup_remote_process_patterns(
+        config,
+        worker_process,
+        patterns=process_patterns,
+    )
+    with contextlib.suppress(Exception):
+        exec_user(
+            config,
+            worker_process,
+            build_tensorcast_service_remote_cmd(
+                paths,
+                tensorcast_home=runtime_home,
+                subcommand="reset-runtime-state",
+            ),
+            timeout_s=TENSORCAST_RUNTIME_RESET_TIMEOUT_S,
+            check=False,
+        )
+    wait_for_condition(
+        timeout_s=TENSORCAST_STOP_WAIT_TIMEOUT_S,
+        poll_interval_s=config.backend_config.tensorcast.service_poll_interval_s,
+        description=f"{label} cleanup on {worker_process}",
+        check_fn=lambda: remote_process_port_cleanup_state(
+            config,
+            worker_process,
+            ports=ports,
+            patterns=process_patterns,
+        ),
+    )
 
 
 def cleanup_remote_path(
@@ -762,15 +1002,21 @@ def build_tensorcast_configs(
     service_host_ip: str,
     worker_ips: tuple[str, ...],
 ) -> dict[str, Path]:
-    global_cfg = load_yaml(paths.benchmark_root / "configs" / "global_store_config.yaml")
-    daemon_cfg = load_yaml(paths.benchmark_root / "configs" / "store_daemon_config.yaml")
+    global_cfg = load_yaml(
+        paths.benchmark_root / "configs" / "global_store_config.yaml"
+    )
+    daemon_cfg = load_yaml(
+        paths.benchmark_root / "configs" / "store_daemon_config.yaml"
+    )
     tensorcast_cfg = config.backend_config.tensorcast
 
     global_cfg["server"]["listen"]["port"] = tensorcast_cfg.global_store_port
     global_cfg["server"]["advertise"]["host"] = service_host_ip
     global_cfg["server"]["advertise"]["port"] = tensorcast_cfg.global_store_port
     global_cfg["observability"]["logging"]["file"] = str(
-        worker_log_path(paths, config.workers.service_host_worker_index, "tensorcast_global_store")
+        worker_log_path(
+            paths, config.workers.service_host_worker_index, "tensorcast_global_store"
+        )
     )
 
     generated: dict[str, Path] = {
@@ -785,8 +1031,12 @@ def build_tensorcast_configs(
         payload["server"]["advertise"]["host"] = worker_ip
         payload["server"]["p2p_listen"]["host"] = worker_ip
         payload["server"]["p2p_listen"]["port"] = tensorcast_cfg.daemon_p2p_port
-        payload["engine"]["memory_tiers"]["stable_bytes"] = tensorcast_cfg.daemon_stable_bytes
-        payload["high_availability"]["global_store_endpoints"][0]["host"] = service_host_ip
+        payload["engine"]["memory_tiers"]["stable_bytes"] = (
+            tensorcast_cfg.daemon_stable_bytes
+        )
+        payload["high_availability"]["global_store_endpoints"][0]["host"] = (
+            service_host_ip
+        )
         payload["high_availability"]["global_store_endpoints"][0]["port"] = (
             tensorcast_cfg.global_store_port
         )
@@ -803,13 +1053,36 @@ def build_tensorcast_configs(
             )
         )
         payload["communicator"]["enable_rdma"] = config.transport.use_rdma
+        payload["communicator"].setdefault("rdma", {})
+        payload["communicator"]["rdma"]["enable_stable_local_mr_reuse"] = (
+            tensorcast_cfg.enable_stable_local_mr_reuse
+        )
+        payload["communicator"]["rdma"]["stable_local_mr_reuse_chunk_slots"] = (
+            tensorcast_cfg.stable_local_mr_reuse_chunk_slots
+        )
+        prewarm_workers = tensorcast_cfg.stable_local_mr_reuse_prewarm_workers
+        if (
+            prewarm_workers is None
+            and tensorcast_cfg.stable_local_mr_reuse_eager_prereg_all_rails
+        ):
+            prewarm_workers = 1
+        if prewarm_workers is not None:
+            payload["communicator"]["rdma"]["stable_local_mr_reuse_prewarm_workers"] = (
+                prewarm_workers
+            )
         byte_artifact_routing = payload.setdefault("byte_artifact_routing", {})
         byte_artifact_routing["shard_count"] = tensorcast_cfg.byte_artifact_shard_count
+        byte_artifact_routing["route_staleness_budget"] = (
+            f"{tensorcast_cfg.route_staleness_budget_s:g}s"
+        )
         byte_artifact_routing["lease_ttl"] = (
             f"{tensorcast_cfg.byte_artifact_lease_ttl_s:g}s"
         )
         byte_artifact_routing["keepalive_interval"] = (
             f"{tensorcast_cfg.byte_artifact_keepalive_interval_s:g}s"
+        )
+        byte_artifact_routing["worker_directory_staleness_budget"] = (
+            f"{tensorcast_cfg.worker_directory_staleness_budget_s:g}s"
         )
         payload_transport = byte_artifact_routing.setdefault("payload_transport", {})
         payload_transport["max_chunk_bytes"] = tensorcast_cfg.payload_max_chunk_bytes
@@ -819,14 +1092,21 @@ def build_tensorcast_configs(
         payload_transport["max_batch_payload_bytes"] = (
             tensorcast_cfg.max_batch_payload_bytes
         )
-        payload_transport.setdefault("max_batch_items", 256)
+        payload_transport["max_batch_items"] = tensorcast_cfg.max_batch_items
+        payload_transport["source_publish_prereg"] = {
+            "enabled": tensorcast_cfg.source_publish_prereg_enabled,
+            "ttl": f"{tensorcast_cfg.source_publish_prereg_ttl_s:g}s",
+            "max_live_entries": tensorcast_cfg.source_publish_prereg_max_live_entries,
+            "max_live_bytes": tensorcast_cfg.source_publish_prereg_max_live_bytes,
+        }
         capability_tokens = payload.setdefault("capability_tokens", {})
         active_tokens = capability_tokens.setdefault("active", {})
         active_tokens["version"] = int(active_tokens.get("version", 1) or 1)
         if not str(active_tokens.get("secret", "")).strip():
             active_tokens["secret"] = capability_token_secret
         daemon_path = (
-            paths.generated_configs_dir / f"tensorcast_daemon_worker_{worker_index:02d}.yaml"
+            paths.generated_configs_dir
+            / f"tensorcast_daemon_worker_{worker_index:02d}.yaml"
         )
         generated[f"daemon_{worker_index}"] = daemon_path
         dump_yaml(daemon_path, payload)
@@ -840,41 +1120,46 @@ def start_global_store(
     paths: ShareRemotePaths,
     global_store_config_path: Path,
     runtime_home: Path,
+    listen_host: str,
 ) -> None:
     tensorcast_cfg = config.backend_config.tensorcast
-    cleanup_remote_tcp_ports(
+    worker_index = config.workers.service_host_worker_index
+    stop_tensorcast_runtime(
         config,
         worker_process,
+        paths=paths,
+        runtime_home=runtime_home,
+        stop_subcommand="stop-global",
         ports=[tensorcast_cfg.global_store_port],
+        process_patterns=[r"tensorcast\.global_store"],
+        pid_path=worker_pid_path(paths, worker_index, "tensorcast_global_store_start"),
+        label="tensorcast global store",
     )
-    exec_user(
+    start_remote_process(
         config,
         worker_process,
-        build_tensorcast_service_remote_cmd(
-            paths,
-            tensorcast_home=runtime_home,
-            subcommand="stop-global",
+        paths=paths,
+        worker_index=worker_index,
+        name="tensorcast_global_store_start",
+        command=(
+            "set -euo pipefail; sleep 1; "
+            f"bash {shlex.quote(str(paths.scripts_dir / 'tensorcast_service.sh'))} "
+            f"start-global {shlex.quote(str(global_store_config_path))}"
         ),
-        check=False,
+        log_path=worker_log_path(paths, worker_index, "tensorcast_global_store_start"),
+        pid_path=worker_pid_path(paths, worker_index, "tensorcast_global_store_start"),
+        exports={
+            "TENSORCAST_HOME": str(runtime_home),
+            "UV_BIN": str(paths.uv_bin),
+        },
+        include_tensorcast=True,
     )
-    exec_user(
-        config,
-        worker_process,
-        build_tensorcast_service_remote_cmd(
-            paths,
-            tensorcast_home=runtime_home,
-            subcommand="reset-runtime-state",
-        ),
-    )
-    exec_user(
-        config,
-        worker_process,
-        build_tensorcast_service_remote_cmd(
-            paths,
-            tensorcast_home=runtime_home,
-            subcommand="start-global",
-            args=[str(global_store_config_path)],
-        ),
+    wait_tcp_listen(
+        host=listen_host,
+        port=tensorcast_cfg.global_store_port,
+        timeout_s=tensorcast_cfg.service_ready_timeout_s,
+        poll_interval_s=tensorcast_cfg.service_poll_interval_s,
+        description="global store listen socket",
     )
     wait_for_condition(
         timeout_s=tensorcast_cfg.service_ready_timeout_s,
@@ -905,15 +1190,20 @@ def stop_global_store(
     paths: ShareRemotePaths,
     runtime_home: Path,
 ) -> None:
-    exec_user(
+    stop_tensorcast_runtime(
         config,
         worker_process,
-        build_tensorcast_service_remote_cmd(
+        paths=paths,
+        runtime_home=runtime_home,
+        stop_subcommand="stop-global",
+        ports=[config.backend_config.tensorcast.global_store_port],
+        process_patterns=[r"tensorcast\.global_store"],
+        pid_path=worker_pid_path(
             paths,
-            tensorcast_home=runtime_home,
-            subcommand="stop-global",
+            config.workers.service_host_worker_index,
+            "tensorcast_global_store_start",
         ),
-        check=False,
+        label="tensorcast global store",
     )
 
 
@@ -922,53 +1212,54 @@ def start_tensorcast_daemon(
     worker_process: str,
     *,
     paths: ShareRemotePaths,
+    worker_index: int,
     daemon_config_path: Path,
     runtime_home: Path,
     global_store_address: str,
     rdma_env: dict[str, str],
+    listen_host: str,
 ) -> None:
     tensorcast_cfg = config.backend_config.tensorcast
-    cleanup_remote_tcp_ports(
+    stop_tensorcast_runtime(
         config,
         worker_process,
-        ports=[tensorcast_cfg.daemon_port],
+        paths=paths,
+        runtime_home=runtime_home,
+        stop_subcommand="stop-daemon",
+        ports=[tensorcast_cfg.daemon_port, tensorcast_cfg.daemon_p2p_port],
+        process_patterns=[r"tensorcast_daemon"],
+        pid_path=worker_pid_path(paths, worker_index, "tensorcast_daemon_start"),
+        label=f"tensorcast daemon worker {worker_index}",
     )
-    exec_user(
+    start_remote_process(
         config,
         worker_process,
-        build_tensorcast_service_remote_cmd(
-            paths,
-            tensorcast_home=runtime_home,
-            subcommand="stop-daemon",
+        paths=paths,
+        worker_index=worker_index,
+        name="tensorcast_daemon_start",
+        command=(
+            "set -euo pipefail; sleep 1; "
+            f"bash {shlex.quote(str(paths.scripts_dir / 'tensorcast_service.sh'))} "
+            f"start-daemon {shlex.quote(str(daemon_config_path))} "
+            f"{shlex.quote(global_store_address)} "
+            f"{shlex.quote(tensorcast_cfg.cuda_home)} "
+            f"{shlex.quote(tensorcast_cfg.nvidia_lib_dirs)}"
         ),
-        check=False,
+        log_path=worker_log_path(paths, worker_index, "tensorcast_daemon_start"),
+        pid_path=worker_pid_path(paths, worker_index, "tensorcast_daemon_start"),
+        exports={
+            **rdma_env,
+            "TENSORCAST_HOME": str(runtime_home),
+            "UV_BIN": str(paths.uv_bin),
+        },
+        include_tensorcast=True,
     )
-    exec_user(
-        config,
-        worker_process,
-        build_tensorcast_service_remote_cmd(
-            paths,
-            tensorcast_home=runtime_home,
-            subcommand="reset-runtime-state",
-        ),
-    )
-    exec_user(
-        config,
-        worker_process,
-        prepend_exports(
-            build_tensorcast_service_remote_cmd(
-                paths,
-                tensorcast_home=runtime_home,
-                subcommand="start-daemon",
-                args=[
-                    str(daemon_config_path),
-                    global_store_address,
-                    tensorcast_cfg.cuda_home,
-                    tensorcast_cfg.nvidia_lib_dirs,
-                ],
-            ),
-            rdma_env,
-        ),
+    wait_tcp_listen(
+        host=listen_host,
+        port=tensorcast_cfg.daemon_port,
+        timeout_s=tensorcast_cfg.service_ready_timeout_s,
+        poll_interval_s=tensorcast_cfg.service_poll_interval_s,
+        description=f"tensorcast daemon listen socket on worker {worker_index}",
     )
     exec_user(
         config,
@@ -992,39 +1283,23 @@ def stop_tensorcast_daemon(
     worker_process: str,
     *,
     paths: ShareRemotePaths,
+    worker_index: int,
     runtime_home: Path,
 ) -> None:
-    exec_user(
+    stop_tensorcast_runtime(
         config,
         worker_process,
-        build_tensorcast_service_remote_cmd(
-            paths,
-            tensorcast_home=runtime_home,
-            subcommand="stop-daemon",
-        ),
-        check=False,
+        paths=paths,
+        runtime_home=runtime_home,
+        stop_subcommand="stop-daemon",
+        ports=[
+            config.backend_config.tensorcast.daemon_port,
+            config.backend_config.tensorcast.daemon_p2p_port,
+        ],
+        process_patterns=[r"tensorcast_daemon"],
+        pid_path=worker_pid_path(paths, worker_index, "tensorcast_daemon_start"),
+        label=f"tensorcast daemon worker {worker_index}",
     )
-    with contextlib.suppress(Exception):
-        wait_for_condition(
-            timeout_s=config.backend_config.tensorcast.service_ready_timeout_s,
-            poll_interval_s=config.backend_config.tensorcast.service_poll_interval_s,
-            description="daemon stopped",
-            check_fn=lambda: (
-                daemon_is_stopped(
-                    status := exec_user(
-                        config,
-                        worker_process,
-                        build_tensorcast_service_remote_cmd(
-                            paths,
-                            tensorcast_home=runtime_home,
-                            subcommand="status-daemon",
-                        ),
-                        check=False,
-                    ).stdout
-                ),
-                status,
-            ),
-        )
 
 
 def write_mooncake_config(
@@ -1037,7 +1312,9 @@ def write_mooncake_config(
     device_name: str,
 ) -> Path:
     mooncake_cfg = config.backend_config.mooncake
-    config_path = paths.generated_configs_dir / f"mooncake_worker_{worker_index:02d}.json"
+    config_path = (
+        paths.generated_configs_dir / f"mooncake_worker_{worker_index:02d}.json"
+    )
     write_json(
         config_path,
         {
@@ -1149,7 +1426,9 @@ def build_tensorcast_backend_extra_config(
         payload["host_allocator_region_ttl_ms"] = (
             tensorcast_cfg.host_allocator_region_ttl_ms
         )
-        payload["host_allocator_region_name"] = tensorcast_cfg.host_allocator_region_name
+        payload["host_allocator_region_name"] = (
+            tensorcast_cfg.host_allocator_region_name
+        )
     return payload
 
 
@@ -1198,8 +1477,12 @@ def build_sglang_command_for_instance(
         cmd.append("--trust-remote-code")
     if config.workload.enable_hierarchical_cache:
         cmd.append("--enable-hierarchical-cache")
-        cmd.extend(["--hicache-mem-layout", shlex.quote(config.workload.hicache_mem_layout)])
-        cmd.extend(["--hicache-io-backend", shlex.quote(config.workload.hicache_io_backend)])
+        cmd.extend(
+            ["--hicache-mem-layout", shlex.quote(config.workload.hicache_mem_layout)]
+        )
+        cmd.extend(
+            ["--hicache-io-backend", shlex.quote(config.workload.hicache_io_backend)]
+        )
         cmd.extend(["--hicache-ratio", str(config.workload.hicache_ratio)])
         cmd.extend(["--hicache-size", str(config.workload.hicache_size_gb)])
         cmd.extend(
@@ -1262,7 +1545,9 @@ def launch_sglang_instance(
     tensorcast_backend_extra_config: dict[str, object] | None,
     rdma_env: dict[str, str],
 ) -> None:
-    cuda_visible_devices = ",".join(str(device) for device in range(config.workload.tp_size))
+    cuda_visible_devices = ",".join(
+        str(device) for device in range(config.workload.tp_size)
+    )
     stop_sglang_instance(
         config,
         worker_process,
@@ -1323,16 +1608,36 @@ def stop_sglang_instance(
     )
     remote_cmd = (
         "set -euo pipefail; "
-        f"if command -v fuser >/dev/null 2>&1; then "
-        f"fuser -k {config.workload.instance_port}/tcp >/dev/null 2>&1 || true; "
+        f"port={config.workload.instance_port}; "
+        "if command -v fuser >/dev/null 2>&1; then "
+        "  fuser -k ${port}/tcp >/dev/null 2>&1 || true; "
+        "fi; "
+        'PIDS_BY_PORT=""; '
+        "if command -v lsof >/dev/null 2>&1; then "
+        '  PIDS_BY_PORT=$(lsof -tiTCP:${port} -sTCP:LISTEN 2>/dev/null | sort -u | tr "\\n" " "); '
+        "elif command -v ss >/dev/null 2>&1; then "
+        '  PIDS_BY_PORT=$(ss -ltnpH "sport = :${port}" 2>/dev/null '
+        '    | grep -o "pid=[0-9]\\+" '
+        "    | cut -d= -f2 "
+        "    | sort -u "
+        '    | tr "\\n" " "); '
+        "fi; "
+        'if [[ -n "${PIDS_BY_PORT:-}" ]]; then '
+        "  kill ${PIDS_BY_PORT} >/dev/null 2>&1 || true; "
+        "  sleep 2; "
+        "  for pid in ${PIDS_BY_PORT}; do "
+        '    if kill -0 "${pid}" >/dev/null 2>&1; then '
+        '      kill -9 "${pid}" >/dev/null 2>&1 || true; '
+        "    fi; "
+        "  done; "
         "fi; "
         "PIDS=$(ps -ef | awk "
         f"'/[s]glang\\.launch_server/ && /--port {config.workload.instance_port}/ {{print $2}}'"
         "); "
         'if [[ -n "${PIDS:-}" ]]; then '
-        '  kill ${PIDS} >/dev/null 2>&1 || true; '
+        "  kill ${PIDS} >/dev/null 2>&1 || true; "
         "  sleep 2; "
-        '  for pid in ${PIDS}; do '
+        "  for pid in ${PIDS}; do "
         '    if kill -0 "${pid}" >/dev/null 2>&1; then '
         '      kill -9 "${pid}" >/dev/null 2>&1 || true; '
         "    fi; "
@@ -1551,7 +1856,9 @@ def main() -> None:
                 negative_tags=spec.negative_tags,
                 rdma=worker_rdma[spec.index],
             )
-            for spec, info, launched in zip(worker_specs, worker_infos, launched_workers, strict=True)
+            for spec, info, launched in zip(
+                worker_specs, worker_infos, launched_workers, strict=True
+            )
         ]
         write_json(
             paths.worker_inventory_path,
@@ -1597,10 +1904,9 @@ def main() -> None:
                 paths=paths,
                 global_store_config_path=generated_tensorcast_configs["global"],
                 runtime_home=global_runtime_home,
+                listen_host=service_host_ip,
             )
-            global_store_address = (
-                f"{service_host_ip}:{config.backend_config.tensorcast.global_store_port}"
-            )
+            global_store_address = f"{service_host_ip}:{config.backend_config.tensorcast.global_store_port}"
             for index, process_name in enumerate(worker_processes):
                 runtime_home = build_tensorcast_runtime_home(
                     paths,
@@ -1612,10 +1918,12 @@ def main() -> None:
                     config,
                     process_name,
                     paths=paths,
+                    worker_index=index,
                     daemon_config_path=generated_tensorcast_configs[f"daemon_{index}"],
                     runtime_home=runtime_home,
                     global_store_address=global_store_address,
                     rdma_env=rdma_env_by_worker[index],
+                    listen_host=worker_infos[index].ip,
                 )
             tensorcast_backend_extra_config = build_tensorcast_backend_extra_config(
                 config=config
@@ -1682,6 +1990,7 @@ def main() -> None:
             max_prompt_chars=config.workload.max_prompt_chars,
             rps=config.workload.rps,
             settle_ms=config.workload.settle_ms,
+            reuse_interval_ms=config.workload.reuse_interval_ms,
             max_new_tokens=config.workload.max_new_tokens,
             temperature=config.workload.temperature,
             request_timeout_s=config.workload.request_timeout_s,
@@ -1699,7 +2008,9 @@ def main() -> None:
                     worker_ip=info.ip,
                     worker_node=info.node,
                     instance_url=f"http://{info.ip}:{config.workload.instance_port}",
-                    instance_log_path=str(worker_log_path(paths, index, "sglang_instance")),
+                    instance_log_path=str(
+                        worker_log_path(paths, index, "sglang_instance")
+                    ),
                 )
                 for index, (process_name, info) in enumerate(
                     zip(worker_processes, worker_infos, strict=True)
@@ -1724,15 +2035,23 @@ def main() -> None:
                     paths=paths,
                     worker_index=index,
                 )
-            if config.backend == "tensorcast" and tensorcast_runtime_homes[index] is not None:
+            if (
+                config.backend == "tensorcast"
+                and tensorcast_runtime_homes[index] is not None
+            ):
                 with contextlib.suppress(Exception):
                     stop_tensorcast_daemon(
                         config,
                         process_name,
                         paths=paths,
+                        worker_index=index,
                         runtime_home=tensorcast_runtime_homes[index],
                     )
-        if config.backend == "tensorcast" and global_runtime_home is not None and worker_processes:
+        if (
+            config.backend == "tensorcast"
+            and global_runtime_home is not None
+            and worker_processes
+        ):
             with contextlib.suppress(Exception):
                 stop_global_store(
                     config,
@@ -1761,11 +2080,15 @@ def main() -> None:
             if global_runtime_home is not None:
                 copy_tensorcast_runtime_stdio_logs(
                     runtime_home=global_runtime_home,
-                    log_dir=worker_log_dir(paths, config.workers.service_host_worker_index),
+                    log_dir=worker_log_dir(
+                        paths, config.workers.service_host_worker_index
+                    ),
                     name="tensorcast_global_store",
                 )
         if not config.workers.keep_workers:
-            for process_name, launched in zip(worker_processes, launched_workers, strict=True):
+            for process_name, launched in zip(
+                worker_processes, launched_workers, strict=True
+            ):
                 if not launched:
                     continue
                 with contextlib.suppress(Exception):

@@ -17,7 +17,11 @@ from tensorcast_benchmark.kv.share_remote.models import (
     ShareRemoteDriverConfig,
     ShareRemoteRunSummary,
 )
-from tensorcast_benchmark.kv.share_remote.outputs import load_yaml, write_json, write_jsonl
+from tensorcast_benchmark.kv.share_remote.outputs import (
+    load_yaml,
+    write_json,
+    write_jsonl,
+)
 
 
 def _mean(values: list[float]) -> float | None:
@@ -58,7 +62,9 @@ def parse_args() -> ShareRemoteDriverConfig:
     return ShareRemoteDriverConfig.model_validate(payload)
 
 
-def _build_request_id(run_id: str, prompt_id: str, group_index: int, position: int) -> str:
+def _build_request_id(
+    run_id: str, prompt_id: str, group_index: int, position: int
+) -> str:
     return f"share-remote:{run_id}:{prompt_id}:group{group_index}:pos{position}"
 
 
@@ -154,7 +160,9 @@ def _build_group_result(
     group_index: int,
     instance_results: list[InstanceRequestResult],
 ) -> PromptGroupResult:
-    ordered_results = tuple(sorted(instance_results, key=lambda result: result.position))
+    ordered_results = tuple(
+        sorted(instance_results, key=lambda result: result.position)
+    )
     first_failure = next(
         (result for result in ordered_results if not result.success),
         None,
@@ -171,6 +179,12 @@ def _build_group_result(
         status=status,
         error_message=error_message,
     )
+
+
+def _position_start_delay_ms(config: ShareRemoteDriverConfig, position: int) -> int:
+    if position == 0:
+        return 0
+    return config.settle_ms + ((position - 1) * config.reuse_interval_ms)
 
 
 async def _run_prompt_group(
@@ -192,7 +206,8 @@ async def _run_prompt_group(
                 group_index=group_index,
                 position=position,
                 sampling_params=sampling_params,
-                scheduled_start_s=group_start_s + (position * config.settle_ms / 1000.0),
+                scheduled_start_s=group_start_s
+                + (_position_start_delay_ms(config, position) / 1000.0),
             )
         )
         for position, target in enumerate(config.instance_targets)
@@ -264,7 +279,9 @@ def _collect_position_improvements(
         for instance_result in result.instance_results[1:]:
             if instance_result.ttft_ms is None:
                 continue
-            values[instance_result.position].append(first.ttft_ms - instance_result.ttft_ms)
+            values[instance_result.position].append(
+                first.ttft_ms - instance_result.ttft_ms
+            )
     return values
 
 
@@ -349,6 +366,7 @@ async def run_driver(config: ShareRemoteDriverConfig) -> None:
         worker_count=len(config.instance_targets),
         service_host_worker_index=config.service_host_worker_index,
         prompt_count=len(results),
+        reuse_interval_ms=config.reuse_interval_ms,
         avg_prompt_length=_mean([result.prompt_length for result in results]),
         successful_prompt_groups=sum(result.status == "success" for result in results),
         failed_prompt_groups=sum(result.status != "success" for result in results),
@@ -363,7 +381,9 @@ async def run_driver(config: ShareRemoteDriverConfig) -> None:
         ),
         log_dir=str(Path(config.summary_json_path).parent / "logs"),
         results_json_path=config.results_json_path,
-        worker_processes=tuple(target.worker_process for target in config.instance_targets),
+        worker_processes=tuple(
+            target.worker_process for target in config.instance_targets
+        ),
         worker_hosts=tuple(target.worker_host for target in config.instance_targets),
         worker_ips=tuple(target.worker_ip for target in config.instance_targets),
         worker_nodes=tuple(target.worker_node for target in config.instance_targets),

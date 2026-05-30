@@ -8,6 +8,16 @@ uv_cmd() {
   "$UV_BIN" run --active --no-project --offline "$@"
 }
 
+bounded_uv_cmd() {
+  local timeout_s="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${timeout_s}s" "$UV_BIN" run --active --no-project --offline "$@"
+  else
+    "$UV_BIN" run --active --no-project --offline "$@"
+  fi
+}
+
 configure_cuda_runtime() {
   local cuda_home="$1"
   local extra_lib_dirs="$2"
@@ -44,7 +54,10 @@ case "$subcommand" in
     uv_cmd tensorcast-cli global start --config="$config_path"
     ;;
   stop-global)
-    uv_cmd tensorcast-cli global stop
+    stop_timeout_s="${1:-45}"
+    if ! bounded_uv_cmd "$stop_timeout_s" tensorcast-cli global stop >/dev/null 2>&1; then
+      uv_cmd tensorcast-cli global stop --force >/dev/null 2>&1 || true
+    fi
     ;;
   status-global)
     uv_cmd tensorcast-cli global status
@@ -79,7 +92,10 @@ PY
       --global-store-address "$global_store_address"
     ;;
   stop-daemon)
-    uv_cmd tensorcast-cli daemon stop
+    stop_timeout_s="${1:-45}"
+    if ! bounded_uv_cmd "$stop_timeout_s" tensorcast-cli daemon stop >/dev/null 2>&1; then
+      uv_cmd tensorcast-cli daemon stop --force >/dev/null 2>&1 || true
+    fi
     ;;
   status-daemon)
     uv_cmd tensorcast-cli daemon status

@@ -158,6 +158,14 @@ backend_config:
     daemon_port_base: 50052
     daemon_p2p_port_base: 65090
     byte_artifact_shard_count: 8
+    route_staleness_budget_s: 5.0
+    worker_directory_staleness_budget_s: 30.0
+    max_batch_payload_bytes: 0
+    max_batch_items: 0
+    stable_local_mr_reuse_chunk_slots: 32
+    stable_local_mr_reuse_prewarm_workers: 1
+    source_publish_prereg_enabled: true
+    source_publish_prereg_ttl_s: 60.0
   mooncake:
     master_port: 60051
     http_metadata_server_port: 8080

@@ -38,7 +38,9 @@ class WorkerEntry(BaseModel):
         default_shape: WorkerShape,
         process_name_override: str = "",
     ) -> "ResolvedWorkerSpec":
-        effective_process_name = process_name_override.strip() or self.process_name.strip()
+        effective_process_name = (
+            process_name_override.strip() or self.process_name.strip()
+        )
         return ResolvedWorkerSpec(
             index=index,
             process_name=effective_process_name,
@@ -86,11 +88,11 @@ class WorkersConfig(BaseModel):
     @model_validator(mode="after")
     def validate_worker_layout(self) -> "WorkersConfig":
         if not self.entries and self.count <= 0:
-            raise ValueError("workers.count must be positive when workers.entries is empty")
-        if self.entries and self.count not in (0, len(self.entries)):
             raise ValueError(
-                "workers.count must be 0 or equal to len(workers.entries)"
+                "workers.count must be positive when workers.entries is empty"
             )
+        if self.entries and self.count not in (0, len(self.entries)):
+            raise ValueError("workers.count must be 0 or equal to len(workers.entries)")
         resolved_count = self.resolved_count()
         if len(self.existing_worker_processes) > resolved_count:
             raise ValueError(
@@ -146,8 +148,7 @@ class BrainctlConfig(BaseModel):
     )
     private_machine: str = "group"
     mount: str = (
-        "juicefs+s3://oss.i.shaipower.com/step2-alignment-jfs:"
-        "/mnt/step2-alignment-jfs"
+        "juicefs+s3://oss.i.shaipower.com/step2-alignment-jfs:/mnt/step2-alignment-jfs"
     )
     max_wait_duration: str = "10m"
     worker_ready_timeout_s: float = Field(default=900.0, gt=0.0)
@@ -176,6 +177,7 @@ class WorkloadConfig(BaseModel):
     prompt_count: int = Field(default=10, ge=1)
     rps: float = Field(default=0.5, gt=0.0)
     settle_ms: int = Field(default=20_000, ge=0)
+    reuse_interval_ms: int = Field(default=5_000, ge=0)
     max_new_tokens: int = Field(default=32, ge=1)
     temperature: float = Field(default=0.0, ge=0.0)
     data_path: str = (
@@ -202,10 +204,7 @@ class WorkloadConfig(BaseModel):
         dataset_path = Path(self.data_path).expanduser()
         if not dataset_path.is_file():
             raise ValueError(f"workload.data_path does not exist: {self.data_path}")
-        if (
-            self.max_prompt_chars > 0
-            and self.max_prompt_chars < self.min_prompt_chars
-        ):
+        if self.max_prompt_chars > 0 and self.max_prompt_chars < self.min_prompt_chars:
             raise ValueError(
                 "workload.max_prompt_chars must be 0 or greater than or equal to "
                 "workload.min_prompt_chars"
@@ -226,14 +225,40 @@ class TensorcastBackendConfig(BaseModel):
     nvidia_lib_dirs: str = "/usr/local/cuda-12.9/compat:/usr/local/nvidia/lib64"
     daemon_stable_bytes: str = "64GB"
     byte_artifact_shard_count: int = Field(default=8, ge=1)
+    route_staleness_budget_s: float = Field(default=5.0, gt=0.0)
     byte_artifact_lease_ttl_s: float = Field(default=30.0, gt=0.0)
     byte_artifact_keepalive_interval_s: float = Field(default=10.0, gt=0.0)
+    worker_directory_staleness_budget_s: float = Field(default=30.0, gt=0.0)
     payload_max_chunk_bytes: int = Field(default=(1 << 20), ge=1)
-    max_batch_payload_bytes: int = Field(default=(16 << 20), ge=1)
+    max_batch_payload_bytes: int = Field(default=0, ge=0)
+    max_batch_items: int = Field(default=0, ge=0)
+    enable_stable_local_mr_reuse: bool = True
+    stable_local_mr_reuse_chunk_slots: int = Field(default=32, ge=1)
+    stable_local_mr_reuse_prewarm_workers: int | None = Field(default=1, ge=0)
+    stable_local_mr_reuse_eager_prereg_all_rails: bool | None = None
+    source_publish_prereg_enabled: bool = True
+    source_publish_prereg_ttl_s: float = Field(default=60.0, gt=0.0)
+    source_publish_prereg_max_live_entries: int = Field(default=4096, ge=1)
+    source_publish_prereg_max_live_bytes: int = Field(default=(16 << 30), ge=1)
     prefetch_threshold: int = Field(default=1, ge=1)
     host_allocator_enabled: bool = True
     host_allocator_region_ttl_ms: int = Field(default=0, ge=0)
     host_allocator_region_name: str = "sglang_tensorcast_host_pool"
+
+    @model_validator(mode="after")
+    def validate_stable_local_mr_reuse_prewarm(self) -> "TensorcastBackendConfig":
+        if (
+            self.stable_local_mr_reuse_prewarm_workers is not None
+            and self.stable_local_mr_reuse_eager_prereg_all_rails is not None
+        ):
+            workers_enabled = self.stable_local_mr_reuse_prewarm_workers > 0
+            if workers_enabled != self.stable_local_mr_reuse_eager_prereg_all_rails:
+                raise ValueError(
+                    "backend_config.tensorcast.stable_local_mr_reuse_prewarm_workers "
+                    "conflicts with deprecated alias "
+                    "backend_config.tensorcast.stable_local_mr_reuse_eager_prereg_all_rails"
+                )
+        return self
 
 
 class MooncakeBackendConfig(BaseModel):
@@ -309,7 +334,9 @@ class ShareRemoteBenchmarkConfig(BaseModel):
                 raise ValueError(
                     "backend_config.mooncake.protocol conflicts with transport.use_rdma"
                 )
-        needs_launch = any(not spec.process_name.strip() for spec in resolved_worker_specs)
+        needs_launch = any(
+            not spec.process_name.strip() for spec in resolved_worker_specs
+        )
         if needs_launch and not self.brainctl.charged_group.strip():
             raise ValueError(
                 "brainctl.charged_group is required unless all workers are reused"
@@ -418,6 +445,7 @@ class ShareRemoteDriverConfig(BaseModel):
     max_prompt_chars: int = Field(default=0, ge=0)
     rps: float = Field(gt=0.0)
     settle_ms: int = Field(default=20_000, ge=0)
+    reuse_interval_ms: int = Field(default=5_000, ge=0)
     max_new_tokens: int = Field(ge=1)
     temperature: float = Field(default=0.0, ge=0.0)
     request_timeout_s: float = Field(default=600.0, gt=0.0)
@@ -490,6 +518,7 @@ class ShareRemoteRunSummary(BaseModel):
     worker_count: int
     service_host_worker_index: int
     prompt_count: int
+    reuse_interval_ms: int
     avg_prompt_length: float | None = None
     successful_prompt_groups: int
     failed_prompt_groups: int
