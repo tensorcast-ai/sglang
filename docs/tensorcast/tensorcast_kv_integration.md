@@ -786,6 +786,52 @@ Pinned-host operational policy:
 - and each TP rank SHOULD manage its own independently exported slab because
   HiCache residency and allocator state are rank-local.
 
+Daemon-side RDMA target-window registration policy:
+
+- for RDMA `batch_get_v1(...)` into one exported long-lived `HOST_SHARED` slab,
+  Tensorcast SHOULD treat that slab as one stable local backing object on the
+  target side,
+- stable local backing remains slab-scoped semantically, but daemon-side RDMA
+  MR reuse SHOULD be registration-chunk-scoped operationally,
+- for allocator-backed KV slabs, Tensorcast SHOULD NOT preregister the full
+  slab as one MR for sink-side direct-write reuse; that whole-slab geometry was
+  measured to regress RDMA batch-get completion latency on large slabs,
+- the accepted policy is slab-scoped stable backing plus a lazy rail-local
+  registration-chunk MR cache, where registration chunks are fixed-width and
+  slot-aligned inside the slab,
+- first cut chunk sizing SHOULD be configurable from daemon YAML through
+  `communicator.rdma.stable_local_mr_reuse_chunk_slots`, default `1`,
+- on one issued request, the daemon SHOULD ensure only the chunk set overlapped
+  by the requested destination windows on the selected rail and reuse those
+  chunk MRs across later requests on that rail,
+- the requested destination window remains request-scoped `ptr + length` inside
+  that slab; chunked MR reuse does **not** change page identity,
+  routing truth, or permit a remote daemon to push writes directly into SGLang
+  memory,
+- if chunk registration or lookup fails on the selected rail, the slab remains
+  a valid `HOST_SHARED` KV slab and correctness is unchanged, but the daemon
+  SHOULD fall back to request-scoped target-window registration for that
+  request before issue,
+- and this optimization is distinct from `cudaHostRegister(...)`: the former is
+  daemon-side RDMA MR reuse for sink windows, while the latter is SGLang-side
+  host pinning for later `L2(host) -> L1(device)` copy-back.
+
+Accepted first-cut daemon YAML surface:
+
+```yaml
+communicator:
+  enable_rdma: true
+  rdma:
+    enable_stable_local_mr_reuse: true
+    stable_local_mr_reuse_chunk_slots: 1  # default
+    stable_local_mr_reuse_prewarm_workers: 0  # default disabled; >0 enables async one-job-per-visible-rail prewarm
+```
+
+`stable_local_mr_reuse_eager_prereg_all_rails` is now a deprecated
+backward-compatible alias for old configs. When
+`stable_local_mr_reuse_prewarm_workers` is unset, alias `true` maps to
+`prewarm_workers=1` and alias `false` maps to `0`.
+
 ##### Host-slab and slot residency state machine
 
 For allocator-backed direct residency, one allocator slot is the ownership
@@ -920,14 +966,18 @@ Slab teardown order:
    `PutInFlight`.
 3. Remove or retire any remaining resident slots from radix-visible state.
 4. Bump generation for every retired slot that will re-enter the free pool.
-5. If the mapping was host-registered, perform `cudaHostUnregister(...)` on the
+5. Coordinate with the local Tensorcast daemon to quiesce any in-flight RDMA
+   reads that target this slab and deregister any activated registration-chunk
+   MRs for that slab on the rails that use them.
+6. If the mapping was host-registered, perform `cudaHostUnregister(...)` on the
    local mapping.
-6. Unmap the memfd from the SGLang rank.
-7. Release the local slab lease so the daemon may reap the slab.
+7. Unmap the memfd from the SGLang rank.
+8. Release the local slab lease so the daemon may reap the slab.
 
 This order is normative for allocator-backed direct host residency because
 reversing it can leave pinned or in-flight slot references pointing at unmapped
-or re-exported host memory.
+or re-exported host memory, or leave daemon-side chunk MRs alive after the
+slab has been retired from service.
 
 Remaining follow-up work after the current implementation is narrower:
 
