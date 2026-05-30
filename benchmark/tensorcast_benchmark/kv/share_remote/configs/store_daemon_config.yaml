@@ -253,6 +253,14 @@ communicator:
     # Multi-QP configuration for high-throughput scenarios
     qp_count: 1  # Number of QPs per transport (1-16, default: 1)
     bonding_balance: false  # Enable LAG port balancing (default: false)
+    # Reuse preregistered stable local MRs for read_plan target windows when available.
+    # Disable only for A/B or debugging request-scoped MR registration behavior.
+    enable_stable_local_mr_reuse: true
+    # Slot-aligned MR reuse chunk size for stable local backing.
+    stable_local_mr_reuse_chunk_slots: 32
+    # Async all-rail chunk prewarm. Unset or 0 disables; values >0 enable one
+    # prewarm job per visible rail on a bounded communicator-local worker pool.
+    stable_local_mr_reuse_prewarm_workers: 1
   transport:
     # TCP connections per peer; more lanes help bandwidth but add CPU overhead.
     tcp_conn_count: 8
@@ -336,3 +344,38 @@ debug:
   cuda:
     # Same-process CUDA IPC fallback for tests; breaks real IPC semantics across processes.
     enable_same_process_ipc_fallback: false
+
+# Byte-artifact routing and payload transport defaults used by the share_remote benchmark.
+byte_artifact_routing:
+  # Number of routing shards used for authority fanout.
+  shard_count: 8
+  # How long route resolution can be reused before forcing a refresh.
+  route_staleness_budget: 5s
+  # Lease TTL for published byte-artifact routes.
+  lease_ttl: 30s
+  # Keepalive cadence for refreshing active route leases.
+  keepalive_interval: 10s
+  # Worker-directory cache freshness budget used before refetching active workers.
+  worker_directory_staleness_budget: 30s
+  payload_transport:
+    # Per-transport chunk size limit used when segmenting payloads.
+    max_chunk_bytes: 1048576
+    # Batch transport protocol revision.
+    batch_transport_protocol_version: 2
+    # Use communicator/materialize source export paths when available.
+    communicator_source_enabled: true
+    # Allow host-memory export for direct-write-capable CPU paths.
+    host_memory_export_enabled: true
+    # 0 means no payload-size cap at the benchmark layer.
+    max_batch_payload_bytes: 0
+    # 0 means no per-batch item-count cap at the benchmark layer.
+    max_batch_items: 0
+    source_publish_prereg:
+      # Pre-register publish-time exports so later batch_get can reuse them directly.
+      enabled: true
+      # Keep preregistered exports alive long enough for the delayed consumer phase.
+      ttl: 60s
+      # Cap live preregistered export entries to avoid unbounded retention.
+      max_live_entries: 4096
+      # Cap total bytes retained by live preregistered exports.
+      max_live_bytes: 17179869184
