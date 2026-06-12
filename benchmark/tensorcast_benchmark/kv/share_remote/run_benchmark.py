@@ -596,6 +596,67 @@ def derive_remote_rdma_info(
     )
 
 
+def _hca_sort_key(name: str) -> int:
+    return int(name.split("_", maxsplit=1)[1])
+
+
+def _parse_hca_names(raw_value: str) -> set[str]:
+    return {name.strip() for name in raw_value.split(",") if name.strip()}
+
+
+def apply_common_hca_intersection(
+    worker_rdma: list[WorkerRDMAInfo | None],
+) -> list[str] | None:
+    """Force every worker onto the intersection of their derived HCA name sets.
+
+    H800 hosts here can have heterogeneous NIC naming topologies (e.g.
+    mlx5_0,1,2,3,4,6,7,8 vs mlx5_0,3,4,5,6,7,8,9). Cross-node RDMA QP pairing
+    requires both ends to enumerate the same rail set, so we rewrite
+    NCCL_IB_HCA and the preferred device on every worker to the common subset.
+    Returns the sorted intersection, or None when no rewrite is needed.
+    """
+    present = [info for info in worker_rdma if info is not None]
+    if len(present) < 2:
+        return None
+    hca_sets = [_parse_hca_names(info.nccl_ib_hca_raw) for info in present]
+    if any(not names for names in hca_sets):
+        return None
+    intersection = set.intersection(*hca_sets)
+    if not intersection:
+        per_worker = "; ".join(
+            ",".join(sorted(names, key=_hca_sort_key)) for names in hca_sets
+        )
+        raise RuntimeError(
+            "RDMA HCA intersection across workers is empty; cannot establish "
+            f"cross-node RDMA. Per-worker HCA sets: {per_worker}"
+        )
+    ordered = sorted(intersection, key=_hca_sort_key)
+    if all(names == intersection for names in hca_sets):
+        return ordered
+    exact = _to_exact_match_hca(",".join(ordered))
+    for index, info in enumerate(worker_rdma):
+        if info is None:
+            continue
+        preferred = info.preferred_ib_device.strip()
+        if preferred not in intersection:
+            preferred = next(
+                (
+                    candidate.hca_name
+                    for candidate in info.gpu_candidates
+                    if candidate.hca_name in intersection
+                ),
+                ordered[0],
+            )
+        worker_rdma[index] = info.model_copy(
+            update={
+                "nccl_ib_hca_raw": ",".join(ordered),
+                "nccl_ib_hca_exact": exact,
+                "preferred_ib_device": preferred,
+            }
+        )
+    return ordered
+
+
 def capture_remote_rdma_inventory(
     config: ShareRemoteBenchmarkConfig,
     worker_process: str,
@@ -1691,6 +1752,11 @@ def build_rdma_env(
     return {
         "NCCL_SOCKET_IFNAME": worker_rdma.socket_ifname,
         "NCCL_IB_HCA": worker_rdma.nccl_ib_hca_exact,
+        # Constrain the tensorcast daemon's RDMA data plane to the same
+        # intersection rails as NCCL. Without this the daemon enumerates all
+        # visible devices and pairs rails by intrinsic index, so non-shared
+        # rails on heterogeneous-HCA hosts fail to connect.
+        "TENSORCAST_IB_HCA": worker_rdma.nccl_ib_hca_exact,
         "NCCL_IB_GID_INDEX": str(rdma_gid_index),
         "NCCL_SOCKET_FAMILY": "AF_INET",
         "MASTER_ADDR": master_addr,
@@ -1818,6 +1884,19 @@ def main() -> None:
                 f"Worker {spec.index} RDMA: socket_ifname={worker_rdma[spec.index].socket_ifname} "
                 f"nccl_ib_hca={worker_rdma[spec.index].nccl_ib_hca_exact}"
             )
+
+        if config.transport.use_rdma:
+            common_hcas = apply_common_hca_intersection(worker_rdma)
+            if common_hcas is not None:
+                log(f"RDMA common HCA set across workers: {','.join(common_hcas)}")
+                for index, info in enumerate(worker_rdma):
+                    if info is None:
+                        continue
+                    log(
+                        f"Worker {index} RDMA (intersected): "
+                        f"nccl_ib_hca={info.nccl_ib_hca_exact} "
+                        f"preferred_ib_device={info.preferred_ib_device}"
+                    )
 
         if config.workers.rdma_required and config.transport.rdma_smoke_mode == "star":
             for target_index in range(1, len(worker_specs)):

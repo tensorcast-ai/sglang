@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
-from enum import StrEnum
+from enum import Enum
+
+class StrEnum(str, Enum):
+    pass
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 

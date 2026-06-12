@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum
 
 
-class HostSharedPageSlotState(StrEnum):
+class HostSharedPageSlotState(str, Enum):
     SLOT_FREE = "slot_free"
     SLOT_RESERVED = "slot_reserved"
     GET_IN_FLIGHT = "get_in_flight"
