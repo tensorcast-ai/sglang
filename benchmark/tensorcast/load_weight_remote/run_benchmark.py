@@ -924,6 +924,7 @@ def build_parser(default_global_cfg: Path, default_daemon_cfg: Path) -> argparse
     parser.add_argument("--brainctl-max-wait-duration", default="10m")
     parser.add_argument("--tensorcast-global-store-config", default=str(default_global_cfg))
     parser.add_argument("--tensorcast-daemon-config", default=str(default_daemon_cfg))
+    parser.add_argument("--tensorcast-daemon-port", type=int, default=50052)
     parser.add_argument("--tensorcast-service-ready-timeout-s", type=float, default=120.0)
     parser.add_argument("--tensorcast-service-poll-interval-s", type=float, default=2.0)
     parser.add_argument("--tensorcast-cuda-home", default="/usr/local/cuda-12.4")
@@ -993,6 +994,7 @@ def parse_config(paths: BenchmarkPaths) -> BenchmarkConfig:
         worker_b_positive_tags=args.worker_b_positive_tags,
         tensorcast_global_store_config=args.tensorcast_global_store_config,
         tensorcast_daemon_config=args.tensorcast_daemon_config,
+        tensorcast_daemon_port=args.tensorcast_daemon_port,
         tensorcast_service_ready_timeout_s=args.tensorcast_service_ready_timeout_s,
         tensorcast_service_poll_interval_s=args.tensorcast_service_poll_interval_s,
         tensorcast_cuda_home=args.tensorcast_cuda_home,

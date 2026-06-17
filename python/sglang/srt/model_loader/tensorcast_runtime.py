@@ -16,7 +16,6 @@ _INIT_KWARGS: dict[str, Any] | None = None
 
 if TYPE_CHECKING:
     from tensorcast.api.store.artifact import Artifact
-    from tensorcast.api.store.types import FallbackOptions
 
 
 class TensorcastExtraConfig(BaseModel):
@@ -163,18 +162,6 @@ def ensure_tensorcast_runtime_initialized(extra_config: dict[str, Any]) -> None:
         ) from last_exc
 
 
-def build_tensorcast_fallback_options(extra_config: dict[str, Any]) -> "FallbackOptions":
-    import tensorcast as tc
-
-    cfg = parse_tensorcast_extra_config(extra_config)
-    return tc.FallbackOptions(
-        prefer=cfg.tensorcast_fallback_prefer,
-        allow_p2p=cfg.tensorcast_allow_p2p_fallback,
-        allow_disk=cfg.tensorcast_allow_disk_fallback,
-        verify_checksums=cfg.tensorcast_verify_checksums,
-    )
-
-
 def build_tensorcast_call_context(extra_config: dict[str, Any]) -> Any | None:
     import tensorcast as tc
 
@@ -258,9 +245,8 @@ def open_tensorcast_artifact_by_key(
     import tensorcast as tc
 
     ensure_tensorcast_runtime_initialized(extra_config)
-    fallback = build_tensorcast_fallback_options(extra_config)
 
-    artifact = tc.artifact(key=str(artifact_key), fallback=fallback)
+    artifact = tc.artifact(key=str(artifact_key))
     artifact.describe()
     return artifact
 
@@ -386,5 +372,4 @@ def open_tensorcast_artifact_for_bootstrap(
                 f"key={artifact_key!r} path={resolved_path!r}"
             ) from import_exc
 
-        fallback = build_tensorcast_fallback_options(extra_config)
-        return artifact.with_fallback(fallback), True
+        return artifact, True
