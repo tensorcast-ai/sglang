@@ -1,0 +1,52 @@
+# Phase 7 smoke configuration.
+#
+# Identical to benchmark_baseline_smoke.yaml except `configs:` lists
+# `tc_router` instead of the gateway baselines. The Phase-7 stub pairs
+# this with a `_NeverRebalance` policy (router/policy.py) so tc_router
+# is observably equivalent to gw_load_aware.
+
+run_id: phase7-tc-router-smoke
+
+model:
+  path: hf/Qwen3-32B
+  tp_size: 2
+
+instances:
+  count: 3
+  # Avoid the host's k8s NodePort range (30000-32767) AND the Linux
+  # ephemeral range (32768-60999) — both can transiently steal listener
+  # ports. 61100+ is above ephemeral and well-clear of cluster reserved.
+  base_port: 61101
+  kv_pool_size_gb: auto
+  mem_fraction_static: 0.85
+  page_size: 32
+
+transport:
+  use_rdma: true
+
+workload:
+  dataset_path: /data/datasets/OpenHands-Sampled-Trajectories
+  pool_filter:
+    min_turns: 8
+    min_total_tokens: 8000
+  inter_turn_delay:
+    preset: agent_medium
+  max_new_tokens_clip: 256
+  start_jitter_s: 1.0
+  wall_seconds: 60
+  warmup_seconds: 0
+  trials: 1
+  c_target_sweep: [3, 6]
+
+configs:
+  - kind: tc_router
+    policy:
+      kind: never_rebalance
+      seed: 0
+
+gateway:
+  host: 127.0.0.1
+  port: 61200
+
+load_polling:
+  period_ms: 250

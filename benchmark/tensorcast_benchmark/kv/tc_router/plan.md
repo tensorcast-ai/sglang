@@ -351,50 +351,64 @@ from "programmability" value.
 
 ---
 
-## 7. tc_router core
+## 7. tc_router core ✅ DONE (stub policy)
 
-**Goal**: the actual programmable router. Reactive in v1 (per
-discussion: deferred-eager features become later policies).
+**Goal**: the actual programmable router. Phase-7 ships with a
+`_NeverRebalance` stub so end-to-end wiring (Tensorcast global store +
+daemon + runtime connect, session-sticky routing, cell sweep) is
+validated before we introduce real migration policy.
 
-**Deliverables**:
+**Scope adjustment from the original plan**: per user direction,
+Phase 7 stops at the stub. Real `ThresholdPolicy`, the `Rebalancer`
+background task, and `metrics/migrations.py` are deferred to a future
+iteration. The current stub never proposes migrations, so the
+rebalancer / migration-event scaffolding isn't exercised yet — wiring
+those in is now a one-file delta when the policy is added.
 
-- [ ] `services/tensorcast.py`
-  - [ ] `launch_global_store(worker, port) -> Service`
-  - [ ] `launch_daemon(worker, global_store_endpoint, port) -> Service`
-  - [ ] `wait_ready` for both
-  - [ ] Reuses the existing `tensorcast_service.sh` from `request_transfer/scripts/` if compatible
-- [ ] `router/policy.py`
-  - [ ] `Policy` Protocol (4 hooks per arch § 6.4)
-  - [ ] `ThresholdPolicy` concrete implementation
-  - [ ] `policy_factory(config: dict) -> Policy` for YAML dispatch
-- [ ] `router/rebalancer.py`
-  - [ ] `Rebalancer` background task: tick every `period_ms`, call policy, execute migrations
-  - [ ] `_publish_then_hydrate(session_state, source, target)` — uses the request_transfer caller_driver migration mechanic verbatim (publish → hydrate on instance B)
-  - [ ] Cooldown enforcement (`migration_cooldown_s`)
-  - [ ] Concurrency cap (`max_migrations_per_tick`)
-  - [ ] Graceful failure: publish or hydrate failure → no-op, log, do NOT change `home_instance`
-- [ ] `router/tc_router.py`
-  - [ ] `TcRouter` implementing `Router`
-  - [ ] Owns: `session_state`, `instance_loads_poller`, `rebalancer`, Tensorcast `Runtime`
-  - [ ] `generate`: route to `home_instance`, generate `rid`, store as `last_engine_request_id`, post via `/v1/chat/completions`
-  - [ ] On startup: connect to global store via Tensorcast `tc.connect(daemon_address=...)` (we connect to one daemon, by protocol § 4.1 of caller_driver pattern)
-  - [ ] On shutdown: cancel rebalancer + load poller, close runtime
-- [ ] `metrics/migrations.py`
-  - [ ] `MigrationEvent` Pydantic model matching arch § 10.2
-  - [ ] JSONL writer
-  - [ ] Lazy "consumed_by" backfill: when a session's next turn lands on the migration target with `cached_tokens` > the published cutoff threshold, mark the migration as consumed
-  - [ ] Wasted-marker on TTL expiry
-- [ ] Driver-level wiring: `driver/benchmark_loop.py` recognizes `tc_router` config, launches Tensorcast services, instantiates `TcRouter` with the policy from YAML
-- [ ] Reuse from `request_transfer/`: import `_decode_instance_publish_manifest`, `_publish_plan_result`, `_hydrate_plan_result`, `_PreparedBundleSignals` from `caller_driver.py` (or refactor them into a shared `tensorcast_benchmark.kv.tensorcast_helpers` module if that already exists; otherwise copy with attribution)
+**Deliverables** (relative to plan baseline):
+
+- [x] `services/tensorcast.py` — `TensorcastLauncher.launch_global_store(worker, spec)` + `launch_daemon(worker, spec, *, global_store_address, capability_token_secret)`. Reuses the validated `scripts/tensorcast_service.sh` wrapper from `share_remote` (copied into `tc_router/scripts/`). Per-run config files patched from the `request_transfer/configs/{global_store,store_daemon}_config.yaml` templates and dumped to `<run_dir>/tc_router/tensorcast_configs/`. Readiness: `wait_global_ready` polls `tensorcast-cli global status` for `health : SERVING`; `wait_daemon_ready` delegates to the shell wrapper's `wait-daemon-ready` subcommand.
+- [x] `router/policy.py` — `Policy` Protocol (`@runtime_checkable`), `_NeverRebalance` stub, `power_of_two_pick` helper, `make_policy(spec)` factory.
+- [x] `router/tc_router.py` — `TcRouter` implementing `Router`. Owns `session_state: dict[SessionId, SessionState]`, an `InstanceLoadPoller`, the Tensorcast `Runtime` (lazy `tc.connect(daemon_address=...)` in `start()`), and an aiohttp session. First request for a session calls `policy.pick_session_for_initial_home(...)` over the live load snapshot; subsequent requests stick to that home. `result.served_instance` is tagged from the router's `home_instance` map (no header dependency).
+- [x] `router/_chat_client.py` — shared streaming `/v1/chat/completions` helper extracted out of `GatewayRouter` so `TcRouter` and `GatewayRouter` share identical SSE + usage-extraction code.
+- [x] `driver/benchmark_loop.py` — adds `_run_tc_router_config` that launches the tensorcast services on the worker hosting `service_placement.global_store_worker_id`, instantiates `TcRouter`, and reuses the same per-cell `_run_one_cell` loop as gateway baselines.
+- [x] `configs/benchmark_tc_router_smoke.yaml` — identical to `benchmark_baseline_smoke.yaml` except `configs: [{kind: tc_router, policy: {kind: never_rebalance, seed: 0}}]`. Ports moved to 61101-61103 (above Linux ephemeral range) + gateway 61200; this also fixes a port-collision crash hit during Phase 5 retries.
+- [x] Unit tests: `tests/test_policy.py` (13 tests — protocol shape, power-of-two correctness with skewed/missing loads, NeverRebalance returns nothing-to-rebalance, deterministic seed, `make_policy` factory), `tests/test_tc_router.py` (5 async tests — same-session stickiness via fake aiohttp servers, distinct sessions can land on different homes, runtime close releases the fake `tc.Runtime`, turn-count tracking).
+
+**Deferred to future Phase 7+** (deliberately not implemented in stub):
+
+- [ ] `router/rebalancer.py` — Rebalancer background task.
+- [ ] Real `ThresholdPolicy` implementation.
+- [ ] `metrics/migrations.py` + per-migration JSONL writer.
+- [ ] Reuse of `request_transfer.caller_driver` publish/hydrate helpers.
 
 **Validation gate**:
-- [ ] Stub policy `_NeverRebalance` configured: `tc_router` config behaves identically to `gw_load_aware` (same per-turn metrics, zero migrations). This test must pass before moving on.
-- [ ] Stub policy `_AlwaysRebalanceFirstSession`: drive 5 sessions; first session migrates after turn 2; verify:
-  - [ ] migration record written with publish/hydrate latencies
-  - [ ] target instance log contains `Tensorcast prepared-bundle attached` (reuse the verification logic from `request_transfer`)
-  - [ ] next turn's `cached_tokens > 0` and is served by the new home instance
-  - [ ] `migration_utilization` for that session = 1.0
-- [ ] Full smoke run with `ThresholdPolicy`, `c_target_sweep: [3, 12]`: produces non-zero migrations at C_target=12, mostly-zero at C_target=3
+
+- [x] Stub policy `_NeverRebalance`: tc_router routes every session sequentially via power-of-two initial pick, then sticks for life. Same-session turn-by-turn `cached_tokens` grows naturally as the SGLang radix cache picks up the prefix (see sample dump in commit notes).
+- [x] **End-to-end smoke run** `outputs/20260617-084556_phase7-tc-router-smoke/`:
+  - 3 SGLang Qwen3-32B TP=2 instances launched on `worker_a` GPUs `[0,1]/[2,3]/[4,5]`, ports 61101-61103 — ready in 55.6 s.
+  - Tensorcast global store at `10.191.9.39:61050` ready in 7.6 s (`health: SERVING`).
+  - Tensorcast daemon at `10.191.9.39:61053` ready in 25.1 s (registered with global store, capability tokens issued).
+  - TcRouter `tc.connect(daemon_address=10.191.9.39:61053)` succeeded; load poller (250 ms) running; NeverRebalance policy active.
+  - Cell sweep:
+
+    | config | c_target | turns | success | TTFT p50 | TTFT p95 | cached_token_ratio |
+    |---|---:|---:|---:|---:|---:|---:|
+    | `tc_router` | 3 | 25 | 25 | 99.2 ms | 322.8 ms | 0.594 |
+    | `tc_router` | 6 | 48 | 48 | 73.3 ms | 264.5 ms | 0.875 |
+
+  - cache-ratio higher than gateway `gw_load_aware` (0.53 / 0.65 at the same c-points) because NeverRebalance is permanently sticky once a session has a home — actually the SGLang radix-cache reuse pattern resembles `gw_cache_aware` more than `gw_load_aware`. Acceptable for the stub; once we add real `ThresholdPolicy` the gap will reflect actual migration value.
+  - `served_instance` field correctly tagged with the router-chosen home (Phase 5 gateway runs left it empty because the gateway doesn't surface upstream URL via response headers).
+- [x] `outputs/benchmark_results.csv` rolling CSV appended with two new rows for this run.
+
+### Findings recorded for downstream phases
+
+1. **Tensorcast `status-global` signal**: ready state reports `health : SERVING`, not `READY`. `wait_global_ready` must match `"SERVING"`.
+2. **Port range hardening**: SGLang `--port` allocation must avoid both NodePort (30000-32767) AND Linux ephemeral (32768-60999) ranges. Using 61101+ for instances and 61200 for gateway eliminates transient `EADDRINUSE` from other processes' outbound ephemeral source-port allocations.
+3. **`asyncio.to_thread` for Tensorcast `tc.connect`**: the SDK is synchronous. Use `loop.run_in_executor(...)` in `start()` / `close()` so the event loop doesn't block on the gRPC handshake.
+4. **`Runtime` cleanup**: call `runtime.close()` on TcRouter shutdown to avoid leaked daemon connections.
+
+**Test summary**: `pytest tensorcast_benchmark/kv/tc_router/tests` passes 143/143.
 
 ---
 

@@ -1,0 +1,51 @@
+# Phase 5 smoke configuration.
+#
+# Drives gw_load_aware + gw_cache_aware against an existing cluster YAML.
+# Designed for the single-H800 worker setup: N=3 instances of Qwen3-32B
+# (TP=2 each), all packed onto the same worker (3 * 2 = 6 GPUs of 8).
+#
+# Sweep is intentionally small: 2 c_target points, 1 trial, 60s wall —
+# just enough to validate the full pipeline emits the expected outputs.
+
+run_id: phase5-baseline-smoke
+
+model:
+  path: hf/Qwen3-32B
+  tp_size: 2
+
+instances:
+  count: 3
+  # NodePort range (30000–32767) is reserved on this cluster's hosts; use
+  # 55000+ which share_remote also uses for SGLang serving.
+  base_port: 55001
+  kv_pool_size_gb: auto
+  mem_fraction_static: 0.85
+  page_size: 32
+
+transport:
+  use_rdma: true
+
+workload:
+  dataset_path: /data/datasets/OpenHands-Sampled-Trajectories
+  pool_filter:
+    min_turns: 8
+    min_total_tokens: 8000
+  inter_turn_delay:
+    preset: agent_medium
+  max_new_tokens_clip: 256
+  start_jitter_s: 1.0
+  wall_seconds: 60
+  warmup_seconds: 0
+  trials: 1
+  c_target_sweep: [3, 6]
+
+configs:
+  - kind: gw_load_aware
+  - kind: gw_cache_aware
+
+gateway:
+  host: 127.0.0.1
+  port: 55100
+
+load_polling:
+  period_ms: 250
