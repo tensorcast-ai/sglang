@@ -16,31 +16,28 @@ from tensorcast_benchmark.kv.tc_router.resource.base import (
 
 GOOD_YAML: dict = {
     "provider": {
-        "kind": "brainctl",
-        "namespace": "shai-core",
-        "cli": "brainctl",
-        "user": "alice",
+        "kind": "local",
     },
-    "driver_host": {"scratch_dir": "/mnt/jfs/scratch"},
-    "mount": {"path": "/mnt/jfs"},
+    "driver_host": {"scratch_dir": "/tmp/tc_router/scratch"},
+    "mount": {"path": "/tmp/tc_router"},
     "workers": [
         {
             "id": "worker_a",
-            "address": "10.0.0.1",
+            "address": "127.0.0.1",
             "node": "node-1",
-            "process_handle": "rjob-001",
+            "process_handle": "local-a",
             "gpu_indices": [0, 1],
-            "scratch_dir": "/mnt/jfs/worker_a",
-            "base_env": {"NCCL_IB_HCA": "mlx5_2", "MASTER_ADDR": "10.0.0.1"},
+            "scratch_dir": "/tmp/tc_router/worker_a",
+            "base_env": {},
         },
         {
             "id": "worker_b",
-            "address": "10.0.0.2",
+            "address": "127.0.0.2",
             "node": "node-2",
-            "process_handle": "rjob-002",
+            "process_handle": "local-b",
             "gpu_indices": [0, 1],
-            "scratch_dir": "/mnt/jfs/worker_b",
-            "base_env": {"NCCL_IB_HCA": "mlx5_2", "MASTER_ADDR": "10.0.0.1"},
+            "scratch_dir": "/tmp/tc_router/worker_b",
+            "base_env": {},
         },
     ],
     "service_placement": {
@@ -58,13 +55,12 @@ def _write_yaml(tmp_path: Path, data: dict) -> Path:
 
 def test_load_good_cluster(tmp_path: Path) -> None:
     cfg = load_cluster_config(_write_yaml(tmp_path, GOOD_YAML))
-    assert cfg.provider.kind == "brainctl"
-    assert cfg.provider.user == "alice"
+    assert cfg.provider.kind == "local"
     assert len(cfg.workers) == 2
     assert cfg.workers[0].id == "worker_a"
     assert cfg.workers[0].gpu_indices == (0, 1)
-    assert cfg.workers[0].base_env["NCCL_IB_HCA"] == "mlx5_2"
-    assert cfg.mount.path == "/mnt/jfs"
+    assert cfg.workers[0].base_env == {}
+    assert cfg.mount.path == "/tmp/tc_router"
     assert cfg.service_placement.global_store_worker_id == "worker_a"
 
 
@@ -77,7 +73,7 @@ def test_reject_duplicate_id(tmp_path: Path) -> None:
 
 def test_reject_duplicate_address(tmp_path: Path) -> None:
     bad = copy.deepcopy(GOOD_YAML)
-    bad["workers"][1]["address"] = "10.0.0.1"
+    bad["workers"][1]["address"] = "127.0.0.1"
     with pytest.raises(Exception, match="duplicate worker.address"):
         load_cluster_config(_write_yaml(tmp_path, bad))
 
@@ -89,8 +85,14 @@ def test_reject_duplicate_node(tmp_path: Path) -> None:
         load_cluster_config(_write_yaml(tmp_path, bad))
 
 
-def test_reject_empty_base_env(tmp_path: Path) -> None:
+def test_local_allows_empty_base_env(tmp_path: Path) -> None:
+    cfg = load_cluster_config(_write_yaml(tmp_path, GOOD_YAML))
+    assert cfg.workers[0].base_env == {}
+
+
+def test_reject_empty_base_env_for_non_local(tmp_path: Path) -> None:
     bad = copy.deepcopy(GOOD_YAML)
+    bad["provider"]["kind"] = "legacy_remote"
     bad["workers"][0]["base_env"] = {}
     with pytest.raises(Exception, match="base_env is empty"):
         load_cluster_config(_write_yaml(tmp_path, bad))
@@ -137,12 +139,25 @@ def test_reject_extra_field(tmp_path: Path) -> None:
 
 def test_example_cluster_yaml_loads() -> None:
     """The shipped example YAML must parse cleanly."""
+    example = Path(__file__).parent.parent / "configs" / "cluster_local_h800.yaml"
+    cfg = load_cluster_config(example)
+    assert isinstance(cfg, ClusterConfig)
+    assert len(cfg.workers) == 1
+    assert cfg.provider.kind == "local"
+    assert cfg.workers[0].gpu_indices == tuple(range(8))
+    assert cfg.workers[0].env_path_prepend["LD_LIBRARY_PATH"] == (
+        "/usr/local/cuda-12.8/compat",
+    )
+
+
+def test_no_compat_example_cluster_yaml_loads() -> None:
+    """The TP=1 diagnostic local cluster YAML must parse cleanly."""
     example = (
-        Path(__file__).parent.parent
-        / "configs"
-        / "cluster_brainctl_example.yaml"
+        Path(__file__).parent.parent / "configs" / "cluster_local_h800_no_compat.yaml"
     )
     cfg = load_cluster_config(example)
     assert isinstance(cfg, ClusterConfig)
-    assert len(cfg.workers) == 3
-    assert cfg.provider.kind == "brainctl"
+    assert len(cfg.workers) == 1
+    assert cfg.provider.kind == "local"
+    assert cfg.workers[0].gpu_indices == tuple(range(8))
+    assert cfg.workers[0].env_path_prepend == {}

@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Optional
 
 import pytest
 
@@ -59,7 +58,9 @@ class MockRouter:
         pass
 
 
-def _msg(role: str, content: str = "", tool_calls=None, tool_call_id=None, name=None) -> dict:
+def _msg(
+    role: str, content: str = "", tool_calls=None, tool_call_id=None, name=None
+) -> dict:
     return {
         "role": role,
         "content": content,
@@ -79,7 +80,9 @@ def _tool_call(call_id: str = "c1") -> dict:
     }
 
 
-def _build_pool(n: int, *, num_assistants: int = 4, content_len: int = 200) -> list[Trajectory]:
+def _build_pool(
+    n: int, *, num_assistants: int = 4, content_len: int = 200
+) -> list[Trajectory]:
     pool: list[Trajectory] = []
     for i in range(n):
         messages: list[dict] = [
@@ -88,8 +91,12 @@ def _build_pool(n: int, *, num_assistants: int = 4, content_len: int = 200) -> l
         ]
         for k in range(num_assistants):
             messages.append(_msg("assistant", "", tool_calls=[_tool_call(f"c{k}")]))
-            messages.append(_msg("tool", "t" * content_len, tool_call_id=f"c{k}", name="f"))
-        assistant_idx = tuple(j for j, m in enumerate(messages) if m["role"] == "assistant")
+            messages.append(
+                _msg("tool", "t" * content_len, tool_call_id=f"c{k}", name="f")
+            )
+        assistant_idx = tuple(
+            j for j, m in enumerate(messages) if m["role"] == "assistant"
+        )
         pool.append(
             Trajectory(
                 session_id=f"sess{i}",
@@ -115,7 +122,8 @@ async def test_dry_run_records_turns_per_session() -> None:
     pool = _build_pool(20, num_assistants=4)
 
     # Tiny inter-turn delay so we get several turns per session in 1s.
-    delay = lambda: 0.01
+    def delay() -> float:
+        return 0.01
 
     router = MockRouter()
     sink_records: list[TurnRecord] = []

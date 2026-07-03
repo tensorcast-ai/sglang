@@ -1,20 +1,20 @@
-"""Factory for building a `ResourceProvider` from a cluster YAML.
-
-Dispatch is based on `provider.kind` in the YAML. v1 registers only
-`brainctl`. New clusters add a provider implementation under `resource/`
-and register it here (see arch.md § 14.2).
-"""
+"""Factory for building a `ResourceProvider` from a cluster YAML."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from .base import ResourceProvider, load_cluster_config
-from .brainctl import BrainctlProvider
+from tensorcast_benchmark.kv.tc_router.resource.base import (
+    ResourceProvider,
+    load_cluster_config,
+)
+from tensorcast_benchmark.kv.tc_router.resource.local import LocalProvider
+from tensorcast_benchmark.kv.tc_router.resource.static import StaticProvider
 
 
 _REGISTRY: dict[str, type] = {
-    "brainctl": BrainctlProvider,
+    "local": LocalProvider,
+    "static": StaticProvider,
 }
 
 
@@ -24,8 +24,7 @@ def from_cluster_config(path: str | Path) -> ResourceProvider:
     kind = cfg.provider.kind
     if kind not in _REGISTRY:
         raise ValueError(
-            f"unknown provider.kind={kind!r}. "
-            f"Registered providers: {sorted(_REGISTRY)}"
+            f"unknown provider.kind={kind!r}. Registered providers: {sorted(_REGISTRY)}"
         )
     return _REGISTRY[kind].from_cluster_config(path)
 

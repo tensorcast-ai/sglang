@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import shlex
 import signal
 import subprocess
@@ -23,6 +24,15 @@ import aiohttp
 from .base import Service
 
 
+def _default_workspace_root() -> str:
+    """Infer the repo root from this file's location."""
+    return str(Path(__file__).resolve().parents[7])
+
+
+def _default_uv_bin() -> str:
+    return shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
+
+
 @dataclass(frozen=True)
 class GatewayLaunchSpec:
     """Inputs to `sglang_router.launch_router`."""
@@ -33,8 +43,8 @@ class GatewayLaunchSpec:
     port: int = 30100
     log_dir: Optional[str] = None
     extra_args: tuple[str, ...] = field(default_factory=tuple)
-    workspace_root: str = "/home/i-zhouyuhan/tot"
-    uv_bin: str = "/home/i-zhouyuhan/.local/bin/uv"
+    workspace_root: str = field(default_factory=_default_workspace_root)
+    uv_bin: str = field(default_factory=_default_uv_bin)
 
 
 def build_gateway_command(spec: GatewayLaunchSpec) -> str:
@@ -49,12 +59,16 @@ def build_gateway_command(spec: GatewayLaunchSpec) -> str:
     workspace = spec.workspace_root.rstrip("/")
     sglang_root = f"{workspace}/thirdparty/sglang"
     venv_activate = f"{workspace}/.venv/bin/activate"
-    pythonpath = f"{sglang_root}/python"
+    python_paths = (
+        f"{sglang_root}/sgl-model-gateway/bindings/python/src",
+        f"{sglang_root}/python",
+    )
+    pythonpath = ":".join(shlex.quote(path) for path in python_paths)
 
     prefix = (
         f"cd {shlex.quote(sglang_root)}; "
         f"source {shlex.quote(venv_activate)}; "
-        f"export PYTHONPATH={shlex.quote(pythonpath)}:${{PYTHONPATH:-}}; "
+        f"export PYTHONPATH={pythonpath}:${{PYTHONPATH:-}}; "
     )
 
     parts: list[str] = [

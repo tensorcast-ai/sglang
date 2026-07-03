@@ -13,9 +13,11 @@ idle.
 from __future__ import annotations
 
 import asyncio
-import json
+import ipaddress
 import logging
+import shutil
 import shlex
+import socket
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -33,16 +35,53 @@ logger = logging.getLogger(__name__)
 # Path to scripts/templates relative to the tc_router package root.
 _TC_ROUTER_DIR = Path(__file__).resolve().parent.parent
 _SCRIPT_PATH = _TC_ROUTER_DIR / "scripts" / "tensorcast_service.sh"
-_GLOBAL_STORE_TEMPLATE = _TC_ROUTER_DIR / "configs" / "global_store_config_template.yaml"
+_GLOBAL_STORE_TEMPLATE = (
+    _TC_ROUTER_DIR / "configs" / "global_store_config_template.yaml"
+)
 _DAEMON_TEMPLATE = _TC_ROUTER_DIR / "configs" / "store_daemon_config_template.yaml"
+
+
+def _default_workspace_root() -> str:
+    """Infer the repo root from this file's location."""
+    return str(Path(__file__).resolve().parents[7])
+
+
+def _default_uv_bin() -> str:
+    return shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
+
+
+def _is_loopback_or_unspecified_host(host: str) -> bool:
+    if host in {"localhost", ""}:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_unspecified
+
+
+def _detect_local_routable_ipv4() -> str:
+    """Return the primary non-loopback IPv4 visible from this host."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.connect(("8.8.8.8", 80))
+        candidate = sock.getsockname()[0]
+    if _is_loopback_or_unspecified_host(candidate):
+        raise RuntimeError(f"detected non-routable local IPv4 address: {candidate}")
+    return candidate
+
+
+def _tensorcast_advertise_host(worker_address: str) -> str:
+    if _is_loopback_or_unspecified_host(worker_address):
+        return _detect_local_routable_ipv4()
+    return worker_address
 
 
 @dataclass(frozen=True)
 class TensorcastEndpoints:
     """Network coordinates for the running services. Exposed to TcRouter."""
 
-    global_store_address: str   # "<host>:<port>" for daemon to connect to
-    daemon_address: str         # "<host>:<port>" for `tc.connect` from driver
+    global_store_address: str  # "<host>:<port>" for daemon to connect to
+    daemon_address: str  # "<host>:<port>" for `tc.connect` from driver
 
 
 @dataclass(frozen=True)
@@ -57,9 +96,10 @@ class TensorcastLaunchSpec:
     global_store_port: int = 61050
     daemon_port: int = 61053
     daemon_p2p_port: int = 61090
-    # Daemon needs CUDA libs. Defaults match share_remote's working setup.
-    cuda_home: str = "/usr/local/cuda-12.4"
-    nvidia_lib_dirs: str = "/usr/local/cuda-13.0/compat:/usr/local/nvidia/lib64"
+    # Daemon needs CUDA/NVRTC libs. The local H800 host points
+    # `/usr/local/cuda` at the installed toolkit.
+    cuda_home: str = "/usr/local/cuda"
+    nvidia_lib_dirs: str = ""
     # Tensorcast tuning — keep small for smoke; share_remote uses 64GB.
     daemon_stable_bytes: str = "16GB"
     enable_rdma: bool = False
@@ -68,8 +108,8 @@ class TensorcastLaunchSpec:
     log_dir: str = ""
     # Per-run state dir for tensorcast (TENSORCAST_HOME). One per service.
     runtime_home_root: str = ""
-    workspace_root: str = "/"
-    uv_bin: str = "/usr/local/bin/uv"
+    workspace_root: str = field(default_factory=_default_workspace_root)
+    uv_bin: str = field(default_factory=_default_uv_bin)
     # Service ready timeouts.
     service_ready_timeout_s: float = 240.0
     service_poll_interval_s: float = 2.0
@@ -196,8 +236,11 @@ class TensorcastLauncher:
         # the wrapper's stdout (start command output) doesn't compete.
         tc_log_file = str(log_dir / "tensorcast_global_store.tclog")
 
+        advertise_host = _tensorcast_advertise_host(worker.address)
         cfg = render_global_store_config(
-            spec, advertise_host=worker.address, log_path=tc_log_file
+            spec,
+            advertise_host=advertise_host,
+            log_path=tc_log_file,
         )
         cfg_path = str(cfg_dir / "tensorcast_global_store.yaml")
         Path(cfg_path).write_text(yaml.safe_dump(cfg, sort_keys=False))
@@ -223,8 +266,8 @@ class TensorcastLauncher:
             name="tensorcast_global_store",
             worker_id=worker.id,
             endpoints={
-                "grpc": f"{worker.address}:{spec.global_store_port}",
-                "advertise_host": worker.address,
+                "grpc": f"{advertise_host}:{spec.global_store_port}",
+                "advertise_host": advertise_host,
             },
             pid=pid,
             pid_path=pid_path,
@@ -258,7 +301,7 @@ class TensorcastLauncher:
 
         cfg = render_daemon_config(
             spec,
-            advertise_host=worker.address,
+            advertise_host=_tensorcast_advertise_host(worker.address),
             global_store_endpoint=global_store_address,
             log_path=tc_log_file,
             capability_token_secret=capability_token_secret,
@@ -325,7 +368,9 @@ class TensorcastLauncher:
             stdout = (proc.stdout or "") + (proc.stderr or "")
             if "SERVING" in stdout:
                 return
-            last_detail = stdout.strip().splitlines()[-1] if stdout.strip() else "(empty)"
+            last_detail = (
+                stdout.strip().splitlines()[-1] if stdout.strip() else "(empty)"
+            )
             await asyncio.sleep(spec.service_poll_interval_s)
         raise TimeoutError(
             f"tensorcast global store at {service.endpoints['grpc']} "
@@ -398,4 +443,6 @@ class TensorcastLauncher:
             try:
                 await worker.stop_background(pid_path=service.pid_path)
             except Exception:  # noqa: BLE001
-                logger.exception("failed to stop global store background %s", service.name)
+                logger.exception(
+                    "failed to stop global store background %s", service.name
+                )

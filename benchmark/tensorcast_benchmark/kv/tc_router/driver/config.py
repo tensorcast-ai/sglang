@@ -30,6 +30,9 @@ class InstancesConfig(BaseModel):
     kv_pool_size_gb: str | int = "auto"
     mem_fraction_static: float = Field(default=0.85, gt=0.0, lt=1.0)
     page_size: int = Field(default=32, ge=1)
+    sglang_log_level: Optional[
+        Literal["debug", "info", "warning", "error", "critical"]
+    ] = None
 
 
 class TransportConfig(BaseModel):
@@ -48,7 +51,9 @@ class PoolFilterConfig(BaseModel):
 class InterTurnDelayConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    preset: Literal["agent_fast", "agent_medium", "agent_slow", "custom"] = "agent_medium"
+    preset: Literal["agent_fast", "agent_medium", "agent_slow", "custom"] = (
+        "agent_medium"
+    )
     custom_mu: Optional[float] = None
     custom_sigma: Optional[float] = None
 

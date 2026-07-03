@@ -32,11 +32,29 @@ def test_basic_command_has_required_args() -> None:
     assert "http://10.0.0.1:30002" in cmd
 
 
+def test_mixed_local_remote_worker_urls_are_forwarded() -> None:
+    urls = (
+        "http://127.0.0.1:62101",
+        "http://127.0.0.1:62102",
+        "http://10.0.10.58:62105",
+        "http://10.0.10.58:62106",
+    )
+
+    cmd = build_gateway_command(make_spec(worker_urls=urls))
+
+    for url in urls:
+        assert url in cmd
+
+
 def test_command_activates_workspace_venv() -> None:
     cmd = build_gateway_command(make_spec(workspace_root="/home/u/tot"))
     assert "cd /home/u/tot/thirdparty/sglang;" in cmd
     assert "source /home/u/tot/.venv/bin/activate" in cmd
-    assert "export PYTHONPATH=/home/u/tot/thirdparty/sglang/python" in cmd
+    assert (
+        "export PYTHONPATH="
+        "/home/u/tot/thirdparty/sglang/sgl-model-gateway/bindings/python/src:"
+        "/home/u/tot/thirdparty/sglang/python"
+    ) in cmd
 
 
 def test_uses_uv_with_offline_no_project() -> None:
@@ -49,7 +67,9 @@ def test_uses_uv_with_offline_no_project() -> None:
 
 
 def test_extra_args_appended() -> None:
-    cmd = build_gateway_command(make_spec(extra_args=("--max-concurrent-requests", "256")))
+    cmd = build_gateway_command(
+        make_spec(extra_args=("--max-concurrent-requests", "256"))
+    )
     assert "--max-concurrent-requests 256" in cmd
 
 

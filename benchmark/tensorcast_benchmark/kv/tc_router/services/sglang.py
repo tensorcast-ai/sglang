@@ -13,14 +13,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import shlex
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal, Optional
 
 import aiohttp
 
 from .base import Service
+
+
+def _default_workspace_root() -> str:
+    """Infer the repo root from this file's location."""
+    return str(Path(__file__).resolve().parents[7])
+
+
+def _default_uv_bin() -> str:
+    return shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
 
 
 @dataclass(frozen=True)
@@ -33,11 +44,16 @@ class SGLangLaunchSpec:
 
     # Required.
     model_path: str
+    # Host advertised to the driver/gateway for HTTP traffic.
     host: str
     port: int
+    # Host/interface SGLang binds inside the worker. If omitted, binds to
+    # `host` for backward compatibility with existing local runs.
+    bind_host: Optional[str] = None
 
     # TP topology.
     tp_size: int = 1
+    nccl_port: Optional[int] = None
 
     # Memory / pagination.
     mem_fraction_static: float = 0.85
@@ -70,15 +86,11 @@ class SGLangLaunchSpec:
     # disjoint windows here. `len(gpu_indices)` MUST equal `tp_size`.
     gpu_indices: Optional[tuple[int, ...]] = None
 
-    # Workspace location used to find sglang sources / .venv (master pod
-    # convention for this cluster).
-    workspace_root: str = "/home/i-zhouyuhan/tot"
+    # Workspace location used to find sglang sources / .venv.
+    workspace_root: str = field(default_factory=_default_workspace_root)
 
-    # Path to the `uv` binary on the worker. share_remote first checks
-    # `<workspace_root>/.venv/bin/uv` and falls back to `~/.local/bin/uv`;
-    # on this cluster the fallback is what actually exists, so we make it
-    # the default.
-    uv_bin: str = "/home/i-zhouyuhan/.local/bin/uv"
+    # Path to the `uv` binary on the worker.
+    uv_bin: str = field(default_factory=_default_uv_bin)
 
 
 # Args we must never produce in the launch command, per arch § 5.2.3.
@@ -118,7 +130,7 @@ def build_launch_command(spec: SGLangLaunchSpec) -> str:
         "-m",
         "sglang.launch_server",
         "--host",
-        spec.host,
+        spec.bind_host or spec.host,
         "--port",
         str(spec.port),
         "--model-path",
@@ -130,6 +142,8 @@ def build_launch_command(spec: SGLangLaunchSpec) -> str:
         "--mem-fraction-static",
         str(spec.mem_fraction_static),
     ]
+    if spec.nccl_port is not None:
+        parts.extend(["--nccl-port", str(spec.nccl_port)])
     if spec.trust_remote_code:
         parts.append("--trust-remote-code")
     # `--enable-cache-report` makes SGLang populate
@@ -254,6 +268,9 @@ class SGLangLauncher:
             metadata={
                 "model_path": spec.model_path,
                 "tp_size": str(spec.tp_size),
+                "bind_host": spec.bind_host or spec.host,
+                "advertise_host": spec.host,
+                "nccl_port": "" if spec.nccl_port is None else str(spec.nccl_port),
                 "cuda_visible_devices": cuda_visible,
             },
         )
@@ -265,28 +282,52 @@ class SGLangLauncher:
         timeout_s: float = 1800.0,
         poll_interval_s: float = 2.0,
     ) -> None:
-        """Poll the SGLang `/health` endpoint until it returns 200 or timeout."""
-        url = f"{service.endpoints['serving_http']}/health"
+        """Poll SGLang until its OpenAI-compatible API is usable.
+
+        Some SGLang builds can keep `/health` at 503 after model loading while
+        `/v1/models` is already serving. The gateway only needs the
+        OpenAI-compatible API, so either probe succeeding is enough.
+        """
+        base_url = service.endpoints["serving_http"].rstrip("/")
+        health_url = f"{base_url}/health"
+        models_url = f"{base_url}/v1/models"
         deadline = time.monotonic() + timeout_s
         last_detail = "no probe yet"
         session = await self._ensure_session()
         while time.monotonic() < deadline:
-            try:
-                async with session.get(
-                    url,
-                    timeout=aiohttp.ClientTimeout(total=5.0),
-                    proxy=None,
-                ) as resp:
-                    if resp.status == 200:
-                        return
-                    last_detail = f"HTTP {resp.status}"
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                last_detail = f"{type(exc).__name__}: {exc}"
+            health_ready, health_detail = await self._probe_ready_url(
+                session, health_url
+            )
+            if health_ready:
+                return
+            models_ready, models_detail = await self._probe_ready_url(
+                session, models_url
+            )
+            if models_ready:
+                return
+            last_detail = f"health={health_detail}; models={models_detail}"
             await asyncio.sleep(poll_interval_s)
         raise TimeoutError(
-            f"SGLang service {service.name} at {url} not ready within "
+            f"SGLang service {service.name} at {base_url} not ready within "
             f"{timeout_s}s: {last_detail}"
         )
+
+    async def _probe_ready_url(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+    ) -> tuple[bool, str]:
+        try:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=5.0),
+                proxy=None,
+            ) as resp:
+                if resp.status == 200:
+                    return True, "HTTP 200"
+                return False, f"HTTP {resp.status}"
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            return False, f"{type(exc).__name__}: {exc}"
 
     async def stop(self, worker, service: Service) -> None:
         """Stop a service launched via `launch`."""

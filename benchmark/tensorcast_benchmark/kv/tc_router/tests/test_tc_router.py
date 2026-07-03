@@ -6,7 +6,6 @@ Tensorcast Runtime is mocked via monkeypatching `tc.connect`.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import sys
 import types
@@ -63,23 +62,35 @@ class _FakeChatServer:
             headers={"Content-Type": "text/event-stream"},
         )
         await resp.prepare(request)
-        await resp.write(_sse({
-            "choices": [{"delta": {"content": "hi"}, "index": 0}],
-            "usage": None,
-        }))
-        await resp.write(_sse({
-            "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
-            "usage": None,
-        }))
-        await resp.write(_sse({
-            "choices": [],
-            "usage": {
-                "prompt_tokens": 100,
-                "completion_tokens": 1,
-                "total_tokens": 101,
-                "prompt_tokens_details": {"cached_tokens": 0},
-            },
-        }))
+        await resp.write(
+            _sse(
+                {
+                    "choices": [{"delta": {"content": "hi"}, "index": 0}],
+                    "usage": None,
+                }
+            )
+        )
+        await resp.write(
+            _sse(
+                {
+                    "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
+                    "usage": None,
+                }
+            )
+        )
+        await resp.write(
+            _sse(
+                {
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 100,
+                        "completion_tokens": 1,
+                        "total_tokens": 101,
+                        "prompt_tokens_details": {"cached_tokens": 0},
+                    },
+                }
+            )
+        )
         await resp.write(b"data: [DONE]\n\n")
         await resp.write_eof()
         return resp
@@ -154,7 +165,9 @@ async def test_tc_router_routes_same_session_to_same_home(fake_tensorcast) -> No
 
 
 @pytest.mark.asyncio
-async def test_tc_router_distinct_sessions_can_land_on_different_instances(fake_tensorcast) -> None:
+async def test_tc_router_distinct_sessions_can_land_on_different_instances(
+    fake_tensorcast,
+) -> None:
     s_a = _FakeChatServer("a")
     s_b = _FakeChatServer("b")
     runners = []

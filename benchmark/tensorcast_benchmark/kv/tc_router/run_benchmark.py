@@ -4,8 +4,8 @@
 Usage:
 
   python -m tensorcast_benchmark.kv.tc_router.run_benchmark \\
-      --cluster configs/cluster_brainctl_single_h800.yaml \\
-      --bench   configs/benchmark_baseline_smoke.yaml
+      --cluster configs/cluster_local_h800.yaml \\
+      --bench   configs/benchmark_local_tc_router_smoke.yaml
 """
 
 from __future__ import annotations
@@ -20,7 +20,9 @@ from .driver.benchmark_loop import run_benchmark
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--cluster", required=True, type=Path)
     parser.add_argument("--bench", required=True, type=Path)
     parser.add_argument(
@@ -33,7 +35,7 @@ def parse_args() -> argparse.Namespace:
         "--config-filter",
         default=None,
         help="Comma-separated subset of `bench.configs[].kind` to run. "
-             "Default: all configs in bench.yaml that this Phase supports.",
+        "Default: all configs in bench.yaml that this Phase supports.",
     )
     parser.add_argument(
         "--sglang-ready-timeout-s",

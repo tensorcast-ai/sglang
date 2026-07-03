@@ -34,9 +34,10 @@ The following are explicitly out of scope for v1:
 - Multi-model fleets
 - Beating production gateways on throughput in low-cache-reuse workloads
 - Generic single-turn benchmarks (TTFT under uniform short prompts, etc.)
-- Resource acquisition. The benchmark consumes pre-acquired workers
-  described in a cluster YAML (see § 9.1); how those workers come into
-  existence is out of scope.
+- Resource acquisition for remote providers. The current local provider
+  describes the current host directly; future remote providers should
+  consume already-acquired workers described in a cluster YAML (see
+  § 9.1).
 - Comparing routing-policy algorithm quality in the abstract; we compare
   concrete gateway policies vs. concrete tc_router policy
 
@@ -673,85 +674,99 @@ topologies in a single run are not supported (§ 2).
 
 ## 7. Physical Topology
 
-v1 is a cross-host setup. Each SGLang serving instance runs on a
-distinct worker so that Tensorcast `publish` / `hydrate` traffic
-goes over the actual cluster network rather than local PCIe / NVLink.
-Same-host migration would short-circuit the substrate's transport
-cost and make the comparison unrepresentative of real deployments.
+The current checked-in implementation supports a **local single-node
+topology** through `resource/local.py`. The driver host is also the
+worker host; one local worker describes the machine's GPU set, and the
+placement planner can pack multiple SGLang instances onto disjoint GPU
+windows on that worker. This is the supported path for local smoke runs
+on the 8xH800 machine.
 
-The benchmark **consumes pre-acquired workers** described in a cluster
-YAML (see § 9.1). It does not acquire or release workers itself.
+The original publication-grade experiment still wants a cross-host
+topology so Tensorcast `publish` / `hydrate` traffic measures real
+network transport rather than same-host paths. That requires adding a
+new `ResourceProvider` for the target cluster; legacy remote-provider
+support has been removed and is not part of the current runnable code.
+
+The benchmark consumes workers described in a cluster YAML (see § 9.1).
+For `provider.kind: local`, those workers are not acquired out of band;
+they are simply a declarative view of the current host.
 
 ### 7.1 Worker layout
 
-`N` worker hosts (default `N = 3`), one SGLang instance per worker:
+Local smoke layout:
 
-- worker `i` hosts: 1 SGLang instance + 1 Tensorcast daemon (always)
-- one chosen worker (default `worker_0`) additionally hosts the
-  Tensorcast global store, and (when applicable) the Mooncake master
-  + metadata service
+- one worker, `local_h800`, with `gpu_indices: [0, 1, 2, 3, 4, 5, 6, 7]`
+- `instances.count = 3`, `tp_size = 2` packs three SGLang instances on
+  GPU windows `[0,1]`, `[2,3]`, and `[4,5]`
+- the same local worker hosts the Tensorcast global store and one
+  Tensorcast daemon
 
-Each worker contributes `tp_size` GPUs to its SGLang instance.
-Default model is `Qwen/Qwen3-32B` with `tp_size = 2` →
-`N × tp_size = 6` GPUs across the cluster. `Qwen/Qwen3-14B` with
-`tp_size = 1` is supported as the lightweight alternative.
+The placement planner is greedy and provider-agnostic: it walks workers
+in YAML order, allocating non-overlapping `tp_size` GPU windows until
+`instances.count` instances have been placed. For future cross-host
+runs, a cluster YAML can instead describe several workers and the same
+planner will spread or pack instances according to available GPUs.
 
 ### 7.2 Driver host
 
-The router and traffic generator run on a **separate driver host**
-(typically the local machine running `run_benchmark.py`, or a cluster
-login node). The driver host:
+For local runs, the router and traffic generator run on the same host as
+the SGLang instances. The driver host:
 
 - has network reachability to every worker's SGLang HTTP endpoint and
-  Tensorcast daemon
-- does not need GPUs
+  Tensorcast daemon; for local runs these are `127.0.0.1:<port>`
 - runs the `tc_router` Python process (router + workload generator +
   Tensorcast runtime client) for tc_router configs, and the
   gateway-baseline wrapper for `gw_*` configs
 
-This keeps load on the `N` workers symmetric. Putting router code on
-one of the workers would unfairly burden that worker's serving
-instance with control-plane overhead.
+For future cross-host experiments, the same driver can run on a
+separate login node to keep serving workers symmetric.
 
 ### 7.3 Distinct-host requirement
 
-Workers MUST be on distinct physical hosts. The cluster YAML loader
-asserts this; the benchmark refuses to start otherwise. Running
-multiple instances on one worker is explicitly out of scope (§ 2).
+If a cluster YAML lists multiple workers, their `id`, `address`, and
+`node` values must be distinct. The local 8xH800 setup lists a single
+worker and intentionally runs multiple SGLang instances on that worker
+using disjoint GPU windows.
 
 ### 7.4 RDMA capability and transport mode
 
-Workers MUST be RDMA-capable (have an HCA exposed and configured).
-The actual transport used by Tensorcast / Mooncake is selectable
-per-run via `transport.use_rdma` in `benchmark.yaml` (see § 9.2),
-mapping to:
+For local smoke runs, `transport.use_rdma` should be `false`. The local
+provider does not require RDMA environment variables, and the checked-in
+`cluster_local_h800.yaml` leaves `base_env: {}`. CUDA forward-compatibility
+libraries are expressed separately through `env_path_prepend`, which lets the
+local provider prepend CUDA compatibility libraries to `LD_LIBRARY_PATH`
+without relying on shell expansion or overwriting an existing value.
+The current static H800 deployment prepends `/usr/local/cuda-13/bin` to
+`PATH` and `/usr/local/cuda-13/compat` to `LD_LIBRARY_PATH`.
+
+For future cross-host providers, the actual transport used by
+Tensorcast / Mooncake is selectable per-run via `transport.use_rdma` in
+`benchmark.yaml` (see § 9.2), mapping to:
 
 - Tensorcast: `communicator.enable_rdma = true | false`
 - Mooncake: `protocol = rdma | tcp`
 
-This lets one cluster of workers serve both RDMA and TCP runs for
-apples-to-apples backend comparison (same hardware, same workload,
-only transport changes). The chosen mode is recorded as a column in
-`summary.csv`.
+The chosen mode is recorded as a column in `summary.csv`.
 
 ### 7.5 RDMA smoke
 
-For runs that select RDMA, the driver issues a star-shaped smoke
-test (`worker_0 → worker_i` for `i ≥ 1`) before launching real
-services. This reuses the contract from
-[`share_remote/arch.md` § 6](../share_remote/arch.md). Smoke is
-skipped for TCP runs and may be skipped for re-runs against an
-already-validated cluster YAML via a `--skip-rdma-smoke` flag.
+`services/rdma_smoke.py` contains the star-shaped RDMA reachability
+check intended for future cross-host runs. Local runs set
+`transport.use_rdma: false` and skip this concern.
 
 ### 7.6 RDMA env injection
 
-Per-worker RDMA environment variables (`NCCL_IB_HCA`,
-`NCCL_IB_GID_INDEX`, `NCCL_SOCKET_IFNAME`, `NCCL_SOCKET_FAMILY`,
-`MASTER_ADDR`) are stored in each worker's entry in the cluster YAML
-under `base_env` and **automatically injected** into every command
-the benchmark runs on that worker via `Worker.run`. The driver
-itself does not assume worker-global shell state is sufficient. This
-mirrors `share_remote/arch.md` § 6.3.
+Every worker's `base_env` is merged into commands run through
+`Worker.run` / `Worker.start_background`. For local smoke runs this may
+be empty. `env_path_prepend` is applied after `base_env` and before any
+per-call `env`, and is intended for path-like variables such as
+`LD_LIBRARY_PATH`. `env_unset` is applied last and removes inherited
+environment variables such as `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`
+from worker commands; this keeps local gateway/SGLang HTTP calls from being
+routed through an external proxy. Future RDMA-capable providers should put per-worker
+variables such as `NCCL_IB_HCA`, `NCCL_IB_GID_INDEX`,
+`NCCL_SOCKET_IFNAME`, `NCCL_SOCKET_FAMILY`, and `MASTER_ADDR` in
+`base_env`.
 
 ## 8. Driver Structure
 
@@ -762,15 +777,17 @@ tc_router/
   run_benchmark.py         # entry: combines cluster_*.yaml + benchmark.yaml
   scripts/                 # service lifecycle wrappers (reused from request_transfer / share_remote)
   configs/
-    cluster_brainctl_<id>.yaml   # one per acquired set of workers
-    cluster_static_<id>.yaml     # one per pre-existing worker set
+    cluster_local_h800.yaml      # current local 8xH800 worker description
+    cluster_local_h800_no_compat.yaml
+    benchmark_local_baseline_tp1_smoke.yaml
+    benchmark_local_tc_router_smoke.yaml
     benchmark_<id>.yaml          # one per experiment definition
   resource/                # cluster-portable resource abstraction (§ 7)
     __init__.py
     base.py                # Worker, ResourceProvider, RemoteProcess Protocols
     factory.py             # dispatch on cluster_yaml.provider.kind
-    brainctl.py            # BrainctlProvider: Worker.run wraps `brainctl exec`
-    static.py              # StaticProvider: Worker.run wraps generic shell exec (e.g., direct ssh)
+    local.py               # LocalProvider: Worker.run uses local subprocesses
+    static.py              # placeholder for future SSH-like fallback
   services/                # service launchers, all Provider-agnostic
     __init__.py
     base.py                # Service / ServiceLauncher abstract interfaces
@@ -809,9 +826,9 @@ tc_router/
 Invocation:
 
 ```bash
-python run_benchmark.py \
-  --cluster configs/cluster_brainctl_001.yaml \
-  --bench   configs/benchmark_qwen3_32b_main.yaml
+python -m tensorcast_benchmark.kv.tc_router.run_benchmark \
+  --cluster configs/cluster_local_h800.yaml \
+  --bench   configs/benchmark_local_tc_router_smoke.yaml
 ```
 
 Responsibilities:
@@ -819,15 +836,16 @@ Responsibilities:
 - load `cluster.yaml` via `resource.factory.from_cluster_config(...)` →
   obtain a `ResourceProvider` and its `list[Worker]`
 - run `health_check()` on the workers
-- if `transport.use_rdma` is true, run the RDMA smoke test
+- if a future cross-host config enables RDMA, validate transport before
+  launching services
 - for each `(config, c_target, trial, preset)` cell of the sweep:
   - launch services on the appropriate workers (via `services/`,
     backed by `Worker.run`)
   - wait for service health
   - run the traffic generator on the driver host for `T_wall` seconds
   - tear down services launched for this cell
-  - via `Worker.get_file`, pull per-instance logs into the run output
-    directory
+  - logs are written under the configured scratch/output paths; with the
+    local provider those paths are ordinary local filesystem paths
 - write a top-level `summary.csv` indexed by
   `(config, c_target, trial, preset)` with `transport_mode` recorded
 
@@ -838,29 +856,43 @@ which cluster CLI was used — see § 14 for the portability story.
 
 ```python
 class RemoteProcess(Protocol):
-    pid: int | None       # may be None if Provider doesn't expose PIDs
-    async def wait(self) -> int: ...                  # exit code
+    pid: int | None
+    returncode: int | None
+    stdout: str
+    stderr: str
+    async def wait(self) -> int: ...
     async def kill(self) -> None: ...
-    async def stdout(self) -> bytes: ...
-    async def stderr(self) -> bytes: ...
 
 class Worker(Protocol):
     id: str                       # human-readable label
-    address: str                  # routable IP for inter-worker traffic
-    gpu_indices: list[int]        # GPUs this benchmark may use on this worker
+    address: str                  # routable IP / host used by service endpoints
+    node: str
+    gpu_indices: tuple[int, ...]  # GPUs this benchmark may use on this worker
     scratch_dir: str              # writable per-worker path
-    base_env: dict[str, str]      # always merged into Worker.run env (RDMA vars, MASTER_ADDR, ...)
+    base_env: dict[str, str]      # always merged into Worker.run env
 
     async def run(
         self,
-        cmd: list[str],
+        cmd: list[str] | str,
         *,
-        env: dict[str, str] | None = None,    # merged on top of base_env
+        env: dict[str, str] | None = None,
         cwd: str | None = None,
-        background: bool = False,
-        log_path: str | None = None,           # redirect stdout/stderr on the worker
+        timeout_s: float | None = None,
+        check: bool = True,
+        as_user: bool = True,
     ) -> RemoteProcess: ...
 
+    async def start_background(
+        self,
+        cmd: str,
+        *,
+        name: str,
+        log_path: str,
+        pid_path: str,
+        env: dict[str, str] | None = None,
+    ) -> int: ...
+
+    async def stop_background(self, *, pid_path: str) -> None: ...
     async def put_file(self, local_path: Path, remote_path: str) -> None: ...
     async def get_file(self, remote_path: str, local_path: Path) -> None: ...
     async def read_file(self, remote_path: str, *, max_bytes: int | None = None) -> bytes: ...
@@ -873,23 +905,22 @@ class ResourceProvider(Protocol):
     async def health_check(self) -> None: ...
 ```
 
-The Provider is **not** responsible for acquiring workers. It only
-adapts a YAML description of already-acquired workers to a uniform
-`Worker` interface. Acquisition lives in out-of-band scripts that the
-operator runs once per cluster lease.
+The Provider adapts a cluster YAML to a uniform `Worker` interface. For
+`provider.kind: local`, no acquisition happens; the provider runs
+commands directly on the current host with local subprocesses.
 
 ### 8.3 `services/` — Provider-agnostic service launchers
 
-Each launcher takes a `Worker` plus configuration and emits the
-right command to start its service. None of them know about
-`brainctl` or any specific cluster CLI; they only call `Worker.run`.
+Each launcher takes a `Worker` plus configuration and emits the right
+command to start its service. None of them know whether the worker is
+local or remote; they only call the `Worker` protocol.
 
 For example, `services/sglang.py::launch_instance(worker, config)`
-constructs the SGLang launch command (with `--tp-size`, `--port`,
+constructs the SGLang launch command (with `--tp`, `--port`,
 `--host worker.address`, model flags, **without `--tool-call-parser`**
-per § 5.2.3) and calls `Worker.run(..., background=True,
-log_path=f"{worker.scratch_dir}/sglang_{port}.log")`. The same
-command shape works on every provider.
+per § 5.2.3) and calls `Worker.start_background(...)` with a log path
+and PID path under `worker.scratch_dir`. The same command shape works
+on the local provider and on future providers.
 
 ### 8.4 Traffic generator and routers
 
@@ -902,68 +933,71 @@ the resource layer.
 ## 9. Configuration Model
 
 The benchmark consumes **two** YAML files: a cluster description and
-an experiment description. They are intentionally separate so that
-acquired workers can be reused across many experiments without
-re-running any cluster CLI, and so that a new cluster's onboarding
-touches exactly one file (the cluster YAML's provider section).
+an experiment description. They are intentionally separate so that the
+same worker description can be reused across many experiments. In the
+current local setup, the cluster YAML describes the current host rather
+than a pre-acquired remote allocation.
 
-### 9.1 `cluster.yaml` — describes pre-acquired workers
+### 9.1 `cluster.yaml` — describes workers
 
 ```yaml
 provider:
-  kind: brainctl                      # dispatch key for resource/factory.py
-  # Provider-specific settings, used when Worker.run executes commands.
-  # Example for brainctl:
-  exec:
-    cli: brainctl
-    subcmd: exec
+  kind: local
+
 driver_host:
-  scratch_dir: /home/i-zhouyuhan/tot/thirdparty/sglang/benchmark/tensorcast_benchmark/kv/tc_router/outputs
+  scratch_dir: /home/yuhan/tot/thirdparty/sglang/benchmark/tensorcast_benchmark/kv/tc_router/outputs/local_driver
+
+mount:
+  path: /home/yuhan/tot/thirdparty/sglang/benchmark/tensorcast_benchmark/kv/tc_router/outputs
+  spec: local
+
 workers:
-  - id: worker_a
-    address: 10.42.1.5                # routable IP for inter-worker traffic
-    process_handle: rjob-XXX-001      # provider-specific identifier (used by brainctl exec)
-    gpu_indices: [0, 1]
-    scratch_dir: /workspace/scratch
-    base_env:                         # injected into every Worker.run on this worker
-      NCCL_IB_HCA: "mlx5_2,mlx5_3"
-      NCCL_IB_GID_INDEX: "3"
-      NCCL_SOCKET_FAMILY: AF_INET
-      NCCL_SOCKET_IFNAME: bond0
-      MASTER_ADDR: 10.42.1.5
-  - id: worker_b
-    address: 10.42.1.7
-    process_handle: rjob-XXX-002
-    gpu_indices: [0, 1]
-    scratch_dir: /workspace/scratch
-    base_env: { ... }
-  - id: worker_c
-    address: 10.42.1.9
-    process_handle: rjob-XXX-003
-    gpu_indices: [0, 1]
-    scratch_dir: /workspace/scratch
-    base_env: { ... }
+  - id: local_h800
+    address: 127.0.0.1
+    node: local_h800
+    process_handle: local
+    gpu_indices: [0, 1, 2, 3, 4, 5, 6, 7]
+    scratch_dir: /home/yuhan/tot/thirdparty/sglang/benchmark/tensorcast_benchmark/kv/tc_router/outputs/local_worker
+    base_env: {}
+    env_unset: [HTTPS_PROXY, HTTP_PROXY, https_proxy, http_proxy, ALL_PROXY, all_proxy]
+    env_path_prepend:
+      PATH:
+        - /usr/local/cuda-13/bin
+      LD_LIBRARY_PATH:
+        - /usr/local/cuda-13/compat
+
 service_placement:
-  global_store_worker_id: worker_a    # which worker hosts the Tensorcast global store
-  mooncake_master_worker_id: worker_a # which worker hosts Mooncake master (when applicable)
+  global_store_worker_id: local_h800
+  mooncake_master_worker_id: local_h800
 ```
 
-The cluster YAML is **acquired-state**, not a request. The operator
-populates it once per cluster lease (via whatever cluster CLI is
-appropriate), then runs many experiments against it.
+For non-local providers added in the future, the cluster YAML may again
+describe acquired remote state. For `provider.kind: local`, it is just
+the machine-local execution contract.
+
+At runtime the driver writes an effective `cluster.yaml` into
+`outputs/<timestamp>_<run_id>/` and, for the local provider, rewrites
+`driver_host.scratch_dir`, `mount.path`, and every worker `scratch_dir`
+under that run directory. The input YAML is preserved as
+`cluster_input.yaml`. This keeps SGLang logs, PID files, resolved configs,
+turn JSONL files, and summaries together in a single experiment folder.
 
 ### 9.2 `benchmark.yaml` — describes an experiment
 
 ```yaml
-run_id: tcrouter-2026-06-15-001
+run_id: local-tc-router-smoke
 model:
-  path: Qwen/Qwen3-32B
+  path: hf/Qwen3-32B
   tp_size: 2
 instances:
-  count: 3                            # MUST equal len(cluster.workers)
+  count: 3
+  base_port: 61101                    # avoids NodePort and ephemeral ranges
   kv_pool_size_gb: auto
+  mem_fraction_static: 0.85
+  page_size: 32
+  sglang_log_level: debug             # optional; emits SGLang --log-level
 transport:
-  use_rdma: true                      # mapped to Tensorcast / Mooncake transport flags
+  use_rdma: false                     # local smoke, not a cross-host RDMA run
 workload:
   dataset_path: /data/datasets/OpenHands-Sampled-Trajectories
   pool_filter:
@@ -972,47 +1006,40 @@ workload:
   inter_turn_delay:
     preset: agent_medium              # one of agent_fast | agent_medium | agent_slow | custom
     # custom_mu / custom_sigma only honored when preset == custom
-  max_new_tokens_clip: 512
-  start_jitter_s: 2.0
-  wall_seconds: 600
-  warmup_seconds: 120
-  trials: 3
-  c_target_sweep: [3, 5, 8, 12, 18, 24]
+  max_new_tokens_clip: 256
+  start_jitter_s: 1.0
+  wall_seconds: 60
+  warmup_seconds: 0
+  trials: 1
+  c_target_sweep: [3, 6]
 configs:
-  - kind: gw_load_aware
-  - kind: gw_cache_aware
-  - kind: gw_load_aware_mooncake
   - kind: tc_router
     policy:
-      kind: threshold
-      rebalance_ratio: 2.0
-      rebalance_abs: 4
-      max_migrations_per_tick: 1
-      migration_cooldown_s: 30.0
-      migration_ttl_ms: 120000
-      inter_turn_delay_p90_s: 56.0    # P90 of the active preset; loader fills this
+      kind: never_rebalance
+      seed: 0
+gateway:
+  host: 127.0.0.1
+  port: 61200
 load_polling:
   period_ms: 250
-rebalancer:
-  period_ms: 500
 ```
 
 Validation rules at load time:
 
-- `instances.count == len(cluster.workers)` (one instance per worker).
-- For every worker, `len(gpu_indices) >= model.tp_size`.
+- total available GPU windows across all workers must fit
+  `instances.count × model.tp_size`; the local config packs several
+  instances onto one worker
 - `inter_turn_delay.preset == custom` requires `custom_mu` and
   `custom_sigma`; otherwise they MUST be absent.
-- `inter_turn_delay_p90_s` is **derived** from the active preset by
-  the loader (operator does not have to re-compute when changing
-  preset).
+- `provider.kind: local` allows empty `base_env`; non-local providers
+  are expected to define the environment needed by their transport.
 
 ### 9.3 Invocation
 
 ```bash
-python run_benchmark.py \
-  --cluster configs/cluster_brainctl_001.yaml \
-  --bench   configs/benchmark_qwen3_32b_main.yaml
+python -m tensorcast_benchmark.kv.tc_router.run_benchmark \
+  --cluster configs/cluster_local_h800.yaml \
+  --bench   configs/benchmark_local_tc_router_smoke.yaml
 ```
 
 `kv_pool_size_gb: auto` lets each instance use its standard SGLang
@@ -1150,42 +1177,46 @@ becomes clear during implementation:
 
 ## 14. Cluster Portability
 
-The benchmark is designed so that running it on a new cluster is a
-**one-file delta**. This section spells out the contract.
+The current registered provider is `local`. The benchmark remains
+structured so that a new cluster can be added by implementing another
+`ResourceProvider`, but no remote provider is currently shipped.
 
 ### 14.1 What is cluster-specific
 
-Exactly one component is allowed to know about a particular cluster
-CLI: a `ResourceProvider` implementation in
-`resource/<your_cluster>.py`. Everything else
+Exactly one component is allowed to know about a particular execution
+environment: a `ResourceProvider` implementation in
+`resource/<your_provider>.py`. Everything else
 (`driver/`, `services/`, `router/`, `workload/`, `metrics/`,
 `run_benchmark.py`) is cluster-agnostic and interacts with workers
 only through the `Worker` and `RemoteProcess` Protocols defined in
 `resource/base.py`.
 
+The current implementation is `resource/local.py`, where `Worker.run`
+and `Worker.start_background` are thin wrappers around local
+subprocesses.
+
 ### 14.2 Onboarding a new cluster
 
-1. **Acquire workers** out of band, using whatever the cluster
-   provides (its CLI, its scheduler, its web UI). The benchmark does
-   not call this. Acquisition results in a set of long-lived worker
-   processes / pods / VMs.
-2. **Write `resource/<your_cluster>.py`** implementing
+1. **Acquire workers** out of band if the provider is remote, using
+   whatever the cluster provides (its CLI, scheduler, or web UI). The
+   benchmark should not perform acquisition during `run_benchmark.py`.
+   Local runs do not need this step.
+2. **Write `resource/<your_provider>.py`** implementing
    `ResourceProvider`. The bulk of the work is `Worker.run`, which
    needs to:
    - run a command on a specific worker
    - inject the worker's `base_env` plus the per-call `env`
-   - support `background=True` with `log_path` redirection
+   - support `start_background(...)` / `stop_background(...)` with
+     log and PID paths
    - return a `RemoteProcess` whose `wait` / `kill` / `stdout` /
      `stderr` work
    - typically this wraps a cluster-specific exec command
-     (`brainctl exec`, `kubectl exec`, plain `ssh`, `docker exec`,
-     ...). For brainctl the implementation in
-     `resource/brainctl.py` is the reference.
+     (`kubectl exec`, plain `ssh`, `docker exec`, a scheduler CLI,
+     ...). `resource/local.py` is the reference for protocol shape.
 3. **Register the provider**: add a `kind` → class mapping in
    `resource/factory.py`.
-4. **Write `configs/cluster_<your_cluster>_<id>.yaml`** describing
-   the acquired workers (per § 9.1 schema). `provider.kind` matches
-   step 3.
+4. **Write `configs/cluster_<your_provider>_<id>.yaml`** describing
+   the workers (per § 9.1 schema). `provider.kind` matches step 3.
 
 That is the entire delta. `benchmark.yaml`, `run_benchmark.py`, the
 service launchers in `services/`, the router, the workload, and the
@@ -1193,27 +1224,22 @@ metrics code do not change.
 
 ### 14.3 What lives outside the benchmark
 
-- **acquisition / release scripts**: not part of the benchmark.
-  Operators may keep convenience helpers like
-  `scripts/acquire_brainctl.py` and `scripts/release_brainctl.py`
-  next to the benchmark, but they are **not** invoked by
-  `run_benchmark.py`.
+- **acquisition / release scripts** for remote clusters: not part of the
+  benchmark and not invoked by `run_benchmark.py`.
 - **cluster-credential management**: SSH keys, k8s contexts,
-  brainctl tokens, etc. Provided through whatever channel the
-  cluster CLI uses; the benchmark inherits the operator's
-  environment.
+  scheduler tokens, etc. Provided through whatever channel the target
+  cluster uses; the benchmark inherits the operator's environment.
 - **per-cluster RDMA discovery**: which HCAs to use is recorded as
   static `base_env` in the cluster YAML. Re-deriving HCA names per
-  worker is a job for the acquisition script, not the benchmark.
+  worker is a job for acquisition / provisioning code, not the
+  benchmark.
 
 ### 14.4 Static fallback
 
-`resource/static.py::StaticProvider` is a generic provider that
-takes the cluster YAML at face value and runs commands via plain
-shell exec (e.g. `ssh user@address`). Any cluster that exposes SSH
-to its workers can use it without writing a custom provider. Custom
-providers are only needed when the cluster doesn't expose a
-generic shell channel and instead requires its own exec CLI.
+`resource/static.py::StaticProvider` is still a placeholder. It is not
+implemented in the current code. Clusters that expose SSH or another
+remote shell should add a real provider and register it in
+`resource/factory.py`.
 
 ## Appendix A. Dataset format reference
 

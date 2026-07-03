@@ -135,6 +135,152 @@ This phase patterns itself on the brainctl helpers already proven in
 
 ---
 
+## 1.5 StaticProvider (local + SSH static workers)
+
+**Goal**: replace the deprecated brainctl dependency for ordinary runs with
+an ssh-based **StaticProvider**. The provider does not acquire machines; it
+adapts an operator-supplied static inventory into the existing `Worker`
+interface. The first target deployment is a hybrid static cluster:
+
+- local worker: the current 8xH800 machine, executed via local subprocesses
+- remote worker: `yuhan@10.0.10.58`, executed via SSH with existing pubkey auth
+
+The provider must keep the services layer cluster-agnostic: SGLang,
+Tensorcast daemon/global-store, gateway, and workload code should continue
+to depend only on `ResourceProvider` / `Worker`.
+
+All static workers for this deployment share the same `/mnt/data`
+filesystem. Each worker's `/home/yuhan` is a symlink to `/mnt/data`, so
+file transfer must be implemented as shared-filesystem access only; no
+`scp` or `rsync` staging is required for benchmark inputs, service logs, or
+outputs.
+
+### 1.5.1 Config contract
+
+- [x] Define `provider.kind: static` in cluster YAML and register it in
+  `resource/factory.py`.
+- [x] Extend or reuse `WorkerConfig` so each worker can declare an execution
+  backend without brainctl fields:
+  - [x] `execution: local` for the current driver host.
+  - [x] `execution: ssh` for remote static workers.
+  - [x] SSH fields: `ssh_user`, `ssh_host`, `ssh_port`, optional
+    `identity_file`, optional `connect_timeout_s`.
+  - [x] Common fields stay unchanged: `id`, `address`, `node`,
+    `gpu_indices`, `scratch_dir`, `base_env`, optional env path prepends,
+    optional env unsets.
+- [x] Validate static YAML invariants:
+  - [x] unique worker `id`
+  - [x] unique `node`
+  - [x] valid non-empty `gpu_indices`
+  - [x] local worker has no required SSH target
+  - [x] SSH worker has user, host, and port
+  - [x] `scratch_dir` is absolute
+  - [x] cluster mount, driver scratch, worker scratch, and output paths are
+    under the shared `/mnt/data` filesystem, or under `/home/yuhan` which
+    resolves there
+  - [x] CUDA env path prepends are represented by `env_path_prepend` and
+    merged by both local and SSH workers.
+  - [x] Proxy variables are represented by `env_unset` and removed from both
+    local and SSH worker command environments.
+- [x] Add a shipped example config for the current deployment:
+  `configs/cluster_static_local_h800_plus_10_0_10_58.yaml`.
+
+### 1.5.2 Worker implementation
+
+- [x] Implement `resource/static.py` with `StaticProvider`,
+  `LocalStaticWorker`, and `SshStaticWorker`.
+- [x] Preserve the existing `Worker` protocol:
+  - [x] `run(...)`
+  - [x] `start_background(...)`
+  - [x] `stop_background(...)`
+  - [x] `read_file(...)`
+  - [x] `put_file(...)`
+  - [x] `get_file(...)`
+- [x] Local execution:
+  - [x] run commands through `bash --noprofile --norc -lc` under the
+    configured `cwd`
+  - [x] merge `base_env`, env path prepends, per-call env, and configured env
+    unsets consistently
+  - [x] launch background services with the same PID-file/log-file contract
+    used by the services layer
+- [x] SSH execution:
+  - [x] build deterministic SSH argv with `BatchMode=yes`,
+    `StrictHostKeyChecking=accept-new`, configured port, and optional
+    identity file
+  - [x] run remote commands as `bash --noprofile --norc -lc <quoted command>`
+  - [x] avoid any brainctl imports or command paths
+  - [x] compose remote background launch/stop snippets equivalent to the
+    local worker snippets
+- [x] Return a `RemoteProcess`-compatible result object for both local and
+  SSH paths, including stdout, stderr, return code, timeout, and check
+  behavior.
+
+### 1.5.3 Filesystem and artifacts
+
+- [x] Use a single shared-filesystem transfer model:
+  - [x] all workers see `/mnt/data` at the same absolute path
+  - [x] all workers have `/home/yuhan` symlinked to `/mnt/data`
+  - [x] repo, model, dataset, scratch, service logs, and outputs live on that
+    shared filesystem
+- [x] Implement `read_file`, `put_file`, and `get_file` as shared-filesystem
+  operations from the driver host; SSH is used for command execution only.
+- [x] Ensure service logs and PID files always live under each worker's
+  configured `scratch_dir`.
+- [x] Ensure final run artifacts are collected back into
+  `outputs/<run_id>/`, including remote service logs already written on the
+  shared filesystem.
+
+### 1.5.4 Health checks
+
+- [x] `StaticProvider.health_check()` validates the local worker:
+  - [x] `hostname`
+  - [x] `nvidia-smi`
+  - [x] visible GPU count covers `gpu_indices`
+  - [x] `scratch_dir` exists or can be created
+  - [x] shared `/mnt/data` and repo root exist
+- [x] `StaticProvider.health_check()` validates each SSH worker:
+  - [x] SSH connectivity with pubkey auth and no password prompt
+  - [x] remote `hostname`
+  - [x] remote `nvidia-smi`
+  - [x] visible GPU count covers `gpu_indices`
+  - [x] remote `scratch_dir` exists or can be created
+  - [x] shared `/mnt/data` and repo root exist
+  - [x] `/home/yuhan` resolves to `/mnt/data`
+- [x] Report actionable failures that identify the worker id and the failing
+  command.
+
+### 1.5.5 Tests
+
+- [x] Unit test: static cluster YAML with one local worker and one SSH worker
+  parses through `ClusterConfig` and `from_cluster_config`.
+- [x] Unit test: factory dispatches `provider.kind: static` to
+  `StaticProvider` and rejects malformed static worker entries.
+- [x] Unit test: local worker command composition merges base env, path
+  prepends, cwd, and per-call env correctly.
+- [x] Unit test: SSH worker command composition produces the expected SSH
+  argv and shell quoting for env values containing spaces/special chars.
+- [x] Unit test: local and SSH `start_background` snippets write PID files,
+  redirect logs, and use the expected stop escalation sequence.
+- [x] Unit test: shared-filesystem `read_file`, `put_file`, and `get_file`
+  use local filesystem operations and do not build `scp` / `rsync` commands.
+- [x] Optional live smoke: with `yuhan@10.0.10.58`, run
+  `provider.health_check()` and a trivial `worker.run("echo hello")` on both
+  workers. Do not run an E2E benchmark as part of this phase.
+
+### 1.5.6 Validation gate
+
+- [x] `source .venv/bin/activate && uv run --active ruff check
+  thirdparty/sglang/benchmark/tensorcast_benchmark/kv/tc_router/resource
+  thirdparty/sglang/benchmark/tensorcast_benchmark/kv/tc_router/tests`
+- [x] `source .venv/bin/activate && PYTHONPATH=/mnt/data/tot/thirdparty/sglang/benchmark
+  uv run --active pytest tensorcast_benchmark/kv/tc_router/tests`
+- [ ] Static local-only config can launch the same tp=2 smoke setup that
+  already works with the local provider.
+- [x] Static local+SSH config passes health check on the local 8xH800 worker
+  and `yuhan@10.0.10.58`.
+
+---
+
 ## 2. Services layer (cluster-agnostic launchers) ✅ DONE (sglang launcher unit + live; rdma_smoke unit only)
 
 **Goal**: `services.<name>.launch(...)` returns a running, healthy
@@ -407,6 +553,7 @@ those in is now a one-file delta when the policy is added.
 2. **Port range hardening**: SGLang `--port` allocation must avoid both NodePort (30000-32767) AND Linux ephemeral (32768-60999) ranges. Using 61101+ for instances and 61200 for gateway eliminates transient `EADDRINUSE` from other processes' outbound ephemeral source-port allocations.
 3. **`asyncio.to_thread` for Tensorcast `tc.connect`**: the SDK is synchronous. Use `loop.run_in_executor(...)` in `start()` / `close()` so the event loop doesn't block on the gRPC handshake.
 4. **`Runtime` cleanup**: call `runtime.close()` on TcRouter shutdown to avoid leaked daemon connections.
+5. **Static multi-worker global-store address**: when the local static worker is configured as `127.0.0.1`, remote daemons must receive the global store's routable advertise host, not the worker's loopback address.
 
 **Test summary**: `pytest tensorcast_benchmark/kv/tc_router/tests` passes 143/143.
 
@@ -445,7 +592,7 @@ those in is now a one-file delta when the policy is added.
 ### Logging and reproducibility (apply throughout)
 
 - [ ] Every Service launch records: command, env, log path on worker, started-at timestamp
-- [ ] `outputs/<run_id>/` always contains: resolved cluster YAML (post-load), resolved benchmark YAML, all jsonl files, all per-worker service logs (pulled at teardown via `Worker.get_file`), `summary.csv`
+- [x] `outputs/<run_id>/` contains the input cluster YAML, effective run-scoped cluster YAML, input/resolved benchmark YAML, per-config JSONL files, per-worker service logs under `scratch/`, and `summary.csv` for completed runs. Local runs write service logs directly under the run directory instead of pulling them back via `Worker.get_file`.
 - [ ] The inter-turn delay RNG is seeded as `sha256(run_id || config_kind || c_target || trial || preset)` (extends arch § 11)
 - [ ] `git rev-parse HEAD` for the SGLang/tensorcast/tc_router source tree is recorded in `outputs/<run_id>/manifest.json` for traceability
 

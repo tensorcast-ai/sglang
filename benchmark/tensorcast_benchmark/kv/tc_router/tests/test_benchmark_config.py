@@ -49,6 +49,7 @@ def test_load_good_yaml(tmp_path: Path) -> None:
     assert cfg.model.tp_size == 2
     assert cfg.instances.count == 3
     assert cfg.workload.c_target_sweep == (3, 6)
+    assert cfg.instances.sglang_log_level is None
     assert cfg.workload.inter_turn_delay.preset == "agent_medium"
     assert {c.kind for c in cfg.configs} == {"gw_load_aware", "gw_cache_aware"}
 
@@ -92,3 +93,96 @@ def test_shipped_smoke_yaml_parses() -> None:
     assert cfg.instances.count == 3
     assert cfg.model.tp_size == 2
     assert cfg.model.path.endswith("/Qwen3-32B")
+
+
+def test_shipped_local_tc_router_smoke_yaml_parses() -> None:
+    """The local single-node tc_router smoke YAML must parse cleanly."""
+    p = (
+        Path(__file__).resolve().parent.parent
+        / "configs"
+        / "benchmark_local_tc_router_smoke.yaml"
+    )
+    cfg = load_benchmark_yaml(p)
+    assert cfg.transport.use_rdma is False
+    assert cfg.model.path == "/mnt/data/models/Qwen3-32B"
+    assert cfg.model.tp_size == 2
+    assert cfg.instances.count == 3
+    assert cfg.workload.max_new_tokens_clip == 256
+    assert cfg.workload.wall_seconds == 60
+    assert (
+        cfg.workload.dataset_path == "/mnt/data/dataset/OpenHands-Sampled-Trajectories"
+    )
+    assert cfg.configs[0].kind == "tc_router"
+    assert cfg.configs[0].policy == {"kind": "never_rebalance", "seed": 0}
+
+
+def test_shipped_local_baseline_tp1_smoke_yaml_parses() -> None:
+    """The local TP=1 gateway baseline smoke YAML must parse cleanly."""
+    p = (
+        Path(__file__).resolve().parent.parent
+        / "configs"
+        / "benchmark_local_baseline_tp1_smoke.yaml"
+    )
+    cfg = load_benchmark_yaml(p)
+    assert cfg.model.tp_size == 1
+    assert cfg.instances.count == 3
+    assert cfg.transport.use_rdma is False
+    assert {c.kind for c in cfg.configs} == {"gw_load_aware", "gw_cache_aware"}
+
+
+def test_shipped_local_baseline_tp1_8inst_debug_yaml_parses() -> None:
+    """The local TP=1 8-instance debug baseline YAML must parse cleanly."""
+    p = (
+        Path(__file__).resolve().parent.parent
+        / "configs"
+        / "benchmark_local_baseline_tp1_8inst_debug.yaml"
+    )
+    cfg = load_benchmark_yaml(p)
+    assert cfg.model.tp_size == 1
+    assert cfg.instances.count == 8
+    assert cfg.instances.sglang_log_level == "debug"
+    assert cfg.workload.c_target_sweep == (3, 6)
+
+
+def test_shipped_static_baseline_8inst_tp2_yaml_parses() -> None:
+    """The mixed local+SSH static gateway baseline YAML must parse cleanly."""
+    p = (
+        Path(__file__).resolve().parent.parent
+        / "configs"
+        / "benchmark_static_baseline_8inst_tp2.yaml"
+    )
+    cfg = load_benchmark_yaml(p)
+    assert cfg.run_id == "static-baseline-8inst-tp2"
+    assert cfg.model.path == "/mnt/data/models/Qwen3-32B"
+    assert cfg.model.tp_size == 2
+    assert cfg.instances.count == 8
+    assert cfg.instances.base_port == 62101
+    assert cfg.instances.sglang_log_level == "debug"
+    assert cfg.transport.use_rdma is False
+    assert {c.kind for c in cfg.configs} == {"gw_load_aware", "gw_cache_aware"}
+    assert (
+        cfg.workload.dataset_path == "/mnt/data/dataset/OpenHands-Sampled-Trajectories"
+    )
+
+
+def test_shipped_static_tc_router_8inst_tp2_yaml_parses() -> None:
+    """The mixed local+SSH static tc_router smoke YAML must parse cleanly."""
+    p = (
+        Path(__file__).resolve().parent.parent
+        / "configs"
+        / "benchmark_static_tc_router_8inst_tp2.yaml"
+    )
+    cfg = load_benchmark_yaml(p)
+    assert cfg.run_id == "static-tc-router-8inst-tp2"
+    assert cfg.model.path == "/mnt/data/models/Qwen3-32B"
+    assert cfg.model.tp_size == 2
+    assert cfg.instances.count == 8
+    assert cfg.instances.base_port == 62101
+    assert cfg.instances.sglang_log_level == "debug"
+    assert cfg.transport.use_rdma is False
+    assert len(cfg.configs) == 1
+    assert cfg.configs[0].kind == "tc_router"
+    assert cfg.configs[0].policy == {"kind": "never_rebalance", "seed": 0}
+    assert (
+        cfg.workload.dataset_path == "/mnt/data/dataset/OpenHands-Sampled-Trajectories"
+    )

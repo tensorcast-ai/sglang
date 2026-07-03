@@ -9,6 +9,8 @@ or releases workers.
 from __future__ import annotations
 
 from pathlib import Path
+from pathlib import PurePosixPath
+import re
 from typing import Protocol, runtime_checkable
 
 import yaml
@@ -22,9 +24,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 class RemoteProcess(Protocol):
     """A remote command's lifecycle handle.
 
-    For the brainctl provider the underlying `brainctl exec` runs to completion
-    before returning, so most fields are populated immediately and `wait` is a
-    no-op. Long-lived background services are managed via
+    Some providers may run commands to completion before returning, so most
+    fields can be populated immediately and `wait` can be a no-op. Long-lived
+    background services are managed via
     `Worker.start_background` / `Worker.stop_background` (PID-file pattern)
     and do not produce a live `RemoteProcess`.
     """
@@ -132,12 +134,40 @@ class WorkerConfig(BaseModel):
     address: str = Field(min_length=1)
     node: str = Field(min_length=1)
     process_handle: str = Field(
-        min_length=1,
-        description="Cluster CLI's identifier (e.g., the brainctl process name).",
+        default="",
+        description="Provider-specific worker identifier.",
     )
+    execution: str = Field(
+        default="local",
+        description="StaticProvider execution backend: local or ssh.",
+    )
+    ssh_user: str = ""
+    ssh_host: str = ""
+    ssh_port: int = Field(default=22, ge=1, le=65535)
+    identity_file: str = ""
+    connect_timeout_s: float = Field(default=10.0, gt=0)
     gpu_indices: tuple[int, ...]
     scratch_dir: str = Field(min_length=1)
     base_env: dict[str, str] = Field(default_factory=dict)
+    env_path_prepend: dict[str, tuple[str, ...]] = Field(default_factory=dict)
+    env_unset: tuple[str, ...] = Field(default_factory=tuple)
+
+    @model_validator(mode="after")
+    def _validate_env_overrides(self) -> "WorkerConfig":
+        for key in self.base_env:
+            _validate_env_var_name(key, "base_env")
+        for key, paths in self.env_path_prepend.items():
+            _validate_env_var_name(key, "env_path_prepend")
+            if not paths:
+                raise ValueError(f"env_path_prepend[{key!r}] must not be empty")
+            for path in paths:
+                if not path:
+                    raise ValueError(
+                        f"env_path_prepend[{key!r}] contains an empty path"
+                    )
+        for key in self.env_unset:
+            _validate_env_var_name(key, "env_unset")
+        return self
 
 
 class ServicePlacement(BaseModel):
@@ -194,11 +224,14 @@ class ClusterConfig(BaseModel):
             raise ValueError(
                 f"duplicate worker.node found (distinct-host requirement violated): {nodes}"
             )
+        requires_base_env = self.provider.kind not in {"local", "static"}
         for w in self.workers:
-            if not w.base_env:
+            if requires_base_env and not w.base_env:
                 raise ValueError(
                     f"worker {w.id!r}: base_env is empty; at least RDMA env vars are expected"
                 )
+        if self.provider.kind == "static":
+            self._validate_static_workers()
         if self.service_placement.global_store_worker_id not in ids:
             raise ValueError(
                 f"service_placement.global_store_worker_id="
@@ -210,6 +243,53 @@ class ClusterConfig(BaseModel):
                 f"{self.service_placement.mooncake_master_worker_id!r} not in workers"
             )
         return self
+
+    def _validate_static_workers(self) -> None:
+        if not _is_shared_data_path(self.driver_host.scratch_dir):
+            raise ValueError(
+                "static driver_host.scratch_dir must be under /mnt/data or /home/yuhan"
+            )
+        if not _is_shared_data_path(self.mount.path):
+            raise ValueError("static mount.path must be under /mnt/data or /home/yuhan")
+        for worker in self.workers:
+            if worker.execution not in {"local", "ssh"}:
+                raise ValueError(
+                    f"worker {worker.id!r}: execution must be 'local' or 'ssh'"
+                )
+            if not worker.gpu_indices:
+                raise ValueError(f"worker {worker.id!r}: gpu_indices must not be empty")
+            if not PurePosixPath(worker.scratch_dir).is_absolute():
+                raise ValueError(f"worker {worker.id!r}: scratch_dir must be absolute")
+            if not _is_shared_data_path(worker.scratch_dir):
+                raise ValueError(
+                    f"worker {worker.id!r}: scratch_dir must be under /mnt/data "
+                    "or /home/yuhan"
+                )
+            if worker.execution == "local":
+                if worker.ssh_user or worker.ssh_host or worker.identity_file:
+                    raise ValueError(
+                        f"worker {worker.id!r}: local execution must not set SSH target fields"
+                    )
+            if worker.execution == "ssh":
+                if not worker.ssh_user:
+                    raise ValueError(f"worker {worker.id!r}: ssh_user is required")
+                if not worker.ssh_host:
+                    raise ValueError(f"worker {worker.id!r}: ssh_host is required")
+
+
+def _is_shared_data_path(path: str) -> bool:
+    normalized = path.rstrip("/")
+    return (
+        normalized == "/mnt/data"
+        or normalized.startswith("/mnt/data/")
+        or normalized == "/home/yuhan"
+        or normalized.startswith("/home/yuhan/")
+    )
+
+
+def _validate_env_var_name(name: str, field_name: str) -> None:
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+        raise ValueError(f"{field_name} contains invalid env var name: {name!r}")
 
 
 def load_cluster_config(path: str | Path) -> ClusterConfig:

@@ -9,27 +9,24 @@ import pytest
 import yaml
 
 from tensorcast_benchmark.kv.tc_router.resource import factory
-from tensorcast_benchmark.kv.tc_router.resource.brainctl import BrainctlProvider
+from tensorcast_benchmark.kv.tc_router.resource.local import LocalProvider
 
 # Reuse the GOOD_YAML fixture from test_resource_base via a local copy.
 GOOD_YAML: dict = {
     "provider": {
-        "kind": "brainctl",
-        "namespace": "shai-core",
-        "cli": "brainctl",
-        "user": "alice",
+        "kind": "local",
     },
-    "driver_host": {"scratch_dir": "/mnt/jfs/scratch"},
-    "mount": {"path": "/mnt/jfs"},
+    "driver_host": {"scratch_dir": "/tmp/tc_router/scratch"},
+    "mount": {"path": "/tmp/tc_router"},
     "workers": [
         {
             "id": "worker_a",
-            "address": "10.0.0.1",
+            "address": "127.0.0.1",
             "node": "node-1",
-            "process_handle": "rjob-001",
+            "process_handle": "local-a",
             "gpu_indices": [0, 1],
-            "scratch_dir": "/mnt/jfs/worker_a",
-            "base_env": {"NCCL_IB_HCA": "mlx5_2", "MASTER_ADDR": "10.0.0.1"},
+            "scratch_dir": "/tmp/tc_router/worker_a",
+            "base_env": {},
         },
     ],
     "service_placement": {
@@ -45,34 +42,32 @@ def _write_yaml(tmp_path: Path, data: dict) -> Path:
     return path
 
 
-def test_factory_dispatches_to_brainctl(tmp_path: Path) -> None:
+def test_factory_dispatches_to_local(tmp_path: Path) -> None:
     provider = factory.from_cluster_config(_write_yaml(tmp_path, GOOD_YAML))
-    assert isinstance(provider, BrainctlProvider)
+    assert isinstance(provider, LocalProvider)
     workers = provider.workers()
     assert len(workers) == 1
     w = workers[0]
     assert w.id == "worker_a"
-    assert w.address == "10.0.0.1"
+    assert w.address == "127.0.0.1"
     assert w.node == "node-1"
-    assert w.process_handle == "rjob-001"
-    assert w.namespace == "shai-core"
-    assert w.cli == "brainctl"
-    assert w.user == "alice"
-    assert w.base_env["NCCL_IB_HCA"] == "mlx5_2"
+    assert w.process_handle == "local-a"
+    assert w.base_env == {}
 
 
 def test_factory_rejects_unknown_kind(tmp_path: Path) -> None:
     bad = copy.deepcopy(GOOD_YAML)
     bad["provider"]["kind"] = "imaginary_cluster_cli"
+    bad["workers"][0]["base_env"] = {"REQUIRED_FOR_NON_LOCAL": "1"}
     with pytest.raises(ValueError, match="unknown provider.kind"):
         factory.from_cluster_config(_write_yaml(tmp_path, bad))
 
 
-def test_factory_registered_kinds_include_brainctl() -> None:
-    assert "brainctl" in factory.registered_kinds()
+def test_factory_registered_kinds_include_local_and_static() -> None:
+    assert factory.registered_kinds() == ["local", "static"]
 
 
-def test_brainctl_provider_workers_idempotent(tmp_path: Path) -> None:
+def test_local_provider_workers_idempotent(tmp_path: Path) -> None:
     """Calling workers() twice returns equivalent lists (cached)."""
     provider = factory.from_cluster_config(_write_yaml(tmp_path, GOOD_YAML))
     a = provider.workers()

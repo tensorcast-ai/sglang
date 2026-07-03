@@ -8,12 +8,16 @@ in `tools/live_check_sglang.py`.
 from __future__ import annotations
 
 import json
+import socket
 
 import pytest
+from aiohttp import web
 
+from tensorcast_benchmark.kv.tc_router.services.base import Service
 from tensorcast_benchmark.kv.tc_router.services.sglang import (
     FORBIDDEN_ARGS,
     SGLangLaunchSpec,
+    SGLangLauncher,
     build_launch_command,
 )
 
@@ -40,6 +44,15 @@ def test_basic_command_has_required_args() -> None:
     assert "--tp 1" in cmd
     assert "--page-size 32" in cmd
     assert "--mem-fraction-static 0.85" in cmd
+
+
+def test_bind_host_overrides_listen_host_without_changing_advertise_host() -> None:
+    spec = make_spec(host="10.0.10.58", bind_host="0.0.0.0")
+
+    cmd = build_launch_command(spec)
+
+    assert "--host 0.0.0.0" in cmd
+    assert spec.host == "10.0.10.58"
 
 
 def test_command_always_enables_cache_report() -> None:
@@ -92,16 +105,12 @@ def test_default_command_does_not_pass_tool_call_parser() -> None:
 
 def test_extra_args_with_tool_call_parser_is_rejected() -> None:
     with pytest.raises(ValueError, match="forbidden flag"):
-        build_launch_command(
-            make_spec(extra_args=("--tool-call-parser=qwen",))
-        )
+        build_launch_command(make_spec(extra_args=("--tool-call-parser=qwen",)))
 
 
 def test_extra_args_with_tool_call_parser_two_token_form_rejected() -> None:
     with pytest.raises(ValueError, match="forbidden flag"):
-        build_launch_command(
-            make_spec(extra_args=("--tool-call-parser", "qwen"))
-        )
+        build_launch_command(make_spec(extra_args=("--tool-call-parser", "qwen")))
 
 
 # --- HiCache flag gating -----------------------------------------------------
@@ -142,7 +151,9 @@ def test_storage_backend_mooncake_with_extra_config() -> None:
     )
     assert "--hicache-storage-backend mooncake" in cmd
     # JSON is sorted + compact; assert presence of canonical form.
-    expected_json = json.dumps({"bar": "baz", "foo": 1}, separators=(",", ":"), sort_keys=True)
+    expected_json = json.dumps(
+        {"bar": "baz", "foo": 1}, separators=(",", ":"), sort_keys=True
+    )
     assert expected_json in cmd
 
 
@@ -165,12 +176,52 @@ def test_trust_remote_code_when_enabled() -> None:
 
 
 def test_extra_args_appended() -> None:
-    cmd = build_launch_command(
-        make_spec(extra_args=("--log-level", "debug"))
-    )
+    cmd = build_launch_command(make_spec(extra_args=("--log-level", "debug")))
     assert "--log-level debug" in cmd
 
 
 def test_tp_size_serialized() -> None:
     cmd = build_launch_command(make_spec(tp_size=4))
     assert "--tp 4" in cmd
+
+
+def test_nccl_port_serialized_when_set() -> None:
+    cmd = build_launch_command(make_spec(nccl_port=65201))
+    assert "--nccl-port 65201" in cmd
+
+
+@pytest.mark.asyncio
+async def test_wait_ready_accepts_v1_models_when_health_stays_503() -> None:
+    app = web.Application()
+
+    async def health_handler(request: web.Request) -> web.Response:
+        return web.Response(status=503)
+
+    async def models_handler(request: web.Request) -> web.Response:
+        return web.json_response({"data": []})
+
+    app.router.add_get("/health", health_handler)
+    app.router.add_get("/v1/models", models_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    site = web.SockSite(runner, sock)
+    await site.start()
+
+    launcher = SGLangLauncher()
+    service = Service(
+        name="sglang_test",
+        worker_id="local",
+        endpoints={"serving_http": f"http://127.0.0.1:{port}"},
+        pid=0,
+        pid_path="/tmp/sglang_test.pid",
+        log_path="/tmp/sglang_test.log",
+    )
+    try:
+        await launcher.wait_ready(service, timeout_s=1.0, poll_interval_s=0.01)
+    finally:
+        await launcher.aclose()
+        await runner.cleanup()

@@ -9,7 +9,6 @@ import pyarrow.parquet as pq
 import pytest
 
 from tensorcast_benchmark.kv.tc_router.workload.trajectory_pool import (
-    Trajectory,
     _assistant_indices,
     _strip_nulls_deep,
     _trajectory_total_chars,
@@ -18,7 +17,9 @@ from tensorcast_benchmark.kv.tc_router.workload.trajectory_pool import (
 )
 
 
-def _msg(role: str, content: str = "", tool_calls=None, tool_call_id=None, name=None) -> dict:
+def _msg(
+    role: str, content: str = "", tool_calls=None, tool_call_id=None, name=None
+) -> dict:
     return {
         "role": role,
         "content": content,
@@ -38,7 +39,14 @@ def _tool_call(name: str, arguments: str, call_id: str) -> dict:
     }
 
 
-def _make_long_trajectory(session_id: str, instance_id: str, *, num_assistants: int = 5, content_len: int = 5000, resolved: bool = False) -> dict:
+def _make_long_trajectory(
+    session_id: str,
+    instance_id: str,
+    *,
+    num_assistants: int = 5,
+    content_len: int = 5000,
+    resolved: bool = False,
+) -> dict:
     """Build a synthetic trajectory with `num_assistants` LLM-call boundaries."""
     messages = [
         _msg("system", "you are an SWE agent"),
@@ -49,10 +57,19 @@ def _make_long_trajectory(session_id: str, instance_id: str, *, num_assistants: 
             _msg(
                 "assistant",
                 content="",
-                tool_calls=[_tool_call("str_replace_editor", '{"command":"view"}', f"call_{i}")],
+                tool_calls=[
+                    _tool_call("str_replace_editor", '{"command":"view"}', f"call_{i}")
+                ],
             )
         )
-        messages.append(_msg("tool", "Y" * content_len, tool_call_id=f"call_{i}", name="str_replace_editor"))
+        messages.append(
+            _msg(
+                "tool",
+                "Y" * content_len,
+                tool_call_id=f"call_{i}",
+                name="str_replace_editor",
+            )
+        )
     return {
         "instance_id": instance_id,
         "run_id": session_id,
@@ -93,7 +110,10 @@ def test_assistant_indices_returns_only_assistant_positions() -> None:
 
 
 def test_trajectory_total_chars_sums_all_messages() -> None:
-    msgs = [_msg("user", "abc"), _msg("assistant", "de", tool_calls=[_tool_call("n", "ar", "i")])]
+    msgs = [
+        _msg("user", "abc"),
+        _msg("assistant", "de", tool_calls=[_tool_call("n", "ar", "i")]),
+    ]
     # 3 + 2 + 1 + 2 = 8
     assert _trajectory_total_chars(msgs) == 8
 
@@ -102,8 +122,12 @@ def test_trajectory_total_chars_sums_all_messages() -> None:
 
 
 def test_filter_keeps_long_trajectory_rejects_short_one(tmp_path: Path) -> None:
-    long_traj = _make_long_trajectory("sess_long", "task_long", num_assistants=5, content_len=5000)
-    short_traj = _make_long_trajectory("sess_short", "task_short", num_assistants=2, content_len=100)
+    long_traj = _make_long_trajectory(
+        "sess_long", "task_long", num_assistants=5, content_len=5000
+    )
+    short_traj = _make_long_trajectory(
+        "sess_short", "task_short", num_assistants=2, content_len=100
+    )
     _write_parquet(tmp_path, [long_traj, short_traj])
 
     pool = load_pool(
@@ -133,7 +157,9 @@ def test_messages_preserved_verbatim(tmp_path: Path) -> None:
     assert pool[0].messages[1]["role"] == "user"
     assert pool[0].messages[2]["role"] == "assistant"
     # Tool call structure preserved.
-    assert pool[0].messages[2]["tool_calls"][0]["function"]["name"] == "str_replace_editor"
+    assert (
+        pool[0].messages[2]["tool_calls"][0]["function"]["name"] == "str_replace_editor"
+    )
 
 
 def test_shuffle_is_deterministic(tmp_path: Path) -> None:

@@ -24,6 +24,7 @@ import yaml
 from ..metrics.per_turn import TurnRecordWriter
 from ..metrics.summary import RunSummary, aggregate_cell, write_summary_csv
 from ..resource import factory as resource_factory
+from ..resource.base import ClusterConfig, load_cluster_config
 from ..router.gateway_router import GatewayRouter
 from ..router.policy import make_policy
 from ..router.tc_router import TcRouter, TcRouterConfig
@@ -52,6 +53,15 @@ _GATEWAY_POLICY = {
 }
 
 
+def _derive_nccl_port(serving_port: int) -> int:
+    for candidate in (serving_port + 100, serving_port - 100):
+        if 1024 <= candidate <= 65535:
+            return candidate
+    raise ValueError(
+        f"cannot derive a valid nccl_port from serving_port={serving_port}"
+    )
+
+
 def _now_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
@@ -62,22 +72,58 @@ def _resolve_run_dir(bench_cfg: BenchmarkConfig, *, root: Path) -> Path:
     return run_dir
 
 
+def _cluster_config_for_run(cluster_yaml: Path, run_dir: Path) -> ClusterConfig:
+    """Return the effective cluster config for this run.
+
+    Local and static workers should write all transient state under the run
+    directory so a completed or failed experiment is self-contained. Static
+    workers share /mnt/data across hosts, so the run directory is visible to
+    both local and SSH workers. Other remote providers keep their configured
+    scratch paths because those paths may be pre-mounted shared storage
+    outside the driver filesystem.
+    """
+    cfg = load_cluster_config(cluster_yaml)
+    if cfg.provider.kind not in {"local", "static"}:
+        return cfg
+
+    data = cfg.model_dump(mode="json")
+    scratch_root = run_dir / "scratch"
+    data["driver_host"]["scratch_dir"] = str(scratch_root / "driver")
+    if cfg.provider.kind == "local":
+        data["mount"]["path"] = str(run_dir / "mount")
+    for worker in data["workers"]:
+        worker["scratch_dir"] = str(scratch_root / "workers" / worker["id"])
+    return ClusterConfig.model_validate(data)
+
+
 def _save_resolved_configs(
     run_dir: Path,
     *,
     cluster_yaml: Path,
     bench_yaml: Path,
     bench_cfg: BenchmarkConfig,
+    cluster_cfg: ClusterConfig,
 ) -> None:
-    shutil.copy2(cluster_yaml, run_dir / "cluster.yaml")
+    shutil.copy2(cluster_yaml, run_dir / "cluster_input.yaml")
     shutil.copy2(bench_yaml, run_dir / "benchmark.yaml")
+    (run_dir / "cluster.yaml").write_text(
+        yaml.safe_dump(
+            cluster_cfg.model_dump(mode="json"),
+            sort_keys=False,
+            default_flow_style=False,
+        )
+    )
     # Resolved (post-validation) form.
     (run_dir / "benchmark_resolved.yaml").write_text(
-        yaml.safe_dump(bench_cfg.model_dump(), sort_keys=False, default_flow_style=False)
+        yaml.safe_dump(
+            bench_cfg.model_dump(), sort_keys=False, default_flow_style=False
+        )
     )
 
 
-def _append_top_level_csv(rows: list[RunSummary], top_csv: Path, *, run_id: str) -> None:
+def _append_top_level_csv(
+    rows: list[RunSummary], top_csv: Path, *, run_id: str
+) -> None:
     """Append summary rows to a rolling `outputs/benchmark_results.csv`.
 
     Adds a `run_id` column up front so multiple runs can coexist.
@@ -102,28 +148,50 @@ async def _launch_sglang_fleet(
     bench_cfg: BenchmarkConfig,
     sglang_launcher: SGLangLauncher,
     ready_timeout_s: float,
+    bind_host: str | None = None,
 ) -> list:
-    """Launch every SGLang instance in parallel, then wait for all to become healthy."""
-    services: list = []
-    launch_tasks = []
-    for p in placements:
+    """Launch every SGLang instance in parallel, then wait for readiness."""
+    services: list[object | None] = [None] * len(placements)
+    extra_args: tuple[str, ...] = ()
+    if bench_cfg.instances.sglang_log_level is not None:
+        extra_args = ("--log-level", bench_cfg.instances.sglang_log_level)
+
+    async def launch_one(idx: int, p: InstanceAssignment) -> None:
         spec = SGLangLaunchSpec(
             model_path=bench_cfg.model.path,
             host=p.worker.address,
+            bind_host=bind_host,
             port=p.port,
             tp_size=bench_cfg.model.tp_size,
+            nccl_port=_derive_nccl_port(p.port),
             gpu_indices=p.gpu_indices,
             mem_fraction_static=bench_cfg.instances.mem_fraction_static,
             page_size=bench_cfg.instances.page_size,
+            extra_args=extra_args,
         )
-        launch_tasks.append(sglang_launcher.launch(p.worker, spec))
-    services = await asyncio.gather(*launch_tasks)
-    logger.info("launched %d SGLang services; waiting ready...", len(services))
-    await asyncio.gather(
-        *[sglang_launcher.wait_ready(s, timeout_s=ready_timeout_s) for s in services]
-    )
+        service = await sglang_launcher.launch(p.worker, spec)
+        services[idx] = service
+
+    try:
+        await asyncio.gather(*(launch_one(idx, p) for idx, p in enumerate(placements)))
+        ready_services = [service for service in services if service is not None]
+        logger.info(
+            "launched %d SGLang services; waiting ready...", len(ready_services)
+        )
+        await asyncio.gather(
+            *[
+                sglang_launcher.wait_ready(s, timeout_s=ready_timeout_s)
+                for s in ready_services
+            ]
+        )
+    except BaseException:
+        for p, svc in reversed(list(zip(placements, services))):
+            if svc is not None:
+                with suppress(Exception):
+                    await sglang_launcher.stop(p.worker, svc)
+        raise
     logger.info("all %d SGLang services are healthy", len(services))
-    return services
+    return [service for service in services if service is not None]
 
 
 async def _stop_sglang_fleet(
@@ -218,7 +286,11 @@ async def _run_gateway_config(
     summary_rows: list[RunSummary] = []
     try:
         await gateway_launcher.wait_ready(gateway_svc, timeout_s=180.0)
-        logger.info("[%s] gateway healthy at %s", cfg_spec.kind, gateway_svc.endpoints["openai_http"])
+        logger.info(
+            "[%s] gateway healthy at %s",
+            cfg_spec.kind,
+            gateway_svc.endpoints["openai_http"],
+        )
 
         # Inter-turn sampler — same params for all (c_target, trial) cells of this config.
         delay_params = DelayParams.from_preset(
@@ -235,8 +307,13 @@ async def _run_gateway_config(
             for c_target in bench_cfg.workload.c_target_sweep:
                 for trial in range(bench_cfg.workload.trials):
                     cell_dir = cfg_dir / f"c{c_target}" / f"trial{trial}"
-                    sampler = LogNormalSampler(delay_params, seed=hash((cfg_spec.kind, c_target, trial)) & 0xFFFFFFFF)
-                    print(f"[run] {cfg_spec.kind} c={c_target} trial={trial} -> {cell_dir}")
+                    sampler = LogNormalSampler(
+                        delay_params,
+                        seed=hash((cfg_spec.kind, c_target, trial)) & 0xFFFFFFFF,
+                    )
+                    print(
+                        f"[run] {cfg_spec.kind} c={c_target} trial={trial} -> {cell_dir}"
+                    )
                     summary, info = await _run_one_cell(
                         cell_dir=cell_dir,
                         cfg_kind=cfg_spec.kind,
@@ -318,16 +395,25 @@ async def _run_tc_router_config(
     tc_router: Optional[TcRouter] = None
     try:
         # 1. Global store
-        logger.info("[%s] launching tensorcast global store on %s...", cfg_spec.kind, gs_worker.id)
+        logger.info(
+            "[%s] launching tensorcast global store on %s...",
+            cfg_spec.kind,
+            gs_worker.id,
+        )
         global_store_svc = await tc_launcher.launch_global_store(gs_worker, tc_spec)
         await tc_launcher.wait_global_ready(gs_worker, tc_spec, global_store_svc)
-        gs_host_port = (gs_worker.address, tc_spec.global_store_port)
+        gs_host_port = (
+            str(global_store_svc.endpoints["advertise_host"]),
+            tc_spec.global_store_port,
+        )
         logger.info("[%s] global store ready at %s:%d", cfg_spec.kind, *gs_host_port)
 
         # 2. Daemons (one per unique worker)
         capability_secret = f"tc_router-{bench_cfg.run_id}"
         for w in daemon_workers:
-            logger.info("[%s] launching tensorcast daemon on %s...", cfg_spec.kind, w.id)
+            logger.info(
+                "[%s] launching tensorcast daemon on %s...", cfg_spec.kind, w.id
+            )
             svc = await tc_launcher.launch_daemon(
                 w,
                 tc_spec,
@@ -401,7 +487,7 @@ async def _run_tc_router_config(
             with suppress(Exception):
                 await tc_router.close()
         # Stop daemons first, then global store.
-        for (w, svc) in reversed(daemon_svcs):
+        for w, svc in reversed(daemon_svcs):
             with suppress(Exception):
                 await tc_launcher.stop_daemon(w, tc_spec, svc)
         if global_store_svc is not None:
@@ -420,7 +506,21 @@ async def run_benchmark(
 ) -> Path:
     """Top-level entry. Returns the run output directory."""
     bench_cfg = load_benchmark_yaml(bench_yaml)
-    provider = resource_factory.from_cluster_config(cluster_yaml)
+    outputs_root = outputs_root or Path(__file__).resolve().parents[1] / "outputs"
+    outputs_root.mkdir(parents=True, exist_ok=True)
+    run_dir = _resolve_run_dir(bench_cfg, root=outputs_root)
+    print(f"[run_benchmark] run_dir = {run_dir}")
+    cluster_cfg = _cluster_config_for_run(cluster_yaml, run_dir)
+    _save_resolved_configs(
+        run_dir,
+        cluster_yaml=cluster_yaml,
+        bench_yaml=bench_yaml,
+        bench_cfg=bench_cfg,
+        cluster_cfg=cluster_cfg,
+    )
+
+    effective_cluster_yaml = run_dir / "cluster.yaml"
+    provider = resource_factory.from_cluster_config(effective_cluster_yaml)
 
     workers = provider.workers()
     placements = plan_instance_placement(
@@ -428,14 +528,6 @@ async def run_benchmark(
         instances_count=bench_cfg.instances.count,
         tp_size=bench_cfg.model.tp_size,
         base_port=bench_cfg.instances.base_port,
-    )
-
-    outputs_root = outputs_root or Path(__file__).resolve().parents[1] / "outputs"
-    outputs_root.mkdir(parents=True, exist_ok=True)
-    run_dir = _resolve_run_dir(bench_cfg, root=outputs_root)
-    print(f"[run_benchmark] run_dir = {run_dir}")
-    _save_resolved_configs(
-        run_dir, cluster_yaml=cluster_yaml, bench_yaml=bench_yaml, bench_cfg=bench_cfg
     )
 
     # Save placement plan for postmortem / debugging.
@@ -447,26 +539,31 @@ async def run_benchmark(
         )
     )
 
-    print(f"[run_benchmark] cluster health check...")
+    print("[run_benchmark] cluster health check...")
     await provider.health_check()
 
     sglang_launcher = SGLangLauncher()
     summary_rows: list[RunSummary] = []
     instance_services: list = []
     try:
-        print(f"[run_benchmark] launching {len(placements)} SGLang instances "
-              f"({bench_cfg.model.path}, tp={bench_cfg.model.tp_size})...")
+        print(
+            f"[run_benchmark] launching {len(placements)} SGLang instances "
+            f"({bench_cfg.model.path}, tp={bench_cfg.model.tp_size})..."
+        )
         t0 = time.monotonic()
         instance_services = await _launch_sglang_fleet(
             placements=placements,
             bench_cfg=bench_cfg,
             sglang_launcher=sglang_launcher,
             ready_timeout_s=sglang_ready_timeout_s,
+            bind_host="0.0.0.0" if cluster_cfg.provider.kind == "static" else None,
         )
         print(f"[run_benchmark] SGLang instances ready in {time.monotonic() - t0:.1f}s")
 
         # Load workload pool ONCE, shared across configs/cells.
-        print(f"[run_benchmark] loading trajectory pool from {bench_cfg.workload.dataset_path}...")
+        print(
+            f"[run_benchmark] loading trajectory pool from {bench_cfg.workload.dataset_path}..."
+        )
         pool = load_pool(
             bench_cfg.workload.dataset_path,
             min_turns=bench_cfg.workload.pool_filter.min_turns,
@@ -498,7 +595,9 @@ async def run_benchmark(
                         run_dir=run_dir,
                     )
                 else:
-                    logger.info("skipping unsupported config %s in this driver", cfg_spec.kind)
+                    logger.info(
+                        "skipping unsupported config %s in this driver", cfg_spec.kind
+                    )
                     rows = []
                 summary_rows.extend(rows)
             except Exception:  # noqa: BLE001
@@ -517,7 +616,7 @@ async def run_benchmark(
         return run_dir
     finally:
         if instance_services:
-            print(f"[run_benchmark] tearing down SGLang instances...")
+            print("[run_benchmark] tearing down SGLang instances...")
             with suppress(Exception):
                 await _stop_sglang_fleet(
                     placements=placements,
