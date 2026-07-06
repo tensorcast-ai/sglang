@@ -49,7 +49,7 @@ same N serving instances, and the same model**:
 | Config | Component in front | Notes |
 |---|---|---|
 | `gw_load_aware` | sgl-model-gateway, `--policy power_of_two` | No cache awareness |
-| `gw_cache_aware` | sgl-model-gateway, `--policy cache_aware` | Sticky session + imbalance fallback |
+| `gw_cache_aware` | sgl-model-gateway, `--policy cache_aware` | Prefix affinity + imbalance / low-match fallback |
 | `gw_load_aware_mooncake` | sgl-model-gateway, `--policy power_of_two`, SGLang HiCache backed by Mooncake | Isolates the value of a shared KV substrate from the value of programmability |
 | `tc_router` | Our user-space Python router, Tensorcast-backed | Eager session-level KV migration via `publish` / `hydrate` |
 
@@ -305,8 +305,10 @@ async supervisor:
 session_runner(traj):
   for k where traj.messages[k].role == "assistant":
     prompt_messages = traj.messages[0:k]
+    rid = f"tcrouter:{traj.session_id}:turn{turn_idx:03d}"
     result = await router.generate(
-        session_id=traj.run_id,
+        rid=rid,
+        session_id=traj.session_id,
         messages=prompt_messages,
         tools=traj.tools,
         sampling_params={"max_tokens": clip(estimate_response_tokens(traj, k), 1, 512)},
@@ -417,6 +419,57 @@ the chosen preset is recorded in `summary.csv` per row.
   600`), discard the first `T_warmup = 120` seconds.
 - 3 trials per `(config, C_target)` point.
 
+#### 5.4.1 Cell Isolation
+
+Cells in a `C_target` sweep must not inherit serving-side cache state from
+earlier cells. Otherwise a later, larger `C_target` can look better simply
+because an earlier cell warmed the same trajectory prefixes. This benchmark
+therefore treats each `(config, C_target, trial)` cell as a fresh cache
+experiment while keeping model load cost under control.
+
+The SGLang serving instances are **not restarted between cells**. They are
+launched once for the run and torn down at the end. Restarting Qwen3-32B TP=2
+for every cell would dominate experiment time with model-load overhead and
+would measure fleet churn as much as routing behavior.
+
+Instead, every cell boundary uses this protocol:
+
+1. Stop admitting new workload sessions when the cell reaches its wall-clock
+   deadline.
+2. Await all active session tasks, including their in-flight streaming
+   requests, so the cell's running and waiting requests drain naturally.
+3. Tear down the per-cell front router. For `gw_*`, this means stopping
+   `sgl-model-gateway`; for `tc_router`, this means closing the Python router
+   object. This resets router-local state such as the gateway
+   `cache_aware` approximate prefix tree.
+4. POST `/flush_cache` directly to every SGLang instance endpoint, not through
+   the gateway. The flush must succeed on every instance before the next cell
+   starts.
+5. Do not fail fast on the first non-200 flush response. SGLang returns failure
+   when it still observes running or waiting requests, so the driver should
+   poll all instances with a bounded retry loop until every instance returns
+   HTTP 200. A timeout is an experiment failure because the next cell would not
+   start from a clean KV state.
+6. Start a fresh front router for the next cell, then run workload warmup and
+   measurement for that cell.
+
+`/flush_cache` clears SGLang's radix/KV-cache-side state; it does not reset
+`sgl-model-gateway` policy memory. The per-cell gateway restart is therefore
+required for `gw_cache_aware`, even when all SGLang instances have flushed
+successfully.
+
+`warmup_seconds` and `warmup_counts` are measurement-window controls, not a
+separate cache preload phase. The workload may start immediately after the
+cell's clean startup, but records produced before
+`cell_start + warmup_seconds` or among the first `warmup_counts` completed
+turn records are marked as warmup and excluded from `summary.csv`. The count
+guard matters for sparse cells: with low concurrency and slow inter-turn
+delays, the first measured request may complete after the time guard has
+already elapsed, while it can still include SGLang post-flush/kernel warmup
+cost. Using both guards preserves natural multi-turn session evolution while
+preventing cold-start and post-flush transients from dominating the reported
+TTFT and cached-token ratios.
+
 ### 5.5 What the workload deliberately does *not* include
 
 - No artificial bursts. The narrative depends on the workload looking
@@ -436,7 +489,7 @@ the chosen preset is recorded in `summary.csv` per row.
 
 ```text
 [traffic generator]
-       │  in-process call: router.generate(session_id, messages, tools, ...)
+       │  in-process call: router.generate(rid, session_id, messages, tools, ...)
        ▼
 [tc_router]
        │  routes via /v1/chat/completions to chosen instance
@@ -462,6 +515,7 @@ class Router(Protocol):
     async def generate(
         self,
         *,
+        rid: str,                    # unique per-turn request id
         session_id: str,
         messages: list[dict],          # OpenAI chat-format messages
         tools: list[dict] | None,      # OpenAI function specs, optional
@@ -473,9 +527,10 @@ class Router(Protocol):
 
 Both the Tensorcast router and the gateway-baseline wrapper implement
 this interface. Each wrapper internally posts to its serving endpoint
-via `/v1/chat/completions` (OpenAI-compatible). The traffic generator
-does not know which router it is talking to and never sees a
-flattened prompt string.
+via `/v1/chat/completions` (OpenAI-compatible), carrying `rid` in the
+SGLang chat-completions `rid` field. The traffic generator does not
+know which router it is talking to and never sees a flattened prompt
+string.
 
 `GenerateResult` carries the streaming response text (discarded in
 faithful-replay mode), TTFT, total latency, served-instance label, and
@@ -499,16 +554,16 @@ The Tensorcast router maintains:
 - `pending_migrations: dict[session_id, MigrationFuture]` so an arriving
   request can wait on or supersede an in-flight migration
 
-On each `generate(session_id, messages, tools, ...)` call:
+On each `generate(rid, session_id, messages, tools, ...)` call:
 
 1. Resolve target instance:
    - if `session_id` has a `home_instance`, route there
    - else assign `home_instance` (round-robin or load-aware among
      instances) and route there
-2. Generate a unique `rid` for this turn, store it as
+2. Use the workload-provided unique `rid` for this turn, store it as
    `session_state[session_id].last_engine_request_id`, then post the
-   chat-completions request to the chosen instance. Record per-turn
-   metrics.
+   chat-completions request to the chosen instance with body field
+   `rid`. Record per-turn metrics.
 3. Update `last_active_ts`, `turn_count`, `last_prompt_tokens`.
 4. **Asynchronously** invoke `Rebalancer.maybe_rebalance(...)`. This
    never blocks the response.
@@ -838,16 +893,24 @@ Responsibilities:
 - run `health_check()` on the workers
 - if a future cross-host config enables RDMA, validate transport before
   launching services
+- launch the SGLang instance fleet once per run, using the placement plan
+  derived from `instances.count`, `model.tp_size`, and worker GPU windows
 - for each `(config, c_target, trial, preset)` cell of the sweep:
-  - launch services on the appropriate workers (via `services/`,
-    backed by `Worker.run`)
-  - wait for service health
+  - ensure the previous cell's workload has drained and no in-flight request
+    remains
+  - POST `/flush_cache` directly to every SGLang instance and retry until all
+    instances return HTTP 200, subject to a bounded timeout
+  - launch a fresh front router for this cell (`sgl-model-gateway` for
+    `gw_*`, Python `tc_router` for Tensorcast runs) and wait for health
   - run the traffic generator on the driver host for `T_wall` seconds
-  - tear down services launched for this cell
+  - mark turns emitted before `T_warmup` as warmup and exclude them from
+    cell-level summary metrics
+  - tear down the front router for this cell, but keep SGLang instances alive
   - logs are written under the configured scratch/output paths; with the
     local provider those paths are ordinary local filesystem paths
 - write a top-level `summary.csv` indexed by
   `(config, c_target, trial, preset)` with `transport_mode` recorded
+- tear down the SGLang instance fleet after the run completes or fails
 
 The driver does **not** acquire or release workers and does not assume
 which cluster CLI was used — see § 14 for the portability story.
@@ -1010,6 +1073,7 @@ workload:
   start_jitter_s: 1.0
   wall_seconds: 60
   warmup_seconds: 0
+  warmup_counts: 0
   trials: 1
   c_target_sweep: [3, 6]
 configs:
@@ -1017,6 +1081,11 @@ configs:
     policy:
       kind: never_rebalance
       seed: 0
+  - kind: gw_cache_aware
+    policy:                            # optional gateway CLI knobs
+      cache_threshold: 0.0             # emits --cache-threshold
+      balance_abs_threshold: 1000000   # emits --balance-abs-threshold
+      balance_rel_threshold: 1.5       # emits --balance-rel-threshold
 gateway:
   host: 127.0.0.1
   port: 61200
@@ -1033,6 +1102,11 @@ Validation rules at load time:
   `custom_sigma`; otherwise they MUST be absent.
 - `provider.kind: local` allows empty `base_env`; non-local providers
   are expected to define the environment needed by their transport.
+- `gw_cache_aware.policy`, when present, may contain only
+  `cache_threshold`, `balance_abs_threshold`, and
+  `balance_rel_threshold`; the driver forwards them to
+  `sgl-model-gateway`. `gw_load_aware` does not accept gateway policy
+  knobs.
 
 ### 9.3 Invocation
 
@@ -1057,7 +1131,9 @@ trajectory):
 ```jsonc
 {
   "ts": 1717920000.123,
-  "session_id": "gpt-4o-2024-08-06_maxiter_30_N_v2.1-no-hint-train-t04-run_1",
+  "elapsed_s": 142.8,
+  "is_warmup": false,
+  "session_id": "gpt-4o-2024-08-06_maxiter_30_N_v2.1-no-hint-train-t04-run_1::getmoto__moto-5321",
   "instance_id": "getmoto__moto-5321",
   "turn_index": 5,
   "prompt_messages_count": 11,
@@ -1069,14 +1145,23 @@ trajectory):
   "cached_tokens": 8704,
   "used_hydrated_bundle": true,
   "was_just_migrated": true,
-  "rid": "tcrouter:run_1:turn05"
+  "rid": "tcrouter:gpt-4o-2024-08-06_maxiter_30_N_v2.1-no-hint-train-t04-run_1::getmoto__moto-5321:turn005"
 }
 ```
 
-`session_id` is the trajectory's `run_id` from the dataset.
+`session_id` is a unique replay-session key built from the dataset
+`run_id` and `instance_id` as `run_id::instance_id`. If an exact pair
+appears more than once in the loaded shards, later occurrences append a
+deterministic `::dupN` suffix so every pool entry is a distinct
+simulated user/session.
 `instance_id` (column inside the per-turn record, **not** the SGLang
 serving-instance label) is the SWE-Gym task ID for traceability back
 to the source dataset row.
+
+`elapsed_s` is measured from the start of the cell's workload window.
+`is_warmup` is true when `elapsed_s < warmup_seconds` or when the turn is
+among the first `warmup_counts` completed records in that cell. Those rows
+remain in `turns.jsonl` for debugging but are excluded from `summary.csv`.
 
 ### 10.2 Per-migration record
 
@@ -1118,6 +1203,10 @@ TTL expires, the row is rewritten with `wasted: true`.
 - `migration_count`
 - `migration_utilization` (= migrations consumed / migrations issued)
 - `mean_publish_latency_ms`, `mean_hydrate_latency_ms`
+
+All summary latency, cache-ratio, completion, failure, and migration
+utilization metrics are computed over non-warmup records only
+(`is_warmup == false`). Warmup rows stay in JSONL for postmortem analysis.
 
 ## 11. Logging and Reproducibility
 

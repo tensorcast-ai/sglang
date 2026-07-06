@@ -23,9 +23,12 @@ from tensorcast_benchmark.kv.tc_router.router.gateway_router import (
 
 
 def test_extract_cached_tokens_openai_canonical() -> None:
-    assert _extract_cached_tokens(
-        {"prompt_tokens": 10, "prompt_tokens_details": {"cached_tokens": 7}}
-    ) == 7
+    assert (
+        _extract_cached_tokens(
+            {"prompt_tokens": 10, "prompt_tokens_details": {"cached_tokens": 7}}
+        )
+        == 7
+    )
 
 
 def test_extract_cached_tokens_sglang_flat() -> None:
@@ -71,31 +74,59 @@ class _FakeChatServer:
         await resp.prepare(request)
 
         # First content delta
-        await resp.write(_sse_chunk({
-            "choices": [{"delta": {"content": "Hello"}, "index": 0, "finish_reason": None}],
-            "usage": None,
-        }))
+        await resp.write(
+            _sse_chunk(
+                {
+                    "choices": [
+                        {
+                            "delta": {"content": "Hello"},
+                            "index": 0,
+                            "finish_reason": None,
+                        }
+                    ],
+                    "usage": None,
+                }
+            )
+        )
         await asyncio.sleep(0.01)
         # Second content delta
-        await resp.write(_sse_chunk({
-            "choices": [{"delta": {"content": " world"}, "index": 0, "finish_reason": None}],
-            "usage": None,
-        }))
+        await resp.write(
+            _sse_chunk(
+                {
+                    "choices": [
+                        {
+                            "delta": {"content": " world"},
+                            "index": 0,
+                            "finish_reason": None,
+                        }
+                    ],
+                    "usage": None,
+                }
+            )
+        )
         # Final stop chunk
-        await resp.write(_sse_chunk({
-            "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
-            "usage": None,
-        }))
+        await resp.write(
+            _sse_chunk(
+                {
+                    "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
+                    "usage": None,
+                }
+            )
+        )
         # Final usage chunk
-        await resp.write(_sse_chunk({
-            "choices": [],
-            "usage": {
-                "prompt_tokens": self.prompt_tokens,
-                "completion_tokens": 2,
-                "total_tokens": self.prompt_tokens + 2,
-                "prompt_tokens_details": {"cached_tokens": self.cached_tokens},
-            },
-        }))
+        await resp.write(
+            _sse_chunk(
+                {
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": self.prompt_tokens,
+                        "completion_tokens": 2,
+                        "total_tokens": self.prompt_tokens + 2,
+                        "prompt_tokens_details": {"cached_tokens": self.cached_tokens},
+                    },
+                }
+            )
+        )
         await resp.write(b"data: [DONE]\n\n")
         await resp.write_eof()
         return resp
@@ -123,6 +154,7 @@ async def test_gateway_router_parses_stream_and_usage() -> None:
     router = GatewayRouter(base, default_model="Qwen3-32B")
     try:
         result = await router.generate(
+            rid="tcrouter:s1:turn000",
             session_id="s1",
             messages=[{"role": "user", "content": "hi"}],
             tools=None,
@@ -135,6 +167,8 @@ async def test_gateway_router_parses_stream_and_usage() -> None:
         assert result.prompt_tokens == 1234
         assert result.cached_tokens == 900
         assert result.served_instance == "10.0.0.1:30001"
+        assert fake.last_request is not None
+        assert fake.last_request["rid"] == "tcrouter:s1:turn000"
     finally:
         await router.close()
         await runner.cleanup()
@@ -147,6 +181,7 @@ async def test_gateway_router_includes_tools_in_request() -> None:
     router = GatewayRouter(base, default_model="m")
     try:
         await router.generate(
+            rid="tcrouter:s:turn000",
             session_id="s",
             messages=[{"role": "user", "content": "hi"}],
             tools=[{"type": "function", "function": {"name": "f", "parameters": {}}}],
@@ -155,6 +190,7 @@ async def test_gateway_router_includes_tools_in_request() -> None:
         assert fake.last_request is not None
         assert fake.last_request["stream"] is True
         assert fake.last_request["stream_options"] == {"include_usage": True}
+        assert fake.last_request["rid"] == "tcrouter:s:turn000"
         assert fake.last_request["tools"][0]["function"]["name"] == "f"
     finally:
         await router.close()
@@ -177,6 +213,7 @@ async def test_gateway_router_returns_failure_on_http_error() -> None:
     router = GatewayRouter(base, default_model="m")
     try:
         result = await router.generate(
+            rid="tcrouter:s:turn000",
             session_id="s",
             messages=[{"role": "user", "content": "hi"}],
             tools=None,

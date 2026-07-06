@@ -19,6 +19,7 @@ from tensorcast_benchmark.kv.tc_router.services.sglang import (
     SGLangLaunchSpec,
     SGLangLauncher,
     build_launch_command,
+    flush_sglang_caches,
 )
 
 
@@ -30,6 +31,17 @@ def make_spec(**overrides) -> SGLangLaunchSpec:
     )
     defaults.update(overrides)
     return SGLangLaunchSpec(**defaults)
+
+
+async def _start_app(app: web.Application) -> tuple[web.AppRunner, int]:
+    runner = web.AppRunner(app)
+    await runner.setup()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    site = web.SockSite(runner, sock)
+    await site.start()
+    return runner, port
 
 
 # --- Required-arg presence ---------------------------------------------------
@@ -203,13 +215,7 @@ async def test_wait_ready_accepts_v1_models_when_health_stays_503() -> None:
     app.router.add_get("/health", health_handler)
     app.router.add_get("/v1/models", models_handler)
 
-    runner = web.AppRunner(app)
-    await runner.setup()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    site = web.SockSite(runner, sock)
-    await site.start()
+    runner, port = await _start_app(app)
 
     launcher = SGLangLauncher()
     service = Service(
@@ -225,3 +231,64 @@ async def test_wait_ready_accepts_v1_models_when_health_stays_503() -> None:
     finally:
         await launcher.aclose()
         await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_flush_sglang_caches_retries_until_all_endpoints_return_200() -> None:
+    app = web.Application()
+    counts: dict[str, int] = {"a": 0, "b": 0}
+
+    async def flush_handler(request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        counts[name] += 1
+        if name == "a" and counts[name] < 2:
+            return web.Response(status=503, text="a still busy")
+        if name == "b" and counts[name] < 3:
+            return web.Response(status=409, text="b still has waiting requests")
+        return web.Response(text="ok")
+
+    app.router.add_post("/{name}/flush_cache", flush_handler)
+    runner, port = await _start_app(app)
+
+    try:
+        result = await flush_sglang_caches(
+            (f"http://127.0.0.1:{port}/a", f"http://127.0.0.1:{port}/b"),
+            timeout_s=1.0,
+            poll_interval_s=0.01,
+            request_timeout_s=0.2,
+        )
+    finally:
+        await runner.cleanup()
+
+    assert counts == {"a": 2, "b": 3}
+    assert len(result.attempts) == 2
+    assert all(attempt.ok for attempt in result.attempts)
+    assert all(attempt.status == 200 for attempt in result.attempts)
+
+
+@pytest.mark.asyncio
+async def test_flush_sglang_caches_timeout_includes_endpoint_details() -> None:
+    app = web.Application()
+
+    async def flush_handler(request: web.Request) -> web.Response:
+        return web.Response(status=503, text="running requests remain")
+
+    app.router.add_post("/flush_cache", flush_handler)
+    runner, port = await _start_app(app)
+    endpoint = f"http://127.0.0.1:{port}"
+
+    try:
+        with pytest.raises(TimeoutError) as exc_info:
+            await flush_sglang_caches(
+                (endpoint,),
+                timeout_s=0.05,
+                poll_interval_s=0.01,
+                request_timeout_s=0.01,
+            )
+    finally:
+        await runner.cleanup()
+
+    message = str(exc_info.value)
+    assert endpoint in message
+    assert "status=503" in message
+    assert "running requests remain" in message

@@ -43,6 +43,7 @@ class Router(Protocol):
     async def generate(
         self,
         *,
+        rid: str,
         session_id: str,
         messages: list[dict],
         tools: Optional[list[dict]],

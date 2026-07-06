@@ -29,6 +29,7 @@ class MockRouter:
     async def generate(
         self,
         *,
+        rid: str,
         session_id: str,
         messages,
         tools,
@@ -38,6 +39,7 @@ class MockRouter:
         await asyncio.sleep(0)
         self.calls.append(
             {
+                "rid": rid,
                 "session_id": session_id,
                 "messages_count": len(messages),
                 "tools_count": len(tools) if tools is not None else 0,
@@ -56,6 +58,30 @@ class MockRouter:
 
     async def close(self) -> None:
         pass
+
+
+class SlowRouter(MockRouter):
+    def __init__(self, delay_s: float) -> None:
+        super().__init__()
+        self._delay_s = delay_s
+
+    async def generate(
+        self,
+        *,
+        rid: str,
+        session_id: str,
+        messages,
+        tools,
+        sampling_params,
+    ) -> GenerateResult:
+        await asyncio.sleep(self._delay_s)
+        return await super().generate(
+            rid=rid,
+            session_id=session_id,
+            messages=messages,
+            tools=tools,
+            sampling_params=sampling_params,
+        )
 
 
 def _msg(
@@ -185,9 +211,112 @@ async def test_turn_record_fields_populated_correctly() -> None:
     assert rec.ttft_ms == 10.0
     assert rec.latency_ms is not None and rec.latency_ms > 0
     assert rec.rid.startswith("tcrouter:sess")
+    assert router.calls[0]["rid"] == rec.rid
     assert rec.success is True
+    assert rec.elapsed_s >= 0.0
+    assert rec.is_warmup is False
     assert rec.used_hydrated_bundle is False
     assert rec.was_just_migrated is False
+
+
+@pytest.mark.asyncio
+async def test_workload_marks_warmup_and_non_warmup_turn_records() -> None:
+    pool = _build_pool(1, num_assistants=8)
+    driver = WorkloadDriver(
+        SlowRouter(delay_s=0.02),
+        pool,
+        lambda: 0.0,
+        c_target=1,
+        wall_seconds=0.15,
+        warmup_seconds=0.05,
+        start_jitter_s=0.0,
+        max_new_tokens_clip=64,
+        rng_seed=0,
+        supervisor_tick_s=0.005,
+    )
+
+    outcome = await driver.run()
+
+    assert outcome.total_turns >= 3
+    assert any(record.is_warmup for record in driver.records)
+    assert any(not record.is_warmup for record in driver.records)
+    assert all(record.elapsed_s >= 0.0 for record in driver.records)
+    assert all(record.elapsed_s < 0.05 for record in driver.records if record.is_warmup)
+    assert all(
+        record.elapsed_s >= 0.05 for record in driver.records if not record.is_warmup
+    )
+
+
+@pytest.mark.asyncio
+async def test_workload_marks_first_warmup_count_turn_records() -> None:
+    pool = _build_pool(1, num_assistants=5)
+    driver = WorkloadDriver(
+        MockRouter(),
+        pool,
+        lambda: 0.0,
+        c_target=1,
+        wall_seconds=0.5,
+        warmup_seconds=0.0,
+        warmup_counts=2,
+        start_jitter_s=0.0,
+        max_new_tokens_clip=64,
+        rng_seed=0,
+        supervisor_tick_s=0.005,
+    )
+
+    await driver.run()
+
+    assert len(driver.records) >= 3
+    assert [record.is_warmup for record in driver.records[:3]] == [
+        True,
+        True,
+        False,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_turn_rids_are_unique_and_sent_to_router() -> None:
+    template = _build_pool(1, num_assistants=2)[0]
+    pool = [
+        Trajectory(
+            session_id="shared_run::task_a",
+            instance_id="task_a",
+            messages=template.messages,
+            tools=(),
+            assistant_indices=template.assistant_indices,
+            total_chars=1000,
+            estimated_tokens=1000,
+            resolved=False,
+        ),
+        Trajectory(
+            session_id="shared_run::task_b",
+            instance_id="task_b",
+            messages=template.messages,
+            tools=(),
+            assistant_indices=template.assistant_indices,
+            total_chars=1000,
+            estimated_tokens=1000,
+            resolved=False,
+        ),
+    ]
+    router = MockRouter()
+    driver = WorkloadDriver(
+        router,
+        pool,
+        lambda: 0.0,
+        c_target=2,
+        wall_seconds=0.2,
+        start_jitter_s=0.0,
+        max_new_tokens_clip=64,
+        rng_seed=0,
+        supervisor_tick_s=0.01,
+    )
+    await driver.run()
+
+    record_rids = [record.rid for record in driver.records]
+    sent_rids = [call["rid"] for call in router.calls]
+    assert len(record_rids) == len(set(record_rids))
+    assert sent_rids == record_rids
 
 
 @pytest.mark.asyncio
@@ -196,7 +325,7 @@ async def test_router_failure_recorded_as_failed_turn() -> None:
         def __init__(self) -> None:
             self.n = 0
 
-        async def generate(self, *, session_id, messages, tools, sampling_params):
+        async def generate(self, *, rid, session_id, messages, tools, sampling_params):
             self.n += 1
             if self.n == 2:
                 raise RuntimeError("boom")
@@ -247,6 +376,8 @@ async def test_jsonl_sink_writes_records(tmp_path: Path) -> None:
     parsed = [json.loads(line) for line in lines]
     assert all("session_id" in p for p in parsed)
     assert all("ttft_ms" in p for p in parsed)
+    assert all("elapsed_s" in p for p in parsed)
+    assert all("is_warmup" in p for p in parsed)
 
 
 @pytest.mark.asyncio

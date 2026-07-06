@@ -13,6 +13,7 @@ from typing import Optional
 import aiohttp
 
 from ._chat_client import build_chat_completions_body, chat_completion_stream
+
 # Re-exported for backward-compat with tests written against gateway_router.
 from ._chat_client import extract_cached_tokens as _extract_cached_tokens  # noqa: F401
 from .interface import GenerateResult
@@ -48,13 +49,16 @@ class GatewayRouter:
     async def generate(
         self,
         *,
+        rid: str,
         session_id: str,
         messages: list[dict],
         tools: Optional[list[dict]],
         sampling_params: dict,
     ) -> GenerateResult:
+        _ = session_id
         body = build_chat_completions_body(
             model=self._model,
+            rid=rid,
             messages=messages,
             tools=tools,
             sampling_params=sampling_params,

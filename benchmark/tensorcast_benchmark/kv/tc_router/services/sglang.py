@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shutil
 import shlex
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional
@@ -23,6 +25,9 @@ from typing import Literal, Optional
 import aiohttp
 
 from .base import Service
+
+
+logger = logging.getLogger(__name__)
 
 
 def _default_workspace_root() -> str:
@@ -95,6 +100,24 @@ class SGLangLaunchSpec:
 
 # Args we must never produce in the launch command, per arch § 5.2.3.
 FORBIDDEN_ARGS: tuple[str, ...] = ("--tool-call-parser",)
+
+
+@dataclass(frozen=True)
+class FlushAttemptResult:
+    """One `/flush_cache` probe result for a SGLang endpoint."""
+
+    endpoint: str
+    ok: bool
+    status: int | None = None
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class FlushCachesResult:
+    """Final state after flushing all requested SGLang endpoints."""
+
+    attempts: tuple[FlushAttemptResult, ...]
+    elapsed_s: float
 
 
 def build_launch_command(spec: SGLangLaunchSpec) -> str:
@@ -202,6 +225,130 @@ def build_launch_command(spec: SGLangLaunchSpec) -> str:
                 "this should be impossible — please report (arch § 5.2.3)."
             )
     return cmd
+
+
+def _flush_cache_url(endpoint: str) -> str:
+    return f"{endpoint.rstrip('/')}/flush_cache"
+
+
+async def _post_flush_cache(
+    session: aiohttp.ClientSession,
+    endpoint: str,
+    *,
+    request_timeout_s: float,
+) -> FlushAttemptResult:
+    try:
+        async with session.post(
+            _flush_cache_url(endpoint),
+            timeout=aiohttp.ClientTimeout(total=request_timeout_s),
+            proxy=None,
+        ) as resp:
+            body = (await resp.text()).strip()
+            detail = body[:500] if body else f"HTTP {resp.status}"
+            return FlushAttemptResult(
+                endpoint=endpoint,
+                ok=resp.status == 200,
+                status=resp.status,
+                detail=detail,
+            )
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        return FlushAttemptResult(
+            endpoint=endpoint,
+            ok=False,
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+
+
+async def flush_sglang_caches(
+    endpoints: Sequence[str],
+    *,
+    timeout_s: float = 180.0,
+    poll_interval_s: float = 1.0,
+    request_timeout_s: float = 5.0,
+    session: aiohttp.ClientSession | None = None,
+) -> FlushCachesResult:
+    """POST `/flush_cache` to every SGLang endpoint until all return HTTP 200.
+
+    SGLang may reject a flush while it still observes running or waiting
+    requests from the previous cell, so this helper retries every
+    non-successful endpoint until the whole set is clean or the timeout
+    expires. It never routes through `sgl-model-gateway`.
+    """
+    unique_endpoints = tuple(
+        dict.fromkeys(endpoint.rstrip("/") for endpoint in endpoints)
+    )
+    if not unique_endpoints:
+        raise ValueError("flush_sglang_caches requires at least one endpoint")
+    if timeout_s <= 0:
+        raise ValueError("timeout_s must be > 0")
+    if poll_interval_s <= 0:
+        raise ValueError("poll_interval_s must be > 0")
+    if request_timeout_s <= 0:
+        raise ValueError("request_timeout_s must be > 0")
+
+    own_session = session is None
+    http = session or aiohttp.ClientSession(trust_env=False)
+    start = time.monotonic()
+    deadline = start + timeout_s
+    pending = set(unique_endpoints)
+    last_results: dict[str, FlushAttemptResult] = {}
+
+    try:
+        while pending:
+            results = await asyncio.gather(
+                *(
+                    _post_flush_cache(
+                        http,
+                        endpoint,
+                        request_timeout_s=request_timeout_s,
+                    )
+                    for endpoint in sorted(pending)
+                )
+            )
+            for result in results:
+                last_results[result.endpoint] = result
+                if result.ok:
+                    pending.discard(result.endpoint)
+                    continue
+                logger.warning(
+                    "SGLang flush_cache not ready endpoint=%s status=%s detail=%s",
+                    result.endpoint,
+                    result.status,
+                    result.detail,
+                )
+
+            if not pending:
+                break
+            now = time.monotonic()
+            if now >= deadline:
+                failures = [
+                    last_results.get(
+                        endpoint,
+                        FlushAttemptResult(
+                            endpoint=endpoint,
+                            ok=False,
+                            detail="no attempt completed",
+                        ),
+                    )
+                    for endpoint in sorted(pending)
+                ]
+                detail = "; ".join(
+                    f"{failure.endpoint} status={failure.status} detail={failure.detail}"
+                    for failure in failures
+                )
+                raise TimeoutError(
+                    "SGLang flush_cache did not succeed for "
+                    f"{len(failures)} endpoint(s) within {timeout_s}s: {detail}"
+                )
+            await asyncio.sleep(min(poll_interval_s, deadline - now))
+
+        return FlushCachesResult(
+            attempts=tuple(last_results[endpoint] for endpoint in unique_endpoints),
+            elapsed_s=time.monotonic() - start,
+        )
+    finally:
+        if own_session:
+            await http.close()
 
 
 class SGLangLauncher:

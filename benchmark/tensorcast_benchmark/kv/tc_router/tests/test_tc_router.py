@@ -143,6 +143,7 @@ async def test_tc_router_routes_same_session_to_same_home(fake_tensorcast) -> No
             results = []
             for i in range(5):
                 r = await router.generate(
+                    rid=f"tcrouter:sess1:turn{i:03d}",
                     session_id="sess1",
                     messages=[{"role": "user", "content": "hi"}],
                     tools=None,
@@ -191,6 +192,7 @@ async def test_tc_router_distinct_sessions_can_land_on_different_instances(
             homes = []
             for i in range(20):
                 r = await router.generate(
+                    rid=f"tcrouter:sess{i}:turn000",
                     session_id=f"sess{i}",
                     messages=[{"role": "user", "content": "hi"}],
                     tools=None,
@@ -246,8 +248,9 @@ async def test_tc_router_records_turn_count(fake_tensorcast) -> None:
         )
         await router.start()
         try:
-            for _ in range(3):
+            for i in range(3):
                 r = await router.generate(
+                    rid=f"tcrouter:sx:turn{i:03d}",
                     session_id="sx",
                     messages=[{"role": "user", "content": "hi"}],
                     tools=None,
@@ -257,6 +260,12 @@ async def test_tc_router_records_turn_count(fake_tensorcast) -> None:
             snap = router.session_state_snapshot()
             assert snap["sx"].turn_count == 3
             assert snap["sx"].home_instance == "a:0"
+            assert snap["sx"].last_engine_request_id == "tcrouter:sx:turn002"
+            assert [request["rid"] for request in s_a.requests] == [
+                "tcrouter:sx:turn000",
+                "tcrouter:sx:turn001",
+                "tcrouter:sx:turn002",
+            ]
         finally:
             await router.close()
     finally:

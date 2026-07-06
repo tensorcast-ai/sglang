@@ -329,7 +329,7 @@ configured `inter_turn_delay` preset, drives a steady-state of
 - [x] `workload/trajectory_pool.py`
   - [x] Load all parquet shards, project to `(instance_id, run_id, resolved, messages, tools)`.
   - [x] Filter: `turns >= min_turns AND total_chars / chars_per_token >= min_total_tokens` (chars-per-token ≈ 3.6, calibrated to o200k_base).
-  - [x] Build `Trajectory` records: `messages`, `tools`, `assistant_indices`, `total_chars`, `estimated_tokens`, `resolved`, `session_id` (= `run_id`), `instance_id` (SWE-Gym task).
+  - [x] Build `Trajectory` records: `messages`, `tools`, `assistant_indices`, `total_chars`, `estimated_tokens`, `resolved`, unique `session_id` (`run_id::instance_id`, with deterministic `::dupN` suffix for duplicate pairs), `instance_id` (SWE-Gym task).
   - [x] Deterministic shuffle with seed.
   - [x] Profile mode: `python -m tensorcast_benchmark.kv.tc_router.workload.trajectory_pool --dataset-path ... --report` prints turn / token / assistant-call distributions.
 - [x] `workload/inter_turn_delay.py`
@@ -470,6 +470,61 @@ metrics aggregation. No real router yet.
 - `tests/test_{gateway_launcher,gateway_router,placement,benchmark_config}.py`
 
 **Test summary**: `pytest tensorcast_benchmark/kv/tc_router/tests` from `thirdparty/sglang/benchmark` passes 126/126.
+
+---
+
+## 5.5 Cell isolation and warmup accounting
+
+**Goal**: make every `(config, c_target, trial)` cell start from a clean
+serving-side cache state without paying the cost of reloading the model for
+every cell. This implements arch § 5.4.1.
+
+SGLang instances stay alive for the whole run. Cell boundaries restart only
+the front router and flush SGLang KV/radix cache directly on each instance.
+
+**Deliverables**:
+
+- [x] Add a `services/sglang.py` flush helper:
+  - [x] POST `http://<instance>/flush_cache` directly to each SGLang serving endpoint, not through `sgl-model-gateway`.
+  - [x] Treat HTTP 200 as success; preserve the non-200 status/body in logs for debugging.
+  - [x] Retry all non-successful instances until every instance returns 200 or a bounded timeout expires.
+  - [x] Do not fail fast on the first non-200 response: SGLang may reject flush while it still observes running/waiting requests from the just-finished cell.
+  - [x] Surface a clear timeout error listing the endpoints that never flushed successfully.
+- [x] Refactor gateway baseline execution in `driver/benchmark_loop.py` from per-config gateway lifecycle to per-cell gateway lifecycle:
+  - [x] SGLang fleet is still launched once before the config/cell sweep and torn down once at run end.
+  - [x] For each gateway cell, flush all SGLang instances before launching `sgl-model-gateway`.
+  - [x] Launch a fresh gateway per cell so `gw_cache_aware` approximate prefix-tree state does not carry over across c-points.
+  - [x] Stop the gateway after that cell completes, before the next cell's flush.
+- [x] Apply the same cell-boundary protocol to `tc_router` cells:
+  - [x] Flush all SGLang instances before constructing the Python `TcRouter`.
+  - [x] Construct a fresh `TcRouter` per cell so session state, pending migrations, and router-local policy state do not carry over.
+  - [x] Keep Tensorcast daemon/global-store lifecycle at the config level unless implementation shows daemon/global-store state must also be reset for cache-isolated cells.
+- [x] Implement warmup accounting:
+  - [x] Extend `TurnRecord` with `elapsed_s` and `is_warmup`.
+  - [x] `WorkloadDriver` records `elapsed_s = now - cell_start` for every turn.
+  - [x] `is_warmup = elapsed_s < warmup_seconds`.
+  - [x] Add `warmup_counts` as a second guard: the first N completed turn records in each cell are marked warmup even if the time guard has elapsed.
+  - [x] `aggregate_cell` excludes warmup rows from TTFT/cache-ratio/completion/failure/migration-utilization summary metrics while leaving warmup rows in `turns.jsonl`.
+  - [x] Preserve current behavior when `warmup_seconds == 0` and `warmup_counts == 0`.
+- [x] Update tests:
+  - [x] Unit test: SGLang flush helper retries non-200 responses and succeeds once all endpoints eventually return 200.
+  - [x] Unit test: SGLang flush helper times out with endpoint details if one endpoint never returns 200.
+  - [x] Unit test: gateway launcher is invoked per cell and stopped per cell, while SGLang launcher is still invoked once per run.
+  - [x] Unit test: `tc_router` constructs a fresh Python router per cell while Tensorcast daemons/global-store remain per-config.
+  - [x] Unit test: `WorkloadDriver` marks warmup and non-warmup turn records correctly.
+  - [x] Unit test: `WorkloadDriver` marks the first `warmup_counts` completed turn records as warmup.
+  - [x] Unit test: `aggregate_cell` ignores warmup rows in summary metrics.
+  - [x] Regression test: existing `warmup_seconds: 0` fixtures produce the same summary as before.
+- [x] Update docs and configs if implementation changes any YAML knobs or output schema beyond `elapsed_s` / `is_warmup`.
+
+**Validation gate**:
+
+- [x] Run a short static/local smoke with `c_target_sweep` containing at least two c-values and `warmup_seconds > 0` (`outputs/20260703-071554_static-cache-aware-cacheonly-4inst-tp2-c4-8-16-32-64-wall60-warmup10`).
+- [x] Confirm each cell log shows all SGLang endpoints flushing successfully before the front router starts.
+- [x] Confirm gateway logs show a fresh gateway process per cell.
+- [x] Confirm no SGLang instance process is restarted between c-values.
+- [x] Confirm `turns.jsonl` contains both warmup and non-warmup rows when the cell is long enough.
+- [x] Confirm `summary.csv` totals and TTFT/cache-ratio metrics are computed only from non-warmup rows.
 
 ---
 

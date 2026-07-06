@@ -26,10 +26,15 @@ from ..metrics.summary import RunSummary, aggregate_cell, write_summary_csv
 from ..resource import factory as resource_factory
 from ..resource.base import ClusterConfig, load_cluster_config
 from ..router.gateway_router import GatewayRouter
+from ..router.interface import Router
 from ..router.policy import make_policy
 from ..router.tc_router import TcRouter, TcRouterConfig
 from ..services.gateway import GatewayLaunchSpec, GatewayLauncher
-from ..services.sglang import SGLangLaunchSpec, SGLangLauncher
+from ..services.sglang import (
+    SGLangLaunchSpec,
+    SGLangLauncher,
+    flush_sglang_caches,
+)
 from ..services.tensorcast import TensorcastLaunchSpec, TensorcastLauncher
 from ..workload.generator import WorkloadDriver
 from ..workload.inter_turn_delay import (
@@ -51,6 +56,31 @@ _GATEWAY_POLICY = {
     "gw_load_aware": "power_of_two",
     "gw_cache_aware": "cache_aware",
 }
+
+
+def _gateway_extra_args(cfg_spec: ConfigSpec) -> tuple[str, ...]:
+    """Translate gateway baseline policy knobs into sgl-model-gateway CLI args."""
+    if not cfg_spec.policy:
+        return ()
+    if cfg_spec.kind != "gw_cache_aware":
+        raise ValueError(f"{cfg_spec.kind} does not accept gateway policy knobs")
+
+    allowed = {
+        "cache_threshold": "--cache-threshold",
+        "balance_abs_threshold": "--balance-abs-threshold",
+        "balance_rel_threshold": "--balance-rel-threshold",
+    }
+    unknown = sorted(set(cfg_spec.policy) - set(allowed))
+    if unknown:
+        raise ValueError(f"unknown gw_cache_aware policy knob(s): {', '.join(unknown)}")
+
+    args: list[str] = []
+    for key, cli_flag in allowed.items():
+        value = cfg_spec.policy.get(key)
+        if value is None:
+            continue
+        args.extend((cli_flag, str(value)))
+    return tuple(args)
 
 
 def _derive_nccl_port(serving_port: int) -> int:
@@ -207,6 +237,24 @@ async def _stop_sglang_fleet(
             logger.exception("failed to stop SGLang service %s", svc.name)
 
 
+def _sglang_serving_urls(instance_services: list) -> tuple[str, ...]:
+    return tuple(
+        str(svc.endpoints["serving_http"]).rstrip("/") for svc in instance_services
+    )
+
+
+async def _flush_sglang_instances(instance_services: list, *, label: str) -> None:
+    urls = _sglang_serving_urls(instance_services)
+    logger.info("[%s] flushing SGLang caches on %d endpoint(s)...", label, len(urls))
+    result = await flush_sglang_caches(urls, timeout_s=180.0, poll_interval_s=1.0)
+    logger.info(
+        "[%s] SGLang cache flush complete on %d endpoint(s) in %.2fs",
+        label,
+        len(result.attempts),
+        result.elapsed_s,
+    )
+
+
 async def _run_one_cell(
     *,
     cell_dir: Path,
@@ -216,7 +264,7 @@ async def _run_one_cell(
     bench_cfg: BenchmarkConfig,
     pool,
     sampler: LogNormalSampler,
-    router: GatewayRouter,
+    router: Router,
 ) -> tuple[RunSummary, dict]:
     cell_dir.mkdir(parents=True, exist_ok=True)
     turns_path = cell_dir / "turns.jsonl"
@@ -229,6 +277,7 @@ async def _run_one_cell(
             c_target=c_target,
             wall_seconds=bench_cfg.workload.wall_seconds,
             warmup_seconds=bench_cfg.workload.warmup_seconds,
+            warmup_counts=bench_cfg.workload.warmup_counts,
             start_jitter_s=bench_cfg.workload.start_jitter_s,
             max_new_tokens_clip=bench_cfg.workload.max_new_tokens_clip,
             record_sink=writer.write,
@@ -265,7 +314,7 @@ async def _run_gateway_config(
     pool,
     run_dir: Path,
 ) -> list[RunSummary]:
-    """Launch the gateway with this config's policy, run the c_target × trials sweep, tear down."""
+    """Run gateway cells with a fresh gateway process per cell."""
     if cfg_spec.kind not in _GATEWAY_POLICY:
         return []
     policy = _GATEWAY_POLICY[cfg_spec.kind]
@@ -274,70 +323,78 @@ async def _run_gateway_config(
     cfg_dir.mkdir(parents=True, exist_ok=True)
 
     gateway_launcher = GatewayLauncher()
-    gateway_spec = GatewayLaunchSpec(
-        worker_urls=tuple(s.endpoints["serving_http"] for s in instance_services),
-        policy=policy,  # type: ignore[arg-type]
-        host=bench_cfg.gateway.host,
-        port=bench_cfg.gateway.port,
-        log_dir=str(cfg_dir / "gateway_log"),
-    )
-    logger.info("[%s] launching gateway (policy=%s)...", cfg_spec.kind, policy)
-    gateway_svc = await gateway_launcher.launch(gateway_spec)
     summary_rows: list[RunSummary] = []
-    try:
-        await gateway_launcher.wait_ready(gateway_svc, timeout_s=180.0)
-        logger.info(
-            "[%s] gateway healthy at %s",
-            cfg_spec.kind,
-            gateway_svc.endpoints["openai_http"],
-        )
 
-        # Inter-turn sampler — same params for all (c_target, trial) cells of this config.
-        delay_params = DelayParams.from_preset(
-            Preset(bench_cfg.workload.inter_turn_delay.preset),
-            custom_mu=bench_cfg.workload.inter_turn_delay.custom_mu,
-            custom_sigma=bench_cfg.workload.inter_turn_delay.custom_sigma,
-        )
+    # Inter-turn sampler — same params for all (c_target, trial) cells of this config.
+    delay_params = DelayParams.from_preset(
+        Preset(bench_cfg.workload.inter_turn_delay.preset),
+        custom_mu=bench_cfg.workload.inter_turn_delay.custom_mu,
+        custom_sigma=bench_cfg.workload.inter_turn_delay.custom_sigma,
+    )
 
-        router = GatewayRouter(
-            gateway_svc.endpoints["openai_http"],
-            default_model=bench_cfg.model.path,
-        )
-        try:
-            for c_target in bench_cfg.workload.c_target_sweep:
-                for trial in range(bench_cfg.workload.trials):
-                    cell_dir = cfg_dir / f"c{c_target}" / f"trial{trial}"
-                    sampler = LogNormalSampler(
-                        delay_params,
-                        seed=hash((cfg_spec.kind, c_target, trial)) & 0xFFFFFFFF,
-                    )
-                    print(
-                        f"[run] {cfg_spec.kind} c={c_target} trial={trial} -> {cell_dir}"
-                    )
-                    summary, info = await _run_one_cell(
-                        cell_dir=cell_dir,
-                        cfg_kind=cfg_spec.kind,
-                        c_target=c_target,
-                        trial=trial,
-                        bench_cfg=bench_cfg,
-                        pool=pool,
-                        sampler=sampler,
-                        router=router,
-                    )
-                    summary_rows.append(summary)
-                    print(
-                        f"  -> turns={info['total_turns']} "
-                        f"(success={info['successful_turns']}, fail={info['failed_turns']}); "
-                        f"ttft p50={summary.ttft_p50_ms} p95={summary.ttft_p95_ms} "
-                        f"cached_ratio={summary.cached_token_ratio_mean}"
-                    )
-        finally:
-            await router.close()
-    finally:
-        try:
-            await gateway_launcher.stop(gateway_svc)
-        except Exception:  # noqa: BLE001
-            logger.exception("failed to stop gateway")
+    for c_target in bench_cfg.workload.c_target_sweep:
+        for trial in range(bench_cfg.workload.trials):
+            cell_dir = cfg_dir / f"c{c_target}" / f"trial{trial}"
+            sampler = LogNormalSampler(
+                delay_params,
+                seed=hash((cfg_spec.kind, c_target, trial)) & 0xFFFFFFFF,
+            )
+            print(f"[run] {cfg_spec.kind} c={c_target} trial={trial} -> {cell_dir}")
+
+            await _flush_sglang_instances(
+                instance_services,
+                label=f"{cfg_spec.kind} c={c_target} trial={trial}",
+            )
+
+            gateway_spec = GatewayLaunchSpec(
+                worker_urls=tuple(
+                    svc.endpoints["serving_http"] for svc in instance_services
+                ),
+                policy=policy,  # type: ignore[arg-type]
+                host=bench_cfg.gateway.host,
+                port=bench_cfg.gateway.port,
+                log_dir=str(cell_dir / "gateway_log"),
+                extra_args=_gateway_extra_args(cfg_spec),
+            )
+            logger.info("[%s] launching gateway (policy=%s)...", cfg_spec.kind, policy)
+            gateway_svc = await gateway_launcher.launch(gateway_spec)
+            router: Router | None = None
+            try:
+                await gateway_launcher.wait_ready(gateway_svc, timeout_s=180.0)
+                logger.info(
+                    "[%s] gateway healthy at %s",
+                    cfg_spec.kind,
+                    gateway_svc.endpoints["openai_http"],
+                )
+                router = GatewayRouter(
+                    gateway_svc.endpoints["openai_http"],
+                    default_model=bench_cfg.model.path,
+                )
+                summary, info = await _run_one_cell(
+                    cell_dir=cell_dir,
+                    cfg_kind=cfg_spec.kind,
+                    c_target=c_target,
+                    trial=trial,
+                    bench_cfg=bench_cfg,
+                    pool=pool,
+                    sampler=sampler,
+                    router=router,
+                )
+                summary_rows.append(summary)
+                print(
+                    f"  -> turns={info['total_turns']} "
+                    f"(success={info['successful_turns']}, fail={info['failed_turns']}); "
+                    f"ttft p50={summary.ttft_p50_ms} p95={summary.ttft_p95_ms} "
+                    f"cached_ratio={summary.cached_token_ratio_mean}"
+                )
+            finally:
+                if router is not None:
+                    with suppress(Exception):
+                        await router.close()
+                try:
+                    await gateway_launcher.stop(gateway_svc)
+                except Exception:  # noqa: BLE001
+                    logger.exception("failed to stop gateway")
     return summary_rows
 
 
@@ -392,7 +449,6 @@ async def _run_tc_router_config(
     global_store_svc: Optional[object] = None
     daemon_svcs: list = []
     summary_rows: list[RunSummary] = []
-    tc_router: Optional[TcRouter] = None
     try:
         # 1. Global store
         logger.info(
@@ -424,10 +480,9 @@ async def _run_tc_router_config(
             daemon_svcs.append((w, svc))
             logger.info("[%s] daemon ready at %s", cfg_spec.kind, svc.endpoints["grpc"])
 
-        # 3. TcRouter — connect to the daemon co-located with SGLang. For
-        # the single-worker smoke that's the same worker; for multi-worker
-        # setups we pick the first daemon (its directory connects to the
-        # global store, which sees all daemons).
+        # 3. TcRouter connection target. For multi-worker setups we pick the
+        # first daemon; its directory connects to the global store, which sees
+        # all daemons.
         primary_daemon = daemon_svcs[0][1]
         instance_endpoints = {
             svc.endpoints["instance_id"]: svc.endpoints["serving_http"]
@@ -439,16 +494,6 @@ async def _run_tc_router_config(
             daemon_address=primary_daemon.endpoints["grpc"],
             request_timeout_s=600.0,
             load_polling_period_ms=bench_cfg.load_polling.period_ms,
-        )
-        policy = make_policy(cfg_spec.policy)
-        tc_router = TcRouter(tc_router_cfg, policy=policy)
-        await tc_router.start()
-        logger.info(
-            "[%s] TcRouter ready (policy=%s, daemon=%s, %d instances)",
-            cfg_spec.kind,
-            policy.name,
-            primary_daemon.endpoints["grpc"],
-            len(instance_endpoints),
         )
 
         # 4. Sweep cells
@@ -465,27 +510,43 @@ async def _run_tc_router_config(
                     seed=hash((cfg_spec.kind, c_target, trial)) & 0xFFFFFFFF,
                 )
                 print(f"[run] {cfg_spec.kind} c={c_target} trial={trial} -> {cell_dir}")
-                summary, info = await _run_one_cell(
-                    cell_dir=cell_dir,
-                    cfg_kind=cfg_spec.kind,
-                    c_target=c_target,
-                    trial=trial,
-                    bench_cfg=bench_cfg,
-                    pool=pool,
-                    sampler=sampler,
-                    router=tc_router,  # type: ignore[arg-type]
+                await _flush_sglang_instances(
+                    instance_services,
+                    label=f"{cfg_spec.kind} c={c_target} trial={trial}",
                 )
-                summary_rows.append(summary)
-                print(
-                    f"  -> turns={info['total_turns']} "
-                    f"(success={info['successful_turns']}, fail={info['failed_turns']}); "
-                    f"ttft p50={summary.ttft_p50_ms} p95={summary.ttft_p95_ms} "
-                    f"cached_ratio={summary.cached_token_ratio_mean}"
-                )
+
+                policy = make_policy(cfg_spec.policy)
+                tc_router = TcRouter(tc_router_cfg, policy=policy)
+                try:
+                    await tc_router.start()
+                    logger.info(
+                        "[%s] TcRouter ready (policy=%s, daemon=%s, %d instances)",
+                        cfg_spec.kind,
+                        policy.name,
+                        primary_daemon.endpoints["grpc"],
+                        len(instance_endpoints),
+                    )
+                    summary, info = await _run_one_cell(
+                        cell_dir=cell_dir,
+                        cfg_kind=cfg_spec.kind,
+                        c_target=c_target,
+                        trial=trial,
+                        bench_cfg=bench_cfg,
+                        pool=pool,
+                        sampler=sampler,
+                        router=tc_router,
+                    )
+                    summary_rows.append(summary)
+                    print(
+                        f"  -> turns={info['total_turns']} "
+                        f"(success={info['successful_turns']}, fail={info['failed_turns']}); "
+                        f"ttft p50={summary.ttft_p50_ms} p95={summary.ttft_p95_ms} "
+                        f"cached_ratio={summary.cached_token_ratio_mean}"
+                    )
+                finally:
+                    with suppress(Exception):
+                        await tc_router.close()
     finally:
-        if tc_router is not None:
-            with suppress(Exception):
-                await tc_router.close()
         # Stop daemons first, then global store.
         for w, svc in reversed(daemon_svcs):
             with suppress(Exception):

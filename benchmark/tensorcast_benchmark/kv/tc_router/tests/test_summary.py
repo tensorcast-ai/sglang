@@ -48,7 +48,13 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
             fh.write(json.dumps(r) + "\n")
 
 
-def _turn(success: bool = True, ttft_ms: float | None = 50.0, prompt_tokens: int = 1000, cached_tokens: int = 800, **extra: Any) -> dict:
+def _turn(
+    success: bool = True,
+    ttft_ms: float | None = 50.0,
+    prompt_tokens: int = 1000,
+    cached_tokens: int = 800,
+    **extra: Any,
+) -> dict:
     base = {
         "ts": 0.0,
         "session_id": "s",
@@ -72,7 +78,10 @@ def _turn(success: bool = True, ttft_ms: float | None = 50.0, prompt_tokens: int
 
 
 def test_aggregate_basic_quantiles(tmp_path: Path) -> None:
-    turns = [_turn(ttft_ms=t, prompt_tokens=1000, cached_tokens=800) for t in [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]]
+    turns = [
+        _turn(ttft_ms=t, prompt_tokens=1000, cached_tokens=800)
+        for t in [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    ]
     turns_path = tmp_path / "turns.jsonl"
     _write_jsonl(turns_path, turns)
 
@@ -123,6 +132,101 @@ def test_aggregate_excludes_failed_turns_from_ttft(tmp_path: Path) -> None:
     assert summary.ttft_mean_ms == pytest.approx(15.0)
 
 
+def test_aggregate_ignores_warmup_rows_in_summary_metrics(tmp_path: Path) -> None:
+    turns = [
+        _turn(
+            success=True,
+            ttft_ms=1000.0,
+            prompt_tokens=100,
+            cached_tokens=100,
+            elapsed_s=1.0,
+            is_warmup=True,
+            rid="warmup_success",
+        ),
+        _turn(
+            success=True,
+            ttft_ms=10.0,
+            prompt_tokens=100,
+            cached_tokens=20,
+            elapsed_s=11.0,
+            is_warmup=False,
+            rid="measured_success",
+        ),
+        _turn(
+            success=False,
+            ttft_ms=None,
+            elapsed_s=12.0,
+            is_warmup=False,
+            rid="measured_failure",
+            error_message="boom",
+        ),
+    ]
+    migrations = [
+        {
+            "ts": 0,
+            "session_id": "s1",
+            "source_instance": "A",
+            "target_instance": "B",
+            "publish_latency_ms": 1000.0,
+            "hydrate_latency_ms": 2000.0,
+            "transferred_bytes_estimated": 1024,
+            "decided_by": "T",
+            "consumed_by_turn_rid": "warmup_success",
+            "consumed_within_s": 1.0,
+            "wasted": False,
+        },
+        {
+            "ts": 0,
+            "session_id": "s2",
+            "source_instance": "A",
+            "target_instance": "C",
+            "publish_latency_ms": 30.0,
+            "hydrate_latency_ms": 80.0,
+            "transferred_bytes_estimated": 1024,
+            "decided_by": "T",
+            "consumed_by_turn_rid": "measured_success",
+            "consumed_within_s": 2.0,
+            "wasted": False,
+        },
+        {
+            "ts": 0,
+            "session_id": "s3",
+            "source_instance": "A",
+            "target_instance": "D",
+            "publish_latency_ms": 50.0,
+            "hydrate_latency_ms": 100.0,
+            "transferred_bytes_estimated": 2048,
+            "decided_by": "T",
+            "consumed_by_turn_rid": None,
+            "consumed_within_s": None,
+            "wasted": True,
+        },
+    ]
+    turns_path = tmp_path / "turns.jsonl"
+    migrations_path = tmp_path / "migrations.jsonl"
+    _write_jsonl(turns_path, turns)
+    _write_jsonl(migrations_path, migrations)
+
+    summary = aggregate_cell(
+        turns_path=turns_path,
+        migrations_path=migrations_path,
+        config="tc_router",
+        c_target=2,
+        trial=0,
+        inter_turn_delay_preset="agent_fast",
+        transport_mode="tcp",
+    )
+
+    assert summary.total_turns_completed == 2
+    assert summary.total_requests_failed == 1
+    assert summary.ttft_mean_ms == pytest.approx(10.0)
+    assert summary.cached_token_ratio_mean == pytest.approx(0.2)
+    assert summary.migration_count == 2
+    assert summary.migration_utilization == pytest.approx(0.5)
+    assert summary.mean_publish_latency_ms == pytest.approx(40.0)
+    assert summary.mean_hydrate_latency_ms == pytest.approx(90.0)
+
+
 def test_aggregate_handles_empty_turns_jsonl(tmp_path: Path) -> None:
     turns_path = tmp_path / "turns.jsonl"
     turns_path.write_text("")  # empty
@@ -165,20 +269,47 @@ def test_aggregate_with_migrations(tmp_path: Path) -> None:
 
     migs = [
         # consumed
-        {"ts": 0, "session_id": "s1", "source_instance": "A", "target_instance": "B",
-         "publish_latency_ms": 30.0, "hydrate_latency_ms": 80.0,
-         "transferred_bytes_estimated": 1024, "decided_by": "T",
-         "consumed_by_turn_rid": "r1", "consumed_within_s": 5.0, "wasted": False},
+        {
+            "ts": 0,
+            "session_id": "s1",
+            "source_instance": "A",
+            "target_instance": "B",
+            "publish_latency_ms": 30.0,
+            "hydrate_latency_ms": 80.0,
+            "transferred_bytes_estimated": 1024,
+            "decided_by": "T",
+            "consumed_by_turn_rid": "r1",
+            "consumed_within_s": 5.0,
+            "wasted": False,
+        },
         # consumed
-        {"ts": 0, "session_id": "s2", "source_instance": "A", "target_instance": "C",
-         "publish_latency_ms": 50.0, "hydrate_latency_ms": 100.0,
-         "transferred_bytes_estimated": 2048, "decided_by": "T",
-         "consumed_by_turn_rid": "r2", "consumed_within_s": 6.0, "wasted": False},
+        {
+            "ts": 0,
+            "session_id": "s2",
+            "source_instance": "A",
+            "target_instance": "C",
+            "publish_latency_ms": 50.0,
+            "hydrate_latency_ms": 100.0,
+            "transferred_bytes_estimated": 2048,
+            "decided_by": "T",
+            "consumed_by_turn_rid": "r2",
+            "consumed_within_s": 6.0,
+            "wasted": False,
+        },
         # wasted (rejected from utilization numerator)
-        {"ts": 0, "session_id": "s3", "source_instance": "A", "target_instance": "B",
-         "publish_latency_ms": 40.0, "hydrate_latency_ms": 90.0,
-         "transferred_bytes_estimated": 1024, "decided_by": "T",
-         "consumed_by_turn_rid": None, "consumed_within_s": None, "wasted": True},
+        {
+            "ts": 0,
+            "session_id": "s3",
+            "source_instance": "A",
+            "target_instance": "B",
+            "publish_latency_ms": 40.0,
+            "hydrate_latency_ms": 90.0,
+            "transferred_bytes_estimated": 1024,
+            "decided_by": "T",
+            "consumed_by_turn_rid": None,
+            "consumed_within_s": None,
+            "wasted": True,
+        },
     ]
     migrations_path = tmp_path / "migrations.jsonl"
     _write_jsonl(migrations_path, migs)
@@ -236,7 +367,10 @@ class _IntegrationMockRouter:
     def __init__(self) -> None:
         self.n = 0
 
-    async def generate(self, *, session_id, messages, tools, sampling_params) -> GenerateResult:
+    async def generate(
+        self, *, rid, session_id, messages, tools, sampling_params
+    ) -> GenerateResult:
+        _ = rid, session_id, tools, sampling_params
         self.n += 1
         await asyncio.sleep(0)
         # Vary TTFT so quantiles differ.
@@ -250,31 +384,62 @@ class _IntegrationMockRouter:
             success=True,
         )
 
-    async def close(self) -> None: pass
+    async def close(self) -> None:
+        pass
 
 
-def _msg(role: str, content: str = "", tool_calls=None, tool_call_id=None, name=None) -> dict:
-    return {"role": role, "content": content, "tool_calls": tool_calls,
-            "tool_call_id": tool_call_id, "name": name, "function_call": None}
+def _msg(
+    role: str, content: str = "", tool_calls=None, tool_call_id=None, name=None
+) -> dict:
+    return {
+        "role": role,
+        "content": content,
+        "tool_calls": tool_calls,
+        "tool_call_id": tool_call_id,
+        "name": name,
+        "function_call": None,
+    }
 
 
-def _build_pool(n: int, num_assistants: int = 3, content_len: int = 200) -> list[Trajectory]:
+def _build_pool(
+    n: int, num_assistants: int = 3, content_len: int = 200
+) -> list[Trajectory]:
     pool: list[Trajectory] = []
     for i in range(n):
         messages = [_msg("system", "sys"), _msg("user", "u" * content_len)]
         for k in range(num_assistants):
-            messages.append(_msg("assistant", "", tool_calls=[
-                {"id": f"c{k}", "index": 0, "type": "function",
-                 "function": {"name": "f", "arguments": "{}"}}]))
-            messages.append(_msg("tool", "t" * content_len, tool_call_id=f"c{k}", name="f"))
-        assistant_idx = tuple(j for j, m in enumerate(messages) if m["role"] == "assistant")
-        pool.append(Trajectory(
-            session_id=f"sess{i}", instance_id=f"task{i}",
-            messages=tuple(messages), tools=(),
-            assistant_indices=assistant_idx,
-            total_chars=sum(len(m.get("content") or "") for m in messages),
-            estimated_tokens=1000, resolved=False,
-        ))
+            messages.append(
+                _msg(
+                    "assistant",
+                    "",
+                    tool_calls=[
+                        {
+                            "id": f"c{k}",
+                            "index": 0,
+                            "type": "function",
+                            "function": {"name": "f", "arguments": "{}"},
+                        }
+                    ],
+                )
+            )
+            messages.append(
+                _msg("tool", "t" * content_len, tool_call_id=f"c{k}", name="f")
+            )
+        assistant_idx = tuple(
+            j for j, m in enumerate(messages) if m["role"] == "assistant"
+        )
+        pool.append(
+            Trajectory(
+                session_id=f"sess{i}",
+                instance_id=f"task{i}",
+                messages=tuple(messages),
+                tools=(),
+                assistant_indices=assistant_idx,
+                total_chars=sum(len(m.get("content") or "") for m in messages),
+                estimated_tokens=1000,
+                resolved=False,
+            )
+        )
     return pool
 
 

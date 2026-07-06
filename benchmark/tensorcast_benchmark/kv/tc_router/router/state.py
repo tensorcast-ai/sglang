@@ -21,7 +21,7 @@ SessionId = str
 class SessionState:
     """Per-session router state.
 
-    Mutable; each `tc_router.generate(session_id, ...)` call updates this.
+    Mutable; each `tc_router.generate(rid, session_id, ...)` call updates this.
     """
 
     session_id: SessionId

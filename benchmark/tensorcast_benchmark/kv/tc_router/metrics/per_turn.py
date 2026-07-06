@@ -7,7 +7,7 @@ that a crashed run still has data on disk.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import IO, Optional
 
@@ -21,6 +21,8 @@ class TurnRecord:
     """
 
     ts: float
+    elapsed_s: float
+    is_warmup: bool
     session_id: str
     instance_id: str
     turn_index: int

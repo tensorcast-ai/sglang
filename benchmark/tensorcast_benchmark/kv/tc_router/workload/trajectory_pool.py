@@ -18,9 +18,8 @@ from __future__ import annotations
 import argparse
 import random
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 # Per arch § 5.1.3 footnote: o200k_base chars/token observed at ~3.6 across
 # the SWE-Gym sample. We use this for filter pre-screening; benchmark-time
@@ -146,6 +145,18 @@ def _find_parquet_shards(dataset_path: str | Path) -> list[Path]:
     return candidates
 
 
+def _make_session_id(run_id: str, instance_id: str, occurrence: int) -> str:
+    """Build a deterministic per-trajectory session id.
+
+    OpenHands `run_id` names the agent/model run and is shared by many task
+    traces. A replay session must instead identify one concrete trajectory.
+    """
+    base = f"{run_id or 'unknown_run'}::{instance_id or 'unknown_instance'}"
+    if occurrence == 0:
+        return base
+    return f"{base}::dup{occurrence}"
+
+
 # --- public API --------------------------------------------------------------
 
 
@@ -169,6 +180,7 @@ def load_pool(
 
     shards = _find_parquet_shards(dataset_path)
     out: list[Trajectory] = []
+    seen_session_bases: dict[str, int] = {}
     for shard in shards:
         table = pq.read_table(
             str(shard),
@@ -190,11 +202,18 @@ def load_pool(
             # messages/tools so SGLang's JSON Schema validators accept the
             # payloads at request time (see _strip_nulls_deep docstring).
             messages_clean = _strip_nulls_deep(messages_raw) or []
-            tools_clean = _canonicalize_tools(_strip_nulls_deep(row.get("tools") or []) or [])
+            tools_clean = _canonicalize_tools(
+                _strip_nulls_deep(row.get("tools") or []) or []
+            )
+            run_id = str(row.get("run_id") or "")
+            instance_id = str(row.get("instance_id") or "")
+            session_base = f"{run_id}::{instance_id}"
+            occurrence = seen_session_bases.get(session_base, 0)
+            seen_session_bases[session_base] = occurrence + 1
             out.append(
                 Trajectory(
-                    session_id=str(row.get("run_id") or ""),
-                    instance_id=str(row.get("instance_id") or ""),
+                    session_id=_make_session_id(run_id, instance_id, occurrence),
+                    instance_id=instance_id,
                     messages=tuple(messages_clean),
                     tools=tuple(tools_clean),
                     assistant_indices=assistant_idx,
@@ -218,11 +237,15 @@ def _quantile(xs: list[int | float], p: float) -> float:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--dataset-path", required=True)
     parser.add_argument("--min-turns", type=int, default=8)
     parser.add_argument("--min-total-tokens", type=int, default=8000)
-    parser.add_argument("--chars-per-token", type=float, default=DEFAULT_CHARS_PER_TOKEN)
+    parser.add_argument(
+        "--chars-per-token", type=float, default=DEFAULT_CHARS_PER_TOKEN
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--report",
@@ -241,13 +264,17 @@ def main() -> int:
 
     if not args.report:
         for traj in pool[:50]:
-            print(f"{traj.session_id}\t{traj.instance_id}\tturns={len(traj.messages)}\testimated_tokens={traj.estimated_tokens}")
+            print(
+                f"{traj.session_id}\t{traj.instance_id}\tturns={len(traj.messages)}\testimated_tokens={traj.estimated_tokens}"
+            )
         if len(pool) > 50:
             print(f"... ({len(pool) - 50} more)")
         return 0
 
     if not pool:
-        print(f"pool is EMPTY after filter (min_turns={args.min_turns}, min_total_tokens={args.min_total_tokens})")
+        print(
+            f"pool is EMPTY after filter (min_turns={args.min_turns}, min_total_tokens={args.min_total_tokens})"
+        )
         return 1
 
     n_turns = [len(t.messages) for t in pool]
@@ -256,11 +283,15 @@ def main() -> int:
     resolved_count = sum(1 for t in pool if t.resolved)
 
     print(f"dataset       : {args.dataset_path}")
-    print(f"filter        : turns >= {args.min_turns}, tokens >= {args.min_total_tokens} (chars/token = {args.chars_per_token})")
+    print(
+        f"filter        : turns >= {args.min_turns}, tokens >= {args.min_total_tokens} (chars/token = {args.chars_per_token})"
+    )
     print(f"pool size     : {len(pool)}")
-    print(f"resolved      : {resolved_count} ({resolved_count*100/len(pool):.1f}%)")
+    print(f"resolved      : {resolved_count} ({resolved_count * 100 / len(pool):.1f}%)")
     print()
-    print(f"{'metric':<25} {'min':>8} {'p25':>8} {'median':>8} {'p75':>8} {'p95':>8} {'max':>8}")
+    print(
+        f"{'metric':<25} {'min':>8} {'p25':>8} {'median':>8} {'p75':>8} {'p95':>8} {'max':>8}"
+    )
     for label, xs in [
         ("turn count", n_turns),
         ("estimated tokens", n_tokens),

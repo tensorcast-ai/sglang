@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import csv
 import json
-from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -102,12 +101,12 @@ def aggregate_cell(
     Both files are JSONL with the schemas declared in arch § 10.1 / § 10.2.
     """
     turns = _read_jsonl(Path(turns_path))
-    successful = [t for t in turns if t.get("success") is True]
-    failed_count = len(turns) - len(successful)
+    metric_turns = [t for t in turns if not bool(t.get("is_warmup", False))]
+    successful = [t for t in metric_turns if t.get("success") is True]
+    failed_count = len(metric_turns) - len(successful)
 
     ttft_values = [
-        float(t["ttft_ms"]) for t in successful
-        if t.get("ttft_ms") is not None
+        float(t["ttft_ms"]) for t in successful if t.get("ttft_ms") is not None
     ]
     cached_ratios: list[float] = []
     for t in successful:
@@ -120,20 +119,36 @@ def aggregate_cell(
     if migrations_path is not None:
         migrations = _read_jsonl(Path(migrations_path))
 
+    warmup_by_rid = {
+        str(t["rid"]): bool(t.get("is_warmup", False))
+        for t in turns
+        if t.get("rid") is not None
+    }
+    metric_migrations = [
+        m
+        for m in migrations
+        if not bool(m.get("is_warmup", False))
+        and not bool(warmup_by_rid.get(str(m.get("consumed_by_turn_rid")), False))
+    ]
     consumed = sum(
-        1 for m in migrations
+        1
+        for m in metric_migrations
         if m.get("consumed_by_turn_rid") and not m.get("wasted")
     )
     publish_latencies = [
-        float(m["publish_latency_ms"]) for m in migrations
+        float(m["publish_latency_ms"])
+        for m in metric_migrations
         if m.get("publish_latency_ms") is not None
     ]
     hydrate_latencies = [
-        float(m["hydrate_latency_ms"]) for m in migrations
+        float(m["hydrate_latency_ms"])
+        for m in metric_migrations
         if m.get("hydrate_latency_ms") is not None
     ]
     migration_utilization: Optional[float]
-    migration_utilization = (consumed / len(migrations)) if migrations else None
+    migration_utilization = (
+        (consumed / len(metric_migrations)) if metric_migrations else None
+    )
 
     return RunSummary(
         config=config,
@@ -146,9 +161,9 @@ def aggregate_cell(
         ttft_p99_ms=_quantile(ttft_values, 0.99),
         ttft_mean_ms=_mean(ttft_values),
         cached_token_ratio_mean=_mean(cached_ratios),
-        total_turns_completed=len(turns),
+        total_turns_completed=len(metric_turns),
         total_requests_failed=failed_count,
-        migration_count=len(migrations),
+        migration_count=len(metric_migrations),
         migration_utilization=migration_utilization,
         mean_publish_latency_ms=_mean(publish_latencies),
         mean_hydrate_latency_ms=_mean(hydrate_latencies),

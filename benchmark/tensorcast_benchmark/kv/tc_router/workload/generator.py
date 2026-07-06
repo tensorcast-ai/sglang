@@ -19,7 +19,6 @@ import asyncio
 import logging
 import random
 import time
-from contextlib import suppress
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -53,6 +52,7 @@ class WorkloadDriver:
         c_target: int,
         wall_seconds: float,
         warmup_seconds: float = 0.0,
+        warmup_counts: int = 0,
         start_jitter_s: float = 2.0,
         max_new_tokens_clip: int = 512,
         record_sink: Optional[Callable[[TurnRecord], None]] = None,
@@ -64,6 +64,8 @@ class WorkloadDriver:
             raise ValueError("c_target must be >= 1")
         if wall_seconds <= 0:
             raise ValueError("wall_seconds must be > 0")
+        if warmup_counts < 0:
+            raise ValueError("warmup_counts must be >= 0")
         if not pool:
             raise ValueError("trajectory pool is empty")
         self._router = router
@@ -72,6 +74,7 @@ class WorkloadDriver:
         self._c_target = c_target
         self._wall_seconds = wall_seconds
         self._warmup_seconds = warmup_seconds
+        self._warmup_counts = warmup_counts
         self._start_jitter_s = start_jitter_s
         self._max_new_tokens_clip = max_new_tokens_clip
         self._sink = record_sink
@@ -109,6 +112,8 @@ class WorkloadDriver:
         prompt_messages: list[dict],
         max_new_tokens: int,
         rid: str,
+        elapsed_s: float,
+        is_warmup: bool,
         result: Optional[GenerateResult],
         latency_ms: float,
         success: bool,
@@ -116,6 +121,8 @@ class WorkloadDriver:
     ) -> TurnRecord:
         return TurnRecord(
             ts=time.time(),
+            elapsed_s=elapsed_s,
+            is_warmup=is_warmup,
             session_id=traj.session_id,
             instance_id=traj.instance_id,
             turn_index=turn_idx,
@@ -138,7 +145,11 @@ class WorkloadDriver:
         )
 
     async def _session_runner(
-        self, traj: Trajectory, *, deadline: float
+        self,
+        traj: Trajectory,
+        *,
+        deadline: float,
+        cell_start: float,
     ) -> None:
         # Tiny start jitter so sessions don't synchronize at supervisor tick.
         if self._start_jitter_s > 0:
@@ -154,7 +165,9 @@ class WorkloadDriver:
 
             prompt_messages = list(traj.messages[:assistant_pos])
             original_assistant = traj.messages[assistant_pos]
-            estimated = max(1, int(_turn_chars(original_assistant) / self._chars_per_token))
+            estimated = max(
+                1, int(_turn_chars(original_assistant) / self._chars_per_token)
+            )
             max_new_tokens = min(estimated, self._max_new_tokens_clip)
             rid = f"tcrouter:{traj.session_id}:turn{turn_idx:03d}"
 
@@ -164,6 +177,7 @@ class WorkloadDriver:
             error_message = ""
             try:
                 result = await self._router.generate(
+                    rid=rid,
                     session_id=traj.session_id,
                     messages=prompt_messages,
                     tools=tools,
@@ -179,7 +193,13 @@ class WorkloadDriver:
             except Exception as exc:  # noqa: BLE001
                 success = False
                 error_message = f"{type(exc).__name__}: {exc}"
-            latency_ms = (time.monotonic() - t0) * 1000.0
+            now = time.monotonic()
+            latency_ms = (now - t0) * 1000.0
+            elapsed_s = now - cell_start
+            record_index = len(self._records)
+            is_warmup = (
+                elapsed_s < self._warmup_seconds or record_index < self._warmup_counts
+            )
 
             rec = self._build_record(
                 traj=traj,
@@ -187,6 +207,8 @@ class WorkloadDriver:
                 prompt_messages=prompt_messages,
                 max_new_tokens=max_new_tokens,
                 rid=rid,
+                elapsed_s=elapsed_s,
+                is_warmup=is_warmup,
                 result=result,
                 latency_ms=latency_ms,
                 success=success,
@@ -233,7 +255,11 @@ class WorkloadDriver:
                         break  # pool exhausted; no new sessions until run end
                     self._started_sessions += 1
                     task = asyncio.create_task(
-                        self._session_runner(traj, deadline=deadline),
+                        self._session_runner(
+                            traj,
+                            deadline=deadline,
+                            cell_start=start,
+                        ),
                         name=f"session_{traj.session_id}",
                     )
                     active.add(task)

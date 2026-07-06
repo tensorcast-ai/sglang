@@ -27,6 +27,7 @@ GOOD: dict = {
         "start_jitter_s": 1.0,
         "wall_seconds": 60,
         "warmup_seconds": 0,
+        "warmup_counts": 0,
         "trials": 1,
         "c_target_sweep": [3, 6],
     },
@@ -51,7 +52,15 @@ def test_load_good_yaml(tmp_path: Path) -> None:
     assert cfg.workload.c_target_sweep == (3, 6)
     assert cfg.instances.sglang_log_level is None
     assert cfg.workload.inter_turn_delay.preset == "agent_medium"
+    assert cfg.workload.warmup_counts == 0
     assert {c.kind for c in cfg.configs} == {"gw_load_aware", "gw_cache_aware"}
+
+
+def test_warmup_counts_rejects_negative_values(tmp_path: Path) -> None:
+    bad = copy.deepcopy(GOOD)
+    bad["workload"]["warmup_counts"] = -1
+    with pytest.raises(Exception):
+        load_benchmark_yaml(_write(tmp_path, bad))
 
 
 def test_custom_preset_requires_params(tmp_path: Path) -> None:
@@ -163,6 +172,30 @@ def test_shipped_static_baseline_8inst_tp2_yaml_parses() -> None:
     assert (
         cfg.workload.dataset_path == "/mnt/data/dataset/OpenHands-Sampled-Trajectories"
     )
+
+
+def test_shipped_static_cache_aware_cacheonly_yaml_parses() -> None:
+    """The cache-aware-only static baseline YAML must parse cleanly."""
+    p = (
+        Path(__file__).resolve().parent.parent
+        / "configs"
+        / "benchmark_static_cache_aware_cacheonly_4inst_tp2_c4_8_16_32_64_wall300_warmup10.yaml"
+    )
+    cfg = load_benchmark_yaml(p)
+    assert cfg.run_id == (
+        "static-cache-aware-cacheonly-4inst-tp2-c4-8-16-32-64-wall300-warmup10"
+    )
+    assert cfg.model.path == "/mnt/data/models/Qwen3-32B"
+    assert cfg.model.tp_size == 2
+    assert cfg.instances.count == 4
+    assert len(cfg.configs) == 1
+    assert cfg.configs[0].kind == "gw_cache_aware"
+    assert cfg.configs[0].policy == {
+        "cache_threshold": 0.0,
+        "balance_abs_threshold": 1_000_000,
+        "balance_rel_threshold": 1.5,
+    }
+    assert cfg.workload.c_target_sweep == (4, 8, 16, 32, 64)
 
 
 def test_shipped_static_tc_router_8inst_tp2_yaml_parses() -> None:

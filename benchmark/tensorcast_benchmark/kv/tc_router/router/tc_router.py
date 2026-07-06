@@ -155,6 +155,7 @@ class TcRouter:
     async def generate(
         self,
         *,
+        rid: str,
         session_id: str,
         messages: list[dict],
         tools: Optional[list[dict]],
@@ -165,6 +166,7 @@ class TcRouter:
 
         body = build_chat_completions_body(
             model=self._config.default_model,
+            rid=rid,
             messages=messages,
             tools=tools,
             sampling_params=sampling_params,
@@ -186,9 +188,7 @@ class TcRouter:
                     state.last_active_ts = time.monotonic()
                     state.turn_count += 1
                     state.last_prompt_tokens = result.prompt_tokens
-                    state.last_engine_request_id = (
-                        f"tcrouter:{session_id}:turn{state.turn_count - 1:03d}"
-                    )
+                    state.last_engine_request_id = rid
         return result
 
     # --- introspection (handy for tests / driver logging) ------------------

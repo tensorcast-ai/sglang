@@ -77,6 +77,7 @@ class WorkloadConfig(BaseModel):
     start_jitter_s: float = Field(default=2.0, ge=0.0)
     wall_seconds: float = Field(default=600.0, gt=0.0)
     warmup_seconds: float = Field(default=0.0, ge=0.0)
+    warmup_counts: int = Field(default=0, ge=0)
     trials: int = Field(default=1, ge=1)
     c_target_sweep: tuple[int, ...] = Field(min_length=1)
 

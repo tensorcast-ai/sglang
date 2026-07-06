@@ -21,12 +21,14 @@ from .interface import GenerateResult
 def build_chat_completions_body(
     *,
     model: str,
+    rid: str,
     messages: list[dict],
     tools: Optional[list[dict]],
     sampling_params: dict,
 ) -> dict:
     body: dict[str, Any] = {
         "model": model,
+        "rid": rid,
         "messages": messages,
         "stream": True,
         # Required so SGLang puts the final `usage` chunk in the SSE stream

@@ -136,7 +136,7 @@ def test_filter_keeps_long_trajectory_rejects_short_one(tmp_path: Path) -> None:
         min_total_tokens=8000,
     )
     assert len(pool) == 1
-    assert pool[0].session_id == "sess_long"
+    assert pool[0].session_id == "sess_long::task_long"
 
 
 def test_assistant_indices_in_returned_trajectory(tmp_path: Path) -> None:
@@ -147,6 +147,25 @@ def test_assistant_indices_in_returned_trajectory(tmp_path: Path) -> None:
     # Layout: [system, user, asst0, tool0, asst1, tool1, asst2, tool2]
     # assistants at indices 2, 4, 6.
     assert pool[0].assistant_indices == (2, 4, 6)
+
+
+def test_session_id_is_unique_per_trace_row(tmp_path: Path) -> None:
+    rows = [
+        _make_long_trajectory("same_run", "task_a", num_assistants=3, content_len=5000),
+        _make_long_trajectory("same_run", "task_b", num_assistants=3, content_len=5000),
+        _make_long_trajectory("same_run", "task_a", num_assistants=3, content_len=5000),
+    ]
+    _write_parquet(tmp_path, rows)
+
+    pool = load_pool(tmp_path, min_turns=4, min_total_tokens=0, seed=0)
+    session_ids = {traj.session_id for traj in pool}
+
+    assert session_ids == {
+        "same_run::task_a",
+        "same_run::task_b",
+        "same_run::task_a::dup1",
+    }
+    assert len(session_ids) == len(pool)
 
 
 def test_messages_preserved_verbatim(tmp_path: Path) -> None:
