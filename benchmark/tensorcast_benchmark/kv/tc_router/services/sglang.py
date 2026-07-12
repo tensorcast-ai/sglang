@@ -17,7 +17,7 @@ import logging
 import shutil
 import shlex
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional
@@ -90,6 +90,10 @@ class SGLangLaunchSpec:
     # packs N=3 TP=2 instances on one 8-GPU host), the orchestrator passes
     # disjoint windows here. `len(gpu_indices)` MUST equal `tp_size`.
     gpu_indices: Optional[tuple[int, ...]] = None
+
+    # Extra service environment, used by storage backends that need per-worker
+    # bind/advertise controls outside the SGLang CLI surface.
+    extra_env: dict[str, str] = field(default_factory=dict)
 
     # Workspace location used to find sglang sources / .venv.
     workspace_root: str = field(default_factory=_default_workspace_root)
@@ -231,15 +235,20 @@ def _flush_cache_url(endpoint: str) -> str:
     return f"{endpoint.rstrip('/')}/flush_cache"
 
 
-async def _post_flush_cache(
+def _clear_hicache_storage_url(endpoint: str) -> str:
+    return f"{endpoint.rstrip('/')}/clear_hicache_storage_backend"
+
+
+async def _post_sglang_admin_endpoint(
     session: aiohttp.ClientSession,
     endpoint: str,
     *,
+    path_builder: Callable[[str], str],
     request_timeout_s: float,
 ) -> FlushAttemptResult:
     try:
         async with session.post(
-            _flush_cache_url(endpoint),
+            path_builder(endpoint),
             timeout=aiohttp.ClientTimeout(total=request_timeout_s),
             proxy=None,
         ) as resp:
@@ -259,26 +268,21 @@ async def _post_flush_cache(
         )
 
 
-async def flush_sglang_caches(
+async def _retry_sglang_admin_endpoint(
     endpoints: Sequence[str],
     *,
+    operation_name: str,
+    path_builder: Callable[[str], str],
     timeout_s: float = 180.0,
     poll_interval_s: float = 1.0,
     request_timeout_s: float = 5.0,
     session: aiohttp.ClientSession | None = None,
 ) -> FlushCachesResult:
-    """POST `/flush_cache` to every SGLang endpoint until all return HTTP 200.
-
-    SGLang may reject a flush while it still observes running or waiting
-    requests from the previous cell, so this helper retries every
-    non-successful endpoint until the whole set is clean or the timeout
-    expires. It never routes through `sgl-model-gateway`.
-    """
     unique_endpoints = tuple(
         dict.fromkeys(endpoint.rstrip("/") for endpoint in endpoints)
     )
     if not unique_endpoints:
-        raise ValueError("flush_sglang_caches requires at least one endpoint")
+        raise ValueError(f"{operation_name} requires at least one endpoint")
     if timeout_s <= 0:
         raise ValueError("timeout_s must be > 0")
     if poll_interval_s <= 0:
@@ -297,9 +301,10 @@ async def flush_sglang_caches(
         while pending:
             results = await asyncio.gather(
                 *(
-                    _post_flush_cache(
+                    _post_sglang_admin_endpoint(
                         http,
                         endpoint,
+                        path_builder=path_builder,
                         request_timeout_s=request_timeout_s,
                     )
                     for endpoint in sorted(pending)
@@ -311,7 +316,8 @@ async def flush_sglang_caches(
                     pending.discard(result.endpoint)
                     continue
                 logger.warning(
-                    "SGLang flush_cache not ready endpoint=%s status=%s detail=%s",
+                    "SGLang %s not ready endpoint=%s status=%s detail=%s",
+                    operation_name,
                     result.endpoint,
                     result.status,
                     result.detail,
@@ -337,7 +343,7 @@ async def flush_sglang_caches(
                     for failure in failures
                 )
                 raise TimeoutError(
-                    "SGLang flush_cache did not succeed for "
+                    f"SGLang {operation_name} did not succeed for "
                     f"{len(failures)} endpoint(s) within {timeout_s}s: {detail}"
                 )
             await asyncio.sleep(min(poll_interval_s, deadline - now))
@@ -349,6 +355,52 @@ async def flush_sglang_caches(
     finally:
         if own_session:
             await http.close()
+
+
+async def flush_sglang_caches(
+    endpoints: Sequence[str],
+    *,
+    timeout_s: float = 180.0,
+    poll_interval_s: float = 1.0,
+    request_timeout_s: float = 5.0,
+    session: aiohttp.ClientSession | None = None,
+) -> FlushCachesResult:
+    """POST `/flush_cache` to every SGLang endpoint until all return HTTP 200.
+
+    SGLang may reject a flush while it still observes running or waiting
+    requests from the previous cell, so this helper retries every
+    non-successful endpoint until the whole set is clean or the timeout
+    expires. It never routes through `sgl-model-gateway`.
+    """
+    return await _retry_sglang_admin_endpoint(
+        endpoints,
+        operation_name="flush_cache",
+        path_builder=_flush_cache_url,
+        timeout_s=timeout_s,
+        poll_interval_s=poll_interval_s,
+        request_timeout_s=request_timeout_s,
+        session=session,
+    )
+
+
+async def clear_sglang_hicache_storage_backends(
+    endpoints: Sequence[str],
+    *,
+    timeout_s: float = 180.0,
+    poll_interval_s: float = 1.0,
+    request_timeout_s: float = 5.0,
+    session: aiohttp.ClientSession | None = None,
+) -> FlushCachesResult:
+    """POST `/clear_hicache_storage_backend` until every endpoint returns HTTP 200."""
+    return await _retry_sglang_admin_endpoint(
+        endpoints,
+        operation_name="clear_hicache_storage_backend",
+        path_builder=_clear_hicache_storage_url,
+        timeout_s=timeout_s,
+        poll_interval_s=poll_interval_s,
+        request_timeout_s=request_timeout_s,
+        session=session,
+    )
 
 
 class SGLangLauncher:
@@ -395,12 +447,15 @@ class SGLangLauncher:
 
         cmd = build_launch_command(spec)
 
+        launch_env = {"CUDA_VISIBLE_DEVICES": cuda_visible}
+        launch_env.update(spec.extra_env)
+
         pid = await worker.start_background(
             cmd,
             name=f"sglang_{spec.port}",
             log_path=log_path,
             pid_path=pid_path,
-            env={"CUDA_VISIBLE_DEVICES": cuda_visible},
+            env=launch_env,
         )
         return Service(
             name=f"sglang_{spec.port}",

@@ -11,10 +11,12 @@ from __future__ import annotations
 import asyncio
 import csv
 import logging
+import re
 import shutil
 import time
 import traceback
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -24,15 +26,22 @@ import yaml
 from ..metrics.per_turn import TurnRecordWriter
 from ..metrics.summary import RunSummary, aggregate_cell, write_summary_csv
 from ..resource import factory as resource_factory
-from ..resource.base import ClusterConfig, load_cluster_config
+from ..resource.base import ClusterConfig, Worker, load_cluster_config
 from ..router.gateway_router import GatewayRouter
 from ..router.interface import Router
 from ..router.policy import make_policy
 from ..router.tc_router import TcRouter, TcRouterConfig
+from ..services.base import Service
 from ..services.gateway import GatewayLaunchSpec, GatewayLauncher
+from ..services.mooncake import (
+    MooncakeLaunchSpec,
+    MooncakeLauncher,
+    _mooncake_advertise_host,
+)
 from ..services.sglang import (
     SGLangLaunchSpec,
     SGLangLauncher,
+    clear_sglang_hicache_storage_backends,
     flush_sglang_caches,
 )
 from ..services.tensorcast import TensorcastLaunchSpec, TensorcastLauncher
@@ -55,7 +64,17 @@ logger = logging.getLogger(__name__)
 _GATEWAY_POLICY = {
     "gw_load_aware": "power_of_two",
     "gw_cache_aware": "cache_aware",
+    "gw_load_aware_mooncake": "power_of_two",
 }
+
+_PLAIN_CONFIG_KINDS = frozenset({"gw_load_aware", "gw_cache_aware", "tc_router"})
+_MOONCAKE_CONFIG_KINDS = frozenset({"gw_load_aware_mooncake"})
+
+
+@dataclass(frozen=True)
+class MooncakeBackendOptions:
+    extra_config: dict[str, object]
+    extra_env: dict[str, str]
 
 
 def _gateway_extra_args(cfg_spec: ConfigSpec) -> tuple[str, ...]:
@@ -83,6 +102,23 @@ def _gateway_extra_args(cfg_spec: ConfigSpec) -> tuple[str, ...]:
     return tuple(args)
 
 
+def _serving_profile_for_config(kind: str) -> str:
+    if kind in _PLAIN_CONFIG_KINDS:
+        return "plain"
+    if kind in _MOONCAKE_CONFIG_KINDS:
+        return "mooncake"
+    raise ValueError(f"unknown config kind for serving profile: {kind}")
+
+
+def _serving_profiles_for_configs(configs: list[ConfigSpec]) -> list[str]:
+    profiles: list[str] = []
+    for cfg_spec in configs:
+        profile = _serving_profile_for_config(cfg_spec.kind)
+        if profile not in profiles:
+            profiles.append(profile)
+    return profiles
+
+
 def _derive_nccl_port(serving_port: int) -> int:
     for candidate in (serving_port + 100, serving_port - 100):
         if 1024 <= candidate <= 65535:
@@ -90,6 +126,74 @@ def _derive_nccl_port(serving_port: int) -> int:
     raise ValueError(
         f"cannot derive a valid nccl_port from serving_port={serving_port}"
     )
+
+
+def _first_mooncake_device_name(device_name: str) -> str:
+    devices = [part.strip() for part in device_name.split(",") if part.strip()]
+    if not devices:
+        raise ValueError("Mooncake RDMA device_name must contain at least one device")
+    return devices[0]
+
+
+def _parse_rdma_netdev(rdma_output: str, device_name: str) -> str:
+    pattern = re.compile(
+        rf"\blink\s+{re.escape(device_name)}/\S+.*\bnetdev\s+(?P<netdev>\S+)"
+    )
+    for line in rdma_output.splitlines():
+        match = pattern.search(line)
+        if match is not None:
+            return match.group("netdev")
+    raise RuntimeError(
+        f"could not find netdev for RDMA device {device_name!r} in `rdma link show`"
+    )
+
+
+def _parse_ipv4_addr(ip_output: str, netdev: str) -> str:
+    match = re.search(r"\binet\s+(?P<cidr>[0-9.]+/\d+)", ip_output)
+    if match is None:
+        raise RuntimeError(f"could not find IPv4 address for netdev {netdev!r}")
+    return match.group("cidr").split("/", 1)[0]
+
+
+async def _resolve_worker_rdma_ipv4(worker: Worker, device_name: str) -> str:
+    rdma_proc = await worker.run(
+        "rdma link show",
+        timeout_s=30.0,
+        check=True,
+    )
+    netdev = _parse_rdma_netdev(rdma_proc.stdout, device_name)
+    ip_proc = await worker.run(
+        f"ip -o -4 addr show dev {netdev} scope global",
+        timeout_s=30.0,
+        check=True,
+    )
+    return _parse_ipv4_addr(ip_proc.stdout, netdev)
+
+
+async def _mooncake_backend_options(
+    *,
+    bench_cfg: BenchmarkConfig,
+    mooncake_service: Service,
+    worker: Worker,
+) -> MooncakeBackendOptions:
+    local_hostname = _mooncake_advertise_host(worker.address)
+    extra_env: dict[str, str] = {}
+    device_name = bench_cfg.mooncake.device_name.strip()
+    if bench_cfg.transport.use_rdma and device_name:
+        rpc_device_name = _first_mooncake_device_name(device_name)
+        local_hostname = await _resolve_worker_rdma_ipv4(worker, rpc_device_name)
+        extra_env["MC_TCP_BIND_ADDRESS"] = local_hostname
+
+    payload: dict[str, object] = {
+        "master_server_address": mooncake_service.endpoints["master_server_address"],
+        "metadata_server": mooncake_service.endpoints["metadata_server"],
+        "local_hostname": local_hostname,
+        "protocol": "rdma" if bench_cfg.transport.use_rdma else "tcp",
+        "global_segment_size": bench_cfg.mooncake.global_segment_size,
+    }
+    if device_name:
+        payload["device_name"] = device_name
+    return MooncakeBackendOptions(extra_config=payload, extra_env=extra_env)
 
 
 def _now_stamp() -> str:
@@ -179,6 +283,7 @@ async def _launch_sglang_fleet(
     sglang_launcher: SGLangLauncher,
     ready_timeout_s: float,
     bind_host: str | None = None,
+    mooncake_service: Service | None = None,
 ) -> list:
     """Launch every SGLang instance in parallel, then wait for readiness."""
     services: list[object | None] = [None] * len(placements)
@@ -187,6 +292,16 @@ async def _launch_sglang_fleet(
         extra_args = ("--log-level", bench_cfg.instances.sglang_log_level)
 
     async def launch_one(idx: int, p: InstanceAssignment) -> None:
+        mooncake_extra_config = None
+        mooncake_extra_env: dict[str, str] = {}
+        if mooncake_service is not None:
+            mooncake_options = await _mooncake_backend_options(
+                bench_cfg=bench_cfg,
+                mooncake_service=mooncake_service,
+                worker=p.worker,
+            )
+            mooncake_extra_config = mooncake_options.extra_config
+            mooncake_extra_env = mooncake_options.extra_env
         spec = SGLangLaunchSpec(
             model_path=bench_cfg.model.path,
             host=p.worker.address,
@@ -197,7 +312,13 @@ async def _launch_sglang_fleet(
             gpu_indices=p.gpu_indices,
             mem_fraction_static=bench_cfg.instances.mem_fraction_static,
             page_size=bench_cfg.instances.page_size,
+            enable_hierarchical_cache=mooncake_service is not None,
+            hicache_storage_backend=(
+                "mooncake" if mooncake_service is not None else None
+            ),
+            hicache_storage_backend_extra_config=mooncake_extra_config,
             extra_args=extra_args,
+            extra_env=mooncake_extra_env,
         )
         service = await sglang_launcher.launch(p.worker, spec)
         services[idx] = service
@@ -249,6 +370,24 @@ async def _flush_sglang_instances(instance_services: list, *, label: str) -> Non
     result = await flush_sglang_caches(urls, timeout_s=180.0, poll_interval_s=1.0)
     logger.info(
         "[%s] SGLang cache flush complete on %d endpoint(s) in %.2fs",
+        label,
+        len(result.attempts),
+        result.elapsed_s,
+    )
+
+
+async def _clear_sglang_hicache_storage(instance_services: list, *, label: str) -> None:
+    urls = _sglang_serving_urls(instance_services)
+    logger.info(
+        "[%s] clearing SGLang HiCache storage backends on %d endpoint(s)...",
+        label,
+        len(urls),
+    )
+    result = await clear_sglang_hicache_storage_backends(
+        urls, timeout_s=180.0, poll_interval_s=1.0
+    )
+    logger.info(
+        "[%s] SGLang HiCache storage clear complete on %d endpoint(s) in %.2fs",
         label,
         len(result.attempts),
         result.elapsed_s,
@@ -313,6 +452,7 @@ async def _run_gateway_config(
     instance_services: list,
     pool,
     run_dir: Path,
+    clear_hicache_storage_between_cells: bool = False,
 ) -> list[RunSummary]:
     """Run gateway cells with a fresh gateway process per cell."""
     if cfg_spec.kind not in _GATEWAY_POLICY:
@@ -345,6 +485,11 @@ async def _run_gateway_config(
                 instance_services,
                 label=f"{cfg_spec.kind} c={c_target} trial={trial}",
             )
+            if clear_hicache_storage_between_cells:
+                await _clear_sglang_hicache_storage(
+                    instance_services,
+                    label=f"{cfg_spec.kind} c={c_target} trial={trial}",
+                )
 
             gateway_spec = GatewayLaunchSpec(
                 worker_urls=tuple(
@@ -557,6 +702,37 @@ async def _run_tc_router_config(
     return summary_rows
 
 
+async def _launch_mooncake_service(
+    *,
+    bench_cfg: BenchmarkConfig,
+    cluster_provider,
+) -> tuple[Worker, MooncakeLauncher, Service]:
+    cluster_cfg = cluster_provider._config  # type: ignore[attr-defined]
+    workers_by_id = {w.id: w for w in cluster_provider.workers()}
+    worker_id = cluster_cfg.service_placement.mooncake_master_worker_id
+    worker = workers_by_id[worker_id]
+    spec = MooncakeLaunchSpec(
+        http_metadata_server_port=bench_cfg.mooncake.http_metadata_server_port,
+        master_port=bench_cfg.mooncake.master_port,
+        eviction_high_watermark_ratio=(
+            bench_cfg.mooncake.eviction_high_watermark_ratio
+        ),
+    )
+    launcher = MooncakeLauncher()
+    service = await launcher.launch(worker, spec)
+    try:
+        await launcher.wait_ready(
+            service,
+            timeout_s=spec.service_ready_timeout_s,
+            poll_interval_s=spec.service_poll_interval_s,
+        )
+    except BaseException:
+        with suppress(Exception):
+            await launcher.stop(worker, service)
+        raise
+    return worker, launcher, service
+
+
 async def run_benchmark(
     cluster_yaml: Path,
     bench_yaml: Path,
@@ -605,22 +781,7 @@ async def run_benchmark(
 
     sglang_launcher = SGLangLauncher()
     summary_rows: list[RunSummary] = []
-    instance_services: list = []
     try:
-        print(
-            f"[run_benchmark] launching {len(placements)} SGLang instances "
-            f"({bench_cfg.model.path}, tp={bench_cfg.model.tp_size})..."
-        )
-        t0 = time.monotonic()
-        instance_services = await _launch_sglang_fleet(
-            placements=placements,
-            bench_cfg=bench_cfg,
-            sglang_launcher=sglang_launcher,
-            ready_timeout_s=sglang_ready_timeout_s,
-            bind_host="0.0.0.0" if cluster_cfg.provider.kind == "static" else None,
-        )
-        print(f"[run_benchmark] SGLang instances ready in {time.monotonic() - t0:.1f}s")
-
         # Load workload pool ONCE, shared across configs/cells.
         print(
             f"[run_benchmark] loading trajectory pool from {bench_cfg.workload.dataset_path}..."
@@ -633,37 +794,113 @@ async def run_benchmark(
         )
         print(f"[run_benchmark] pool size: {len(pool)} trajectories")
 
-        for cfg_spec in bench_cfg.configs:
-            if config_filter is not None and cfg_spec.kind not in config_filter:
-                continue
+        selected_configs = [
+            cfg_spec
+            for cfg_spec in bench_cfg.configs
+            if config_filter is None or cfg_spec.kind in config_filter
+        ]
+
+        for profile in _serving_profiles_for_configs(selected_configs):
+            profile_configs = [
+                cfg_spec
+                for cfg_spec in selected_configs
+                if _serving_profile_for_config(cfg_spec.kind) == profile
+            ]
+            mooncake_worker: Worker | None = None
+            mooncake_launcher: MooncakeLauncher | None = None
+            mooncake_service: Service | None = None
+            instance_services: list = []
             try:
-                if cfg_spec.kind in _GATEWAY_POLICY:
-                    rows = await _run_gateway_config(
-                        cfg_spec=cfg_spec,
-                        bench_cfg=bench_cfg,
-                        instance_services=instance_services,
-                        pool=pool,
-                        run_dir=run_dir,
-                    )
-                elif cfg_spec.kind == "tc_router":
-                    rows = await _run_tc_router_config(
-                        cfg_spec=cfg_spec,
+                if profile == "mooncake":
+                    print("[run_benchmark] launching Mooncake master...")
+                    (
+                        mooncake_worker,
+                        mooncake_launcher,
+                        mooncake_service,
+                    ) = await _launch_mooncake_service(
                         bench_cfg=bench_cfg,
                         cluster_provider=provider,
-                        instance_services=instance_services,
-                        placements=placements,
-                        pool=pool,
-                        run_dir=run_dir,
                     )
-                else:
-                    logger.info(
-                        "skipping unsupported config %s in this driver", cfg_spec.kind
+                    print(
+                        "[run_benchmark] Mooncake master ready at "
+                        f"{mooncake_service.endpoints['master_server_address']}"
                     )
-                    rows = []
-                summary_rows.extend(rows)
-            except Exception:  # noqa: BLE001
-                logger.exception("config %s failed; continuing", cfg_spec.kind)
-                traceback.print_exc()
+
+                print(
+                    f"[run_benchmark] launching {len(placements)} SGLang instances "
+                    f"({bench_cfg.model.path}, tp={bench_cfg.model.tp_size}, "
+                    f"profile={profile})..."
+                )
+                t0 = time.monotonic()
+                instance_services = await _launch_sglang_fleet(
+                    placements=placements,
+                    bench_cfg=bench_cfg,
+                    sglang_launcher=sglang_launcher,
+                    ready_timeout_s=sglang_ready_timeout_s,
+                    bind_host=(
+                        "0.0.0.0" if cluster_cfg.provider.kind == "static" else None
+                    ),
+                    mooncake_service=mooncake_service,
+                )
+                print(
+                    "[run_benchmark] SGLang instances ready in "
+                    f"{time.monotonic() - t0:.1f}s (profile={profile})"
+                )
+
+                for cfg_spec in profile_configs:
+                    try:
+                        if cfg_spec.kind in _GATEWAY_POLICY:
+                            rows = await _run_gateway_config(
+                                cfg_spec=cfg_spec,
+                                bench_cfg=bench_cfg,
+                                instance_services=instance_services,
+                                pool=pool,
+                                run_dir=run_dir,
+                                clear_hicache_storage_between_cells=(
+                                    profile == "mooncake"
+                                    and bench_cfg.mooncake.clear_storage_between_cells
+                                ),
+                            )
+                        elif cfg_spec.kind == "tc_router":
+                            rows = await _run_tc_router_config(
+                                cfg_spec=cfg_spec,
+                                bench_cfg=bench_cfg,
+                                cluster_provider=provider,
+                                instance_services=instance_services,
+                                placements=placements,
+                                pool=pool,
+                                run_dir=run_dir,
+                            )
+                        else:
+                            logger.info(
+                                "skipping unsupported config %s in this driver",
+                                cfg_spec.kind,
+                            )
+                            rows = []
+                        summary_rows.extend(rows)
+                    except Exception:  # noqa: BLE001
+                        logger.exception("config %s failed; continuing", cfg_spec.kind)
+                        traceback.print_exc()
+            finally:
+                if instance_services:
+                    print(
+                        f"[run_benchmark] tearing down SGLang instances "
+                        f"(profile={profile})..."
+                    )
+                    with suppress(Exception):
+                        await _stop_sglang_fleet(
+                            placements=placements,
+                            services=instance_services,
+                            sglang_launcher=sglang_launcher,
+                        )
+                if (
+                    mooncake_worker is not None
+                    and mooncake_launcher is not None
+                    and mooncake_service is not None
+                ):
+                    print("[run_benchmark] tearing down Mooncake master...")
+                    with suppress(Exception):
+                        await mooncake_launcher.stop(mooncake_worker, mooncake_service)
 
         # Per-run summary
         write_summary_csv(summary_rows, run_dir / "summary.csv")
@@ -676,13 +913,5 @@ async def run_benchmark(
         print(f"[run_benchmark] wrote summary.csv with {len(summary_rows)} rows")
         return run_dir
     finally:
-        if instance_services:
-            print("[run_benchmark] tearing down SGLang instances...")
-            with suppress(Exception):
-                await _stop_sglang_fleet(
-                    placements=placements,
-                    services=instance_services,
-                    sglang_launcher=sglang_launcher,
-                )
         with suppress(Exception):
             await sglang_launcher.aclose()

@@ -53,8 +53,12 @@ same N serving instances, and the same model**:
 | `gw_load_aware_mooncake` | sgl-model-gateway, `--policy power_of_two`, SGLang HiCache backed by Mooncake | Isolates the value of a shared KV substrate from the value of programmability |
 | `tc_router` | Our user-space Python router, Tensorcast-backed | Eager session-level KV migration via `publish` / `hydrate` |
 
-The serving instances and SGLang configuration are identical across all
-four configs. Only the routing component changes.
+The model, TP size, instance count, placement plan, and workload are
+identical across configs. The serving launch profile is identical for
+the plain gateway baselines (`gw_load_aware`, `gw_cache_aware`). The
+Mooncake baseline uses the same fleet shape but starts SGLang with
+HiCache backed by Mooncake. The Tensorcast router uses the same plain
+SGLang fleet shape plus Tensorcast services and an in-process router.
 
 `gw_load_aware_mooncake` is the most important baseline: it tells us
 whether the win comes from "anyone can pull prefix pages out of a shared
@@ -458,6 +462,20 @@ Instead, every cell boundary uses this protocol:
 required for `gw_cache_aware`, even when all SGLang instances have flushed
 successfully.
 
+Mooncake-backed cells add one extra isolation step after all SGLang
+instances have accepted `/flush_cache`: POST
+`/clear_hicache_storage_backend` directly to the SGLang instance
+endpoints. Mooncake is a shared storage substrate, so clearing only the
+front-router state and local SGLang cache state is not enough; otherwise
+later `C_target` cells can observe prefix pages written by earlier cells.
+The clear operation is backed by SGLang's HiCache storage API
+(`MooncakeStore.clear()` calls the Mooncake store's `remove_all()`), so
+it is lighter than restarting the Mooncake master and keeps model-load
+cost out of the cell boundary. As with `/flush_cache`, the driver should
+poll every endpoint, collect all non-200 responses for diagnostics, and
+only proceed after all endpoints return HTTP 200. A timeout is an
+experiment failure because the next cell would inherit substrate state.
+
 `warmup_seconds` and `warmup_counts` are measurement-window controls, not a
 separate cache preload phase. The workload may start immediately after the
 cell's clean startup, but records produced before
@@ -535,6 +553,92 @@ string.
 `GenerateResult` carries the streaming response text (discarded in
 faithful-replay mode), TTFT, total latency, served-instance label, and
 the SGLang `meta_info` (specifically `prompt_tokens`, `cached_tokens`).
+
+#### 6.2.1 Gateway and Mooncake baseline contract
+
+The gateway baselines expose the same in-process `Router.generate(...)`
+contract to the workload generator. The wrapper posts each turn to
+`sgl-model-gateway` at `/v1/chat/completions`; the gateway then routes
+to one SGLang serving instance.
+
+`gw_load_aware_mooncake` is not a new routing policy. Its front router is
+the same gateway power-of-two load-aware policy used by
+`gw_load_aware`:
+
+```text
+[traffic generator]
+       │  in-process call: router.generate(...)
+       ▼
+[GatewayRouter wrapper]
+       │  /v1/chat/completions
+       ▼
+[sgl-model-gateway --policy power_of_two]
+       │
+       ▼
+[SGLang instance 0]  [SGLang instance 1]  ...  [SGLang instance N-1]
+       │                       │
+       └──────────────┬────────┘
+                      ▼
+      [SGLang HiCache storage backend = mooncake]
+                      │
+                      ▼
+      [Mooncake master + HTTP metadata service]
+```
+
+The only semantic delta from `gw_load_aware` is the SGLang serving
+profile: every SGLang instance in the Mooncake profile starts with
+hierarchical cache enabled and `--hicache-storage-backend mooncake`.
+This isolates the value of shared substrate-backed KV retention while
+keeping the gateway's routing algorithm load-aware and cache-unaware.
+
+The Mooncake master is a singleton service placed by
+`cluster.yaml.service_placement.mooncake_master_worker_id`. It runs the
+Mooncake master and HTTP metadata service in one process, following the
+same contract used by `kv/share_remote`: SGLang instances connect to the
+master server address for data-plane coordination and to the HTTP
+metadata endpoint for metadata. The advertised host must be reachable
+from every worker. If the placement worker's configured address is
+loopback (`127.0.0.1`, `localhost`, or `0.0.0.0`), the launcher must
+advertise a routable local IPv4 address instead; otherwise remote
+workers would try to connect to themselves.
+
+SGLang receives the Mooncake connection data through
+`--hicache-storage-backend-extra-config`, not through per-instance JSON
+files. The required payload fields are:
+
+- `master_server_address`: `<mooncake_advertise_host>:<master_port>`
+- `metadata_server`: `http://<mooncake_advertise_host>:<http_metadata_server_port>/metadata`
+- `local_hostname`: the worker-reachable address for the SGLang process's
+  worker
+- `protocol`: `tcp` when `transport.use_rdma == false`, otherwise `rdma`
+- `global_segment_size`: copied from `benchmark.yaml.mooncake`
+- `device_name`: copied from `benchmark.yaml.mooncake` when non-empty
+
+For Mooncake RDMA, "worker-reachable" means the IPv4 address attached to
+the selected RDMA HCA's Linux netdev, not necessarily the worker's SSH or
+HTTP control address. Some clusters expose a separate control network
+(`10.x`) and RDMA network (`22.x`) plus internal interfaces that are not
+mutually routable. If SGLang advertises the control address, or if
+Mooncake Transfer Engine auto-binds its RPC listener to an unreachable
+interface, `MooncakeStore.warmup()` can hang in `store.put()` until
+Mooncake reports a transfer timeout. For RDMA runs with non-empty
+`mooncake.device_name`, the driver resolves the first configured HCA with
+`rdma link show`, maps it to its `netdev`, reads that netdev's IPv4 with
+`ip -o -4 addr show`, and uses the resulting IP for both:
+
+- `local_hostname` in SGLang's Mooncake extra config
+- `MC_TCP_BIND_ADDRESS` in the SGLang process environment
+
+`MC_TCP_BIND_ADDRESS` is a Mooncake Transfer Engine environment variable;
+despite the name, it controls the RPC bind address used during RDMA
+setup as well. The Mooncake master and HTTP metadata service still
+advertise their normal worker-reachable control address because those
+endpoints are used for metadata/control-plane traffic, not RDMA data
+transfer.
+
+The benchmark intentionally does **not** set Mooncake
+`prefetch_threshold`; SGLang's default value is used so this baseline
+tracks upstream SGLang behavior rather than a benchmark-specific tuning.
 
 ### 6.3 Internal contract of `tc_router`
 
@@ -801,6 +905,13 @@ Tensorcast / Mooncake is selectable per-run via `transport.use_rdma` in
 - Tensorcast: `communicator.enable_rdma = true | false`
 - Mooncake: `protocol = rdma | tcp`
 
+For Mooncake TCP runs, `device_name` may be left empty and the launcher
+passes `protocol: tcp` in SGLang's Mooncake extra config. For Mooncake
+RDMA runs, `transport.use_rdma: true` maps to `protocol: rdma`; the
+cluster YAML or benchmark config must then supply the worker-appropriate
+HCA/device selection expected by Mooncake. RDMA smoke is a pre-service
+gate only for runs that explicitly enable RDMA.
+
 The chosen mode is recorded as a column in `summary.csv`.
 
 ### 7.5 RDMA smoke
@@ -893,13 +1004,26 @@ Responsibilities:
 - run `health_check()` on the workers
 - if a future cross-host config enables RDMA, validate transport before
   launching services
-- launch the SGLang instance fleet once per run, using the placement plan
-  derived from `instances.count`, `model.tp_size`, and worker GPU windows
+- group configs by serving profile before launching SGLang:
+  - `plain`: `gw_load_aware`, `gw_cache_aware`, and `tc_router`
+  - `mooncake`: `gw_load_aware_mooncake`
+- for each serving profile that appears in the filtered config set:
+  - launch the service prerequisites for that profile; the Mooncake profile
+    starts the Mooncake master/metadata singleton before SGLang, while the
+    plain profile has no Mooncake service
+  - launch the SGLang instance fleet for that profile, using the placement
+    plan derived from `instances.count`, `model.tp_size`, and worker GPU
+    windows
+  - run all configs in that profile, then tear down that profile's SGLang
+    fleet and service prerequisites
 - for each `(config, c_target, trial, preset)` cell of the sweep:
   - ensure the previous cell's workload has drained and no in-flight request
     remains
   - POST `/flush_cache` directly to every SGLang instance and retry until all
     instances return HTTP 200, subject to a bounded timeout
+  - for Mooncake-backed cells, POST `/clear_hicache_storage_backend`
+    directly to every SGLang instance and retry until all instances return
+    HTTP 200, subject to a bounded timeout
   - launch a fresh front router for this cell (`sgl-model-gateway` for
     `gw_*`, Python `tc_router` for Tensorcast runs) and wait for health
   - run the traffic generator on the driver host for `T_wall` seconds
@@ -910,7 +1034,8 @@ Responsibilities:
     local provider those paths are ordinary local filesystem paths
 - write a top-level `summary.csv` indexed by
   `(config, c_target, trial, preset)` with `transport_mode` recorded
-- tear down the SGLang instance fleet after the run completes or fails
+- tear down any live SGLang fleet and profile-specific service prerequisites
+  after the run completes or fails
 
 The driver does **not** acquire or release workers and does not assume
 which cluster CLI was used — see § 14 for the portability story.
@@ -985,6 +1110,17 @@ per § 5.2.3) and calls `Worker.start_background(...)` with a log path
 and PID path under `worker.scratch_dir`. The same command shape works
 on the local provider and on future providers.
 
+`services/mooncake.py` is the Mooncake-profile singleton launcher. It
+starts `.venv/bin/mooncake_master` on the worker selected by
+`service_placement.mooncake_master_worker_id` with
+`--enable_http_metadata_server=true`, the configured HTTP metadata port,
+the configured master port, and the configured eviction high-watermark.
+Readiness is the master's HTTP `/health` endpoint. The launcher exposes
+the master server address and metadata URL to the driver, but does not
+modify SGLang commands itself; `services/sglang.py` receives those values
+as HiCache Mooncake extra config when launching the Mooncake serving
+profile.
+
 ### 8.4 Traffic generator and routers
 
 Stand-alone modules in `workload/generator.py` and `router/`. They
@@ -1033,6 +1169,13 @@ service_placement:
   global_store_worker_id: local_h800
   mooncake_master_worker_id: local_h800
 ```
+
+`service_placement.global_store_worker_id` is consumed by Tensorcast
+runs. `service_placement.mooncake_master_worker_id` is consumed by
+`gw_load_aware_mooncake` runs and selects the worker that hosts the
+Mooncake master plus HTTP metadata service. Both fields are required in
+the cluster schema so a single cluster YAML can support every benchmark
+config kind.
 
 For non-local providers added in the future, the cluster YAML may again
 describe acquired remote state. For `provider.kind: local`, it is just
@@ -1086,9 +1229,17 @@ configs:
       cache_threshold: 0.0             # emits --cache-threshold
       balance_abs_threshold: 1000000   # emits --balance-abs-threshold
       balance_rel_threshold: 1.5       # emits --balance-rel-threshold
+  - kind: gw_load_aware_mooncake
 gateway:
   host: 127.0.0.1
   port: 61200
+mooncake:
+  http_metadata_server_port: 62300  # only used by gw_load_aware_mooncake
+  master_port: 62301
+  global_segment_size: 64gb
+  eviction_high_watermark_ratio: 0.9
+  device_name: ""                   # optional; empty is valid for TCP
+  clear_storage_between_cells: true
 load_polling:
   period_ms: 250
 ```
@@ -1107,6 +1258,11 @@ Validation rules at load time:
   `balance_rel_threshold`; the driver forwards them to
   `sgl-model-gateway`. `gw_load_aware` does not accept gateway policy
   knobs.
+- `mooncake` is only consumed when at least one config has
+  `kind: gw_load_aware_mooncake`. It controls the Mooncake master
+  service and SGLang Mooncake connection payload. It intentionally does
+  not contain a `prefetch_threshold` field; the benchmark uses SGLang's
+  upstream default instead of pinning a benchmark-specific value.
 
 ### 9.3 Invocation
 

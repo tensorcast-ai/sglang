@@ -104,6 +104,26 @@ class GatewayConfig(BaseModel):
     port: int = Field(default=30100, ge=1024, le=65535)
 
 
+class MooncakeConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    http_metadata_server_port: int = Field(default=62300, ge=1024, le=65535)
+    master_port: int = Field(default=62301, ge=1024, le=65535)
+    global_segment_size: str = Field(default="64gb", min_length=1)
+    eviction_high_watermark_ratio: float = Field(default=0.9, gt=0.0, lt=1.0)
+    device_name: str = ""
+    clear_storage_between_cells: bool = True
+
+    @model_validator(mode="after")
+    def _ports_must_be_distinct(self) -> "MooncakeConfig":
+        if self.http_metadata_server_port == self.master_port:
+            raise ValueError(
+                "mooncake.http_metadata_server_port and mooncake.master_port "
+                "must be distinct"
+            )
+        return self
+
+
 class LoadPollingConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -120,6 +140,7 @@ class BenchmarkConfig(BaseModel):
     workload: WorkloadConfig
     configs: tuple[ConfigSpec, ...] = Field(min_length=1)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    mooncake: MooncakeConfig = Field(default_factory=MooncakeConfig)
     load_polling: LoadPollingConfig = Field(default_factory=LoadPollingConfig)
 
 

@@ -19,6 +19,7 @@ from tensorcast_benchmark.kv.tc_router.services.sglang import (
     SGLangLaunchSpec,
     SGLangLauncher,
     build_launch_command,
+    clear_sglang_hicache_storage_backends,
     flush_sglang_caches,
 )
 
@@ -169,6 +170,30 @@ def test_storage_backend_mooncake_with_extra_config() -> None:
     assert expected_json in cmd
 
 
+def test_storage_backend_mooncake_extra_config_does_not_set_prefetch_threshold() -> (
+    None
+):
+    extra_config = {
+        "master_server_address": "10.0.10.49:62301",
+        "metadata_server": "http://10.0.10.49:62300/metadata",
+        "local_hostname": "10.0.10.58",
+        "protocol": "tcp",
+        "global_segment_size": "64gb",
+    }
+    cmd = build_launch_command(
+        make_spec(
+            enable_hierarchical_cache=True,
+            hicache_storage_backend="mooncake",
+            hicache_storage_backend_extra_config=extra_config,
+        )
+    )
+
+    assert "--hicache-storage-backend mooncake" in cmd
+    assert "--hicache-storage-backend-extra-config" in cmd
+    assert "prefetch_threshold" not in cmd
+    assert "10.0.10.49:62301" in cmd
+
+
 def test_storage_backend_tensorcast_emits_correct_flag() -> None:
     cmd = build_launch_command(make_spec(hicache_storage_backend="tensorcast"))
     assert "--hicache-storage-backend tensorcast" in cmd
@@ -200,6 +225,49 @@ def test_tp_size_serialized() -> None:
 def test_nccl_port_serialized_when_set() -> None:
     cmd = build_launch_command(make_spec(nccl_port=65201))
     assert "--nccl-port 65201" in cmd
+
+
+@pytest.mark.asyncio
+async def test_launch_merges_extra_env_with_cuda_visible_devices() -> None:
+    class FakeWorker:
+        id = "worker_a"
+        address = "10.0.10.58"
+        gpu_indices = (0, 1)
+        scratch_dir = "/tmp/worker_a"
+
+        def __init__(self) -> None:
+            self.env: dict[str, str] | None = None
+
+        async def start_background(
+            self,
+            cmd: str,
+            *,
+            name: str,
+            log_path: str,
+            pid_path: str,
+            env: dict[str, str] | None = None,
+        ) -> int:
+            del cmd, name, log_path, pid_path
+            self.env = env
+            return 123
+
+    worker = FakeWorker()
+    launcher = SGLangLauncher()
+
+    service = await launcher.launch(
+        worker,
+        make_spec(
+            gpu_indices=(1, 0),
+            tp_size=2,
+            extra_env={"MC_TCP_BIND_ADDRESS": "22.32.111.67"},
+        ),
+    )
+
+    assert service.pid == 123
+    assert worker.env == {
+        "CUDA_VISIBLE_DEVICES": "1,0",
+        "MC_TCP_BIND_ADDRESS": "22.32.111.67",
+    }
 
 
 @pytest.mark.asyncio
@@ -292,3 +360,36 @@ async def test_flush_sglang_caches_timeout_includes_endpoint_details() -> None:
     assert endpoint in message
     assert "status=503" in message
     assert "running requests remain" in message
+
+
+@pytest.mark.asyncio
+async def test_clear_sglang_hicache_storage_backends_retries_until_200() -> None:
+    app = web.Application()
+    counts: dict[str, int] = {"a": 0, "b": 0}
+
+    async def clear_handler(request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        counts[name] += 1
+        if name == "a" and counts[name] < 2:
+            return web.Response(status=503, text="a still clearing")
+        if name == "b" and counts[name] < 3:
+            return web.Response(status=409, text="b still clearing")
+        return web.Response(text="ok")
+
+    app.router.add_post("/{name}/clear_hicache_storage_backend", clear_handler)
+    runner, port = await _start_app(app)
+
+    try:
+        result = await clear_sglang_hicache_storage_backends(
+            (f"http://127.0.0.1:{port}/a", f"http://127.0.0.1:{port}/b"),
+            timeout_s=1.0,
+            poll_interval_s=0.01,
+            request_timeout_s=0.2,
+        )
+    finally:
+        await runner.cleanup()
+
+    assert counts == {"a": 2, "b": 3}
+    assert len(result.attempts) == 2
+    assert all(attempt.ok for attempt in result.attempts)
+    assert all(attempt.status == 200 for attempt in result.attempts)

@@ -535,20 +535,70 @@ from "programmability" value.
 
 **Deliverables**:
 
-- [ ] `services/mooncake.py`
-  - [ ] `launch_mooncake_master(worker, port) -> Service` (master + metadata service combined per share_remote § 5.2)
-  - [ ] `wait_ready`: poll the master's status endpoint
-- [ ] Extend `services/sglang.py` to accept a Mooncake storage endpoint and pass through to SGLang (via `--hicache-storage-backend mooncake --hicache-storage-config ...` or whatever the current SGLang flag is — verify against installed SGLang version)
-- [ ] Extend `driver/benchmark_loop.py` to launch the Mooncake master before SGLang instances when `config.kind == gw_load_aware_mooncake`
-- [ ] `configs/benchmark_baseline_full.yaml` — three baselines, real `c_target_sweep`, `trials: 1` (still not full, but multi-config)
-- [ ] Cluster YAML must already mark workers RDMA-capable; transport selection per arch § 7.4 lives in `benchmark.yaml`
+- [x] Phase-6 day-0 compatibility check
+  - [x] Verify the installed SGLang accepts `--enable-hierarchical-cache`, `--hicache-storage-backend mooncake`, and `--hicache-storage-backend-extra-config`.
+  - [x] Verify SGLang exposes `/clear_hicache_storage_backend` and that MooncakeStore's `clear()` maps to Mooncake `remove_all()`.
+  - [x] Verify `.venv/bin/mooncake_master` exists on the shared `/mnt/data` workspace and is runnable through local and SSH static workers.
+  - [x] Record any observed version-specific flag differences in `arch.md` before implementation if the current contract differs.
+- [x] Config schema
+  - [x] Add `MooncakeConfig` to `driver/config.py` with `http_metadata_server_port`, `master_port`, `global_segment_size`, `eviction_high_watermark_ratio`, `device_name`, and `clear_storage_between_cells`.
+  - [x] Do **not** add or set `prefetch_threshold`; `gw_load_aware_mooncake` must use SGLang's upstream default.
+  - [x] Validate Mooncake ports are in range and only consumed when a config has `kind: gw_load_aware_mooncake`.
+  - [x] Keep `transport.use_rdma` as the only benchmark-level selector for Mooncake `protocol = tcp|rdma`.
+- [x] `services/mooncake.py`
+  - [x] Add `MooncakeLaunchSpec` and `MooncakeLauncher`.
+  - [x] Launch `.venv/bin/mooncake_master` on `cluster.service_placement.mooncake_master_worker_id`.
+  - [x] Start master + HTTP metadata service in one process with `--enable_http_metadata_server=true`, configured metadata port, configured master port, and configured eviction high-watermark.
+  - [x] Compute a worker-reachable advertise host; loopback/unspecified addresses must be replaced with a routable local IPv4, matching the Tensorcast advertise-host behavior.
+  - [x] Return a `Service` whose endpoints include `master_server_address`, `metadata_server`, `health_http`, and `advertise_host`.
+  - [x] `wait_ready`: poll `health_http` with `aiohttp.ClientSession(trust_env=False)` until HTTP 200.
+  - [x] `stop`: use the worker's PID-file `stop_background` path.
+- [x] SGLang Mooncake serving profile
+  - [x] Extend `SGLangLaunchSpec` only as needed to pass Mooncake extra config and, if necessary, per-instance environment without breaking plain SGLang launch.
+  - [x] Build Mooncake HiCache args as `--enable-hierarchical-cache --hicache-storage-backend mooncake --hicache-storage-backend-extra-config <json>`.
+  - [x] Build extra config with `master_server_address`, `metadata_server`, `local_hostname`, `protocol`, `global_segment_size`, and optional non-empty `device_name`.
+  - [x] Use worker-reachable `local_hostname`; do not pass `127.0.0.1` for a worker that must be reachable from other hosts.
+  - [x] For Mooncake RDMA with non-empty `device_name`, resolve the first HCA to its Linux netdev IPv4 on each worker and use that IP for both `local_hostname` and `MC_TCP_BIND_ADDRESS`.
+  - [x] Preserve existing SGLang guarantees: `.venv` activation, `uv run --active --no-project --offline`, `--enable-cache-report`, no `--tool-call-parser`, TP/GPU pinning, and debug log level passthrough.
+- [x] Driver serving-profile lifecycle
+  - [x] Group configs by serving profile before launching SGLang: `plain = gw_load_aware|gw_cache_aware|tc_router`, `mooncake = gw_load_aware_mooncake`.
+  - [x] Launch and tear down one SGLang fleet per profile; plain and Mooncake configs must not share the same SGLang processes.
+  - [x] For the Mooncake profile, launch Mooncake master before SGLang and stop it after the Mooncake SGLang fleet is stopped.
+  - [x] Keep the existing placement plan identical across profiles: same `instances.count`, TP size, ports, worker assignments, and GPU windows.
+  - [x] Preserve `--config-filter` semantics: if only `gw_load_aware_mooncake` is selected, skip the plain profile; if only plain configs are selected, do not launch Mooncake.
+- [x] Gateway integration
+  - [x] Map `gw_load_aware_mooncake` to gateway policy `power_of_two`.
+  - [x] Reuse the existing `GatewayRouter` wrapper and `/v1/chat/completions` API; workload generator must not know whether Mooncake is enabled.
+  - [x] Keep per-cell gateway restart behavior exactly like other `gw_*` configs.
+- [x] Mooncake cell isolation
+  - [x] Keep existing per-cell drain, front-router teardown, and direct SGLang `/flush_cache` retry loop.
+  - [x] Add `mooncake.clear_storage_between_cells` behavior for Mooncake-backed cells: POST `/clear_hicache_storage_backend` directly to every SGLang endpoint after all `/flush_cache` calls succeed.
+  - [x] Do not fail fast on the first failed storage-clear response; poll all endpoints, log all failures, and require all HTTP 200 before the next cell starts.
+  - [x] Respect `mooncake.clear_storage_between_cells`; default should be `true` for reproducible benchmark cells.
+- [ ] Config files
+  - [x] Add a Mooncake TCP smoke benchmark config for the current static local+SSH H800 setup.
+  - [x] Add a Mooncake RDMA smoke benchmark config for the current static local+SSH H800 setup.
+  - [ ] Add/update a multi-baseline config containing `gw_load_aware`, `gw_cache_aware`, and `gw_load_aware_mooncake`.
+  - [x] Use Mooncake ports that do not collide with current SGLang, gateway, Tensorcast global-store, or Tensorcast daemon ports.
+- [x] Unit tests
+  - [x] `test_services_mooncake.py`: command construction, `.venv/bin/mooncake_master`, health wait, stop path, and loopback advertise-host replacement.
+  - [x] `test_services_sglang.py`: Mooncake HiCache args and extra-config JSON are serialized correctly, and `prefetch_threshold` is absent.
+  - [x] `test_driver_config.py`: `mooncake` block parses and validates, with no `prefetch_threshold` field.
+  - [x] `test_benchmark_loop_mooncake.py`: Mooncake master launches before Mooncake SGLang, gateway policy is `power_of_two`, per-cell `/flush_cache` and `/clear_hicache_storage_backend` are both called, and teardown order is SGLang-before-Mooncake.
+  - [x] Existing baseline, tc-router, static-provider, and cell-isolation tests still pass.
 
 **Validation gate**:
-- [ ] All three baselines run end-to-end on a 3-worker cluster (cross-host, real RDMA — this is the first cross-host run)
-- [ ] RDMA smoke passes before services launch
-- [ ] Summary CSV has rows for all three baselines × all C_targets × 1 trial
+- [ ] Local/static TCP smoke for `gw_load_aware_mooncake` runs end-to-end on the current 2-worker H800 setup.
+- [ ] Summary CSV has rows for Mooncake smoke cells and records `transport_mode = tcp` when `transport.use_rdma: false`.
+- [ ] Cell logs show Mooncake master readiness before Mooncake SGLang launch.
+- [ ] Cell logs show all SGLang endpoints accepted `/flush_cache` and `/clear_hicache_storage_backend` before gateway launch.
+- [ ] A multi-baseline run emits rows for `gw_load_aware`, `gw_cache_aware`, and `gw_load_aware_mooncake` without reusing Mooncake SGLang for the plain baselines.
 - [ ] Sanity comparison: `cached_token_ratio_mean` for `gw_load_aware_mooncake` >= for `gw_load_aware` at the same C_target (substrate must help, not hurt)
-- [ ] `transport_mode = rdma` is correctly recorded in summary
+- [x] Optional RDMA gate, only for a config with `transport.use_rdma: true`: Mooncake RDMA E2E now runs through all cells and records `transport_mode = rdma` in summary.
+
+**Current blocker**:
+- [x] Root cause investigation for the first Mooncake RDMA failures found an advertise/bind mismatch: SGLang advertised worker control addresses (`10.0.10.*`) while Mooncake Transfer Engine auto-bound RPC to unreachable `ansm0` (`11.73.*`); the reachable RDMA netdev addresses are `22.32.*`. The driver now binds Mooncake RDMA endpoints to the selected HCA's netdev IPv4.
+- [x] Re-run Mooncake RDMA E2E after the advertise/bind fix. Success run: `outputs/20260710-083129_static-mooncake-rdma-mlx5_0-4inst-tp2-c4-8-16-32-64-wall600-warmup30`, with all 5 cells completed and 0 failed requests. Prior failed runs: `outputs/20260710-080255_static-mooncake-rdma-4inst-tp2-c4-8-16-32-64-wall600-warmup30` and `outputs/20260710-080930_static-mooncake-rdma-mlx5_0-4inst-tp2-c4-8-16-32-64-wall600-warmup30`.
 
 ---
 

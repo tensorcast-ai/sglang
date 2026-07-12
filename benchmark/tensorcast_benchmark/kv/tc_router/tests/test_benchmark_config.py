@@ -84,6 +84,56 @@ def test_invalid_config_kind(tmp_path: Path) -> None:
         load_benchmark_yaml(_write(tmp_path, bad))
 
 
+def test_mooncake_config_parses_without_prefetch_threshold(tmp_path: Path) -> None:
+    data = copy.deepcopy(GOOD)
+    data["configs"] = [{"kind": "gw_load_aware_mooncake"}]
+    data["mooncake"] = {
+        "http_metadata_server_port": 62300,
+        "master_port": 62301,
+        "global_segment_size": "64gb",
+        "eviction_high_watermark_ratio": 0.9,
+        "device_name": "",
+        "clear_storage_between_cells": True,
+    }
+
+    cfg = load_benchmark_yaml(_write(tmp_path, data))
+
+    assert cfg.configs[0].kind == "gw_load_aware_mooncake"
+    assert cfg.mooncake.http_metadata_server_port == 62300
+    assert cfg.mooncake.master_port == 62301
+    assert cfg.mooncake.global_segment_size == "64gb"
+    assert cfg.mooncake.clear_storage_between_cells is True
+
+
+def test_mooncake_config_rejects_prefetch_threshold(tmp_path: Path) -> None:
+    bad = copy.deepcopy(GOOD)
+    bad["configs"] = [{"kind": "gw_load_aware_mooncake"}]
+    bad["mooncake"] = {
+        "http_metadata_server_port": 62300,
+        "master_port": 62301,
+        "global_segment_size": "64gb",
+        "eviction_high_watermark_ratio": 0.9,
+        "device_name": "",
+        "clear_storage_between_cells": True,
+        "prefetch_threshold": 1,
+    }
+
+    with pytest.raises(Exception, match="prefetch_threshold"):
+        load_benchmark_yaml(_write(tmp_path, bad))
+
+
+def test_mooncake_config_rejects_duplicate_ports(tmp_path: Path) -> None:
+    bad = copy.deepcopy(GOOD)
+    bad["configs"] = [{"kind": "gw_load_aware_mooncake"}]
+    bad["mooncake"] = {
+        "http_metadata_server_port": 62300,
+        "master_port": 62300,
+    }
+
+    with pytest.raises(Exception, match="must be distinct"):
+        load_benchmark_yaml(_write(tmp_path, bad))
+
+
 def test_extra_field_rejected(tmp_path: Path) -> None:
     bad = copy.deepcopy(GOOD)
     bad["unexpected"] = "x"
@@ -219,3 +269,24 @@ def test_shipped_static_tc_router_8inst_tp2_yaml_parses() -> None:
     assert (
         cfg.workload.dataset_path == "/mnt/data/dataset/OpenHands-Sampled-Trajectories"
     )
+
+
+def test_shipped_static_mooncake_4inst_tp2_yaml_parses() -> None:
+    """The mixed local+SSH static Mooncake baseline YAML must parse cleanly."""
+    p = (
+        Path(__file__).resolve().parent.parent
+        / "configs"
+        / "benchmark_static_mooncake_4inst_tp2_c4_8_16_32_64_wall600_warmup30.yaml"
+    )
+    cfg = load_benchmark_yaml(p)
+    assert cfg.run_id == "static-mooncake-4inst-tp2-c4-8-16-32-64-wall600-warmup30"
+    assert cfg.model.path == "/mnt/data/models/Qwen3-32B"
+    assert cfg.model.tp_size == 2
+    assert cfg.instances.count == 4
+    assert cfg.instances.base_port == 62101
+    assert cfg.transport.use_rdma is False
+    assert len(cfg.configs) == 1
+    assert cfg.configs[0].kind == "gw_load_aware_mooncake"
+    assert cfg.mooncake.http_metadata_server_port == 62300
+    assert cfg.mooncake.master_port == 62301
+    assert cfg.mooncake.clear_storage_between_cells is True
