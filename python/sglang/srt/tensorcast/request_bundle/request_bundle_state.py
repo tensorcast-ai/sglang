@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 
 from sglang.srt.tensorcast.instance_ops.instance_ops_types import (
     AggregatedInstanceOpResult,
@@ -254,6 +254,8 @@ class RequestBundleStateRegistry:
         logical_request_id: str,
         instance_id: str,
         engine_request_id: str,
+        logical_session_id: str | None = None,
+        session_generation: int | None = None,
         full_prompt_token_count: int,
         model_fingerprint: str,
         kv_layout_id: str,
@@ -268,6 +270,8 @@ class RequestBundleStateRegistry:
                 logical_request_id=logical_request_id,
                 instance_id=instance_id,
                 engine_request_id=engine_request_id,
+                logical_session_id=logical_session_id,
+                session_generation=session_generation,
                 full_prompt_token_count=int(full_prompt_token_count),
                 model_fingerprint=model_fingerprint,
                 kv_layout_id=kv_layout_id,
@@ -290,6 +294,8 @@ class RequestBundleStateRegistry:
             update={
                 "instance_id": instance_id,
                 "engine_request_id": engine_request_id,
+                "logical_session_id": logical_session_id,
+                "session_generation": session_generation,
                 "full_prompt_token_count": int(full_prompt_token_count),
                 "model_fingerprint": model_fingerprint,
                 "kv_layout_id": kv_layout_id,
@@ -749,6 +755,9 @@ class PreparedBundleRegistry:
         self,
         *,
         logical_request_id: str,
+        source_engine_request_id: str | None = None,
+        logical_session_id: str | None = None,
+        session_generation: int | None = None,
         target_instance_id: str,
         publish_manifest_digest: str,
         artifact_manifest_digest: str,
@@ -782,6 +791,9 @@ class PreparedBundleRegistry:
             )
         record = PreparedBundleRecord(
             logical_request_id=logical_request_id,
+            source_engine_request_id=source_engine_request_id,
+            logical_session_id=logical_session_id,
+            session_generation=session_generation,
             target_instance_id=target_instance_id,
             publish_manifest_digest=publish_manifest_digest,
             artifact_manifest_digest=artifact_manifest_digest,
@@ -819,6 +831,18 @@ class PreparedBundleRegistry:
             record
             for (request_id, _digest), record in self._records.items()
             if request_id == logical_request_id
+            and (
+                include_evicted or record.state != PreparedBundleLifecycleState.EVICTED
+            )
+        )
+
+    def list_session_records(
+        self, *, logical_session_id: str, include_evicted: bool = False
+    ) -> tuple[PreparedBundleRecord, ...]:
+        return tuple(
+            record
+            for record in self._records.values()
+            if record.logical_session_id == logical_session_id
             and (
                 include_evicted or record.state != PreparedBundleLifecycleState.EVICTED
             )
@@ -1048,6 +1072,120 @@ class PreparedBundleRegistry:
         return PreparedBundleClaimDecision(
             action=PreparedBundleClaimAction.CLAIMED,
             reason="prepared bundle claimed successfully",
+            record=claimed,
+            claim_token=claim_token,
+        )
+
+    def claim_prepared_bundle_for_session(
+        self,
+        *,
+        logical_session_id: str,
+        incoming_prompt_token_count: int,
+        incoming_prompt_token_digest_for_count: Callable[[int], str],
+        scheduler_rid: str,
+        claim_token: str,
+        now_ms: int,
+        live_request_exists: bool = False,
+    ) -> PreparedBundleClaimDecision:
+        records = list(
+            self.list_session_records(
+                logical_session_id=logical_session_id,
+                include_evicted=False,
+            )
+        )
+        if live_request_exists:
+            return PreparedBundleClaimDecision(
+                action=PreparedBundleClaimAction.FAIL_CLOSED,
+                reason="a live request already exists for this logical session id",
+            )
+        active_claims = [
+            record
+            for record in records
+            if not record.stale
+            and not record.tainted
+            and record.state
+            in {
+                PreparedBundleLifecycleState.CLAIMED,
+                PreparedBundleLifecycleState.ATTACHED,
+            }
+        ]
+        if active_claims:
+            return PreparedBundleClaimDecision(
+                action=PreparedBundleClaimAction.FAIL_CLOSED,
+                reason="a clean prepared bundle is already claimed or attached for this logical session id",
+            )
+        prepared_records = [
+            record
+            for record in records
+            if record.state == PreparedBundleLifecycleState.PREPARED
+        ]
+        reusable_candidates: list[PreparedBundleRecord] = []
+        stale_or_tainted_candidates: list[PreparedBundleRecord] = []
+        for record in prepared_records:
+            if record.stale or record.tainted:
+                stale_or_tainted_candidates.append(record)
+                continue
+            cutoff_token_count = record.cutoff_token_count
+            if cutoff_token_count is None:
+                continue
+            if int(cutoff_token_count) > int(incoming_prompt_token_count):
+                continue
+            if record.prompt_token_digest is None:
+                continue
+            try:
+                incoming_digest = incoming_prompt_token_digest_for_count(
+                    int(cutoff_token_count)
+                )
+            except ValueError:
+                continue
+            if record.prompt_token_digest != incoming_digest:
+                continue
+            reusable_candidates.append(record)
+        if not reusable_candidates:
+            if stale_or_tainted_candidates:
+                stale_or_tainted_candidates.sort(
+                    key=lambda record: (
+                        int(record.prepared_at_ms or record.created_at_ms),
+                        record.publish_manifest_digest,
+                    )
+                )
+                return PreparedBundleClaimDecision(
+                    action=PreparedBundleClaimAction.FALLBACK,
+                    reason="only stale or tainted prepared bundle records are available for this logical session id",
+                    record=stale_or_tainted_candidates[-1],
+                )
+            return PreparedBundleClaimDecision(
+                action=PreparedBundleClaimAction.FALLBACK,
+                reason="no reusable prepared bundle is available for this logical session id",
+            )
+
+        def candidate_key(record: PreparedBundleRecord) -> tuple[int, int, int, str]:
+            cutoff_token_count = int(record.cutoff_token_count or 0)
+            reusable_prefix_tokens = cutoff_token_count - int(record.tail_valid_tokens)
+            return (
+                reusable_prefix_tokens,
+                int(record.session_generation)
+                if record.session_generation is not None
+                else -1,
+                int(record.prepared_at_ms or record.created_at_ms),
+                record.publish_manifest_digest,
+            )
+
+        candidate = max(reusable_candidates, key=candidate_key)
+        claimed = candidate.model_copy(
+            update={
+                "state": PreparedBundleLifecycleState.CLAIMED,
+                "claim_token": claim_token,
+                "active_scheduler_rid": scheduler_rid,
+                "claimed_at_ms": int(now_ms),
+            }
+        )
+        self._records[(claimed.logical_request_id, claimed.publish_manifest_digest)] = (
+            claimed
+        )
+        return PreparedBundleClaimDecision(
+            action=PreparedBundleClaimAction.CLAIMED,
+            reason="session-scoped prepared bundle claimed successfully",
             record=claimed,
             claim_token=claim_token,
         )

@@ -52,6 +52,8 @@ def _seed_local_live_request(
     rank_pages: tuple[PageClosureEntry, ...],
     latest_token_count: int = 70,
     latest_last_page_index: int = 2,
+    logical_session_id: str | None = None,
+    session_generation: int | None = None,
 ) -> tuple[PagePublicationRegistry, RequestBundleStateRegistry]:
     page_registry = PagePublicationRegistry()
     bundle_registry = RequestBundleStateRegistry(
@@ -73,6 +75,8 @@ def _seed_local_live_request(
         logical_request_id="rid-1",
         instance_id="instance-a",
         engine_request_id="rid-1",
+        logical_session_id=logical_session_id,
+        session_generation=session_generation,
         full_prompt_token_count=latest_token_count,
         model_fingerprint="model-a",
         kv_layout_id="layout-v1",
@@ -101,12 +105,16 @@ def _publish_local_result(
     latest_token_count: int = 70,
     latest_last_page_index: int = 2,
     request: PublishInstanceOpRequest | None = None,
+    logical_session_id: str | None = None,
+    session_generation: int | None = None,
 ) -> SourcePublishClosureResult:
     page_registry, bundle_registry = _seed_local_live_request(
         rank=rank,
         rank_pages=rank_pages,
         latest_token_count=latest_token_count,
         latest_last_page_index=latest_last_page_index,
+        logical_session_id=logical_session_id,
+        session_generation=session_generation,
     )
     return RequestBundlePublisher(
         request_bundle_registry=bundle_registry,
@@ -157,6 +165,41 @@ def test_local_publish_ready_only_succeeds_and_reuses_pages() -> None:
         for rank_result in result.rank_results
         for outcome in rank_result.page_outcomes
     )
+
+
+def test_publish_manifest_copies_source_session_metadata() -> None:
+    result = _publish_local_result(
+        rank=_rank(0),
+        logical_session_id="session-a",
+        session_generation=7,
+        rank_pages=(
+            PageClosureEntry(
+                logical_page_index=0,
+                page_hash="r0-p0",
+                publication_state=PagePublicationState.READY,
+                artifact_id="artifact-r0-p0",
+                host_resident=True,
+            ),
+            PageClosureEntry(
+                logical_page_index=1,
+                page_hash="r0-p1",
+                publication_state=PagePublicationState.READY,
+                artifact_id="artifact-r0-p1",
+                host_resident=True,
+            ),
+            PageClosureEntry(
+                logical_page_index=2,
+                page_hash="r0-p2",
+                publication_state=PagePublicationState.ABSENT,
+                host_resident=True,
+            ),
+        ),
+    )
+
+    payload = result.publish_manifest.engine_owned_manifest.payload
+    assert payload.source_engine_request_id == "rid-1"
+    assert payload.logical_session_id == "session-a"
+    assert payload.session_generation == 7
 
 
 def test_local_publish_allows_mid_decode_requests_but_keeps_prompt_prefix_only() -> (

@@ -94,6 +94,9 @@ class RequestBundleHydrator:
 
         prepared_bundle = self._prepared_bundle_registry.begin_prepare(
             logical_request_id=request.logical_request_id,
+            source_engine_request_id=publish_manifest.engine_owned_manifest.payload.source_engine_request_id,
+            logical_session_id=publish_manifest.engine_owned_manifest.payload.logical_session_id,
+            session_generation=publish_manifest.engine_owned_manifest.payload.session_generation,
             target_instance_id=target.target_instance_id,
             publish_manifest_digest=publish_manifest.publish_manifest_digest,
             artifact_manifest_digest=publish_manifest.artifact_manifest.artifact_manifest_digest,
@@ -504,6 +507,9 @@ class RequestBundleHydrateAggregator:
         )
         prepared_bundle = PreparedBundleRecord(
             logical_request_id=request.logical_request_id,
+            source_engine_request_id=publish_manifest.engine_owned_manifest.payload.source_engine_request_id,
+            logical_session_id=publish_manifest.engine_owned_manifest.payload.logical_session_id,
+            session_generation=publish_manifest.engine_owned_manifest.payload.session_generation,
             target_instance_id=target.target_instance_id,
             publish_manifest_digest=publish_manifest.publish_manifest_digest,
             artifact_manifest_digest=publish_manifest.artifact_manifest.artifact_manifest_digest,

@@ -260,7 +260,9 @@ class SchedulerTensorcastInstanceOpsMixin:
             registration.stop()
         self._tensorcast_instance_ops_runtime = None
 
-    def tensorcast_instance_op_dispatch_entries(self: Scheduler) -> list[tuple[type, object]]:
+    def tensorcast_instance_op_dispatch_entries(
+        self: Scheduler,
+    ) -> list[tuple[type, object]]:
         return [
             (
                 PublishInstanceOpReqInput,
@@ -493,6 +495,7 @@ class SchedulerTensorcastInstanceOpsMixin:
                 engine_request_id=req.rid,
                 prompt_token_ids=list(req.origin_input_ids),
                 requested_at_ms=int(time.time() * 1000),
+                routing_key=getattr(req, "routing_key", None),
                 batch_request_count=1,
                 parallel_sampling_count=req.sampling_params.n,
                 session_lineage_depth=0,
@@ -580,6 +583,7 @@ class SchedulerTensorcastInstanceOpsMixin:
             scheduler_rid=req.rid,
             prompt_token_ids=list(req.origin_input_ids),
             requested_at_ms=int(time.time() * 1000),
+            routing_key=getattr(req, "routing_key", None),
         )
         if bind_result.action == PreparedBundleBindAction.FAIL_CLOSED:
             req.set_finish_with_abort(
@@ -683,16 +687,16 @@ class SchedulerTensorcastInstanceOpsMixin:
                 publish_manifest_digest=state.prepared_bundle_record.publish_manifest_digest,
                 prompt_token_ids=list(req.origin_input_ids),
                 requested_at_ms=int(time.time() * 1000),
-                install_prepared_bundle=lambda record,
-                hold_set,
-                cutoff_prompt_token_ids: self._install_tensorcast_prepared_prefix(
-                    req=req,
-                    state=state,
-                    storage_backend=storage_backend,
-                    manager=manager,
-                    record=record,
-                    hold_set=hold_set,
-                    cutoff_prompt_token_ids=cutoff_prompt_token_ids,
+                install_prepared_bundle=lambda record, hold_set, cutoff_prompt_token_ids: (
+                    self._install_tensorcast_prepared_prefix(
+                        req=req,
+                        state=state,
+                        storage_backend=storage_backend,
+                        manager=manager,
+                        record=record,
+                        hold_set=hold_set,
+                        cutoff_prompt_token_ids=cutoff_prompt_token_ids,
+                    )
                 ),
             )
             state.prepared_bundle_record = consumed_record

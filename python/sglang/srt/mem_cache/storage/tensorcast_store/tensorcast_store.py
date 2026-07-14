@@ -149,7 +149,9 @@ class TensorcastStore(HiCacheStorage):
                 raise ValueError(
                     "TensorCast allocator-backed host residency requires a live host_region_binding"
                 )
-            slot_bytes = int(mem_pool_host.size_per_token) * int(mem_pool_host.page_size)
+            slot_bytes = int(mem_pool_host.size_per_token) * int(
+                mem_pool_host.page_size
+            )
             if slot_bytes <= 0:
                 raise ValueError(
                     "TensorCast allocator-backed host residency requires positive slot_bytes"
@@ -257,6 +259,13 @@ class TensorcastStore(HiCacheStorage):
         extra_info: HiCacheStorageExtraInfo | None = None,
     ) -> int:
         _ = extra_info
+        if not self._tensorcast_config.ordinary_storage_prefetch_enabled:
+            logger.debug(
+                "Tensorcast batch_exists skipped by tensorcast_kv_mode=%s pages=%d",
+                self._tensorcast_config.tensorcast_kv_mode,
+                len(keys),
+            )
+            return 0
         result: TensorcastBatchExistsResult = self._page_client.batch_exists(keys)
         prefix_success = 0
         for exists in result.existence_mask:
@@ -283,6 +292,13 @@ class TensorcastStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: HiCacheStorageExtraInfo | None = None,
     ) -> list[bool]:
+        if not self._tensorcast_config.ordinary_storage_prefetch_enabled:
+            logger.debug(
+                "Tensorcast batch_get_v1 skipped by tensorcast_kv_mode=%s pages=%d",
+                self._tensorcast_config.tensorcast_kv_mode,
+                len(keys),
+            )
+            return [False for _ in keys]
         page_starts = self._page_start_indices(host_indices, len(keys))
         targets = self._host_page_views(page_starts)
         direct_get_enabled = self._allocator_backed_direct_get_enabled()
@@ -341,6 +357,25 @@ class TensorcastStore(HiCacheStorage):
         extra_info: HiCacheStorageExtraInfo | None = None,
     ) -> list[bool]:
         page_starts = self._page_start_indices(host_indices, len(keys))
+        if not self._tensorcast_config.background_page_publish_enabled:
+            slot_tokens = list(
+                self.mem_pool_host.slot_tokens_for_page_starts(page_starts)
+            )
+            self.mem_pool_host.commit_page_backup_success(slot_tokens, keys)
+            self.mem_pool_host.retain_page_slots(slot_tokens)
+            self._request_bundle_manager.record_pages_host_resident(
+                page_hashes=keys,
+                page_starts=page_starts,
+                slot_tokens=slot_tokens,
+                now_ms=int(time.time() * 1000),
+            )
+            logger.debug(
+                "Tensorcast batch_set_v1 recorded host residency without background publish mode=%s pages=%d first_key=%s",
+                self._tensorcast_config.tensorcast_kv_mode,
+                len(keys),
+                keys[0] if keys else "",
+            )
+            return [True for _ in keys]
         pages = self._host_page_views(page_starts)
         direct_put_enabled = self._allocator_backed_direct_put_enabled()
         slot_tokens = (

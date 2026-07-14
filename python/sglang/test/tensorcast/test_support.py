@@ -8,6 +8,28 @@ def _noop(*args: object, **kwargs: object) -> None:
     _ = args, kwargs
 
 
+class _ConcurrentCounterStub:
+    def __init__(self, initial: int = 0) -> None:
+        self._count = int(initial)
+
+    def value(self) -> int:
+        return self._count
+
+    async def increment(self, n: int = 1, notify_all: bool = True) -> None:
+        _ = notify_all
+        self._count += int(n)
+
+    async def decrement(self, n: int = 1, notify_all: bool = True) -> None:
+        _ = notify_all
+        self._count -= int(n)
+
+    async def wait_for(self, condition) -> None:
+        _ = condition
+
+    async def wait_for_zero(self) -> None:
+        return None
+
+
 def install_memory_pool_host_stub(
     *,
     host_kv_cache_cls: type[object] = object,
@@ -39,6 +61,9 @@ def install_memory_pool_host_layout_import_stubs() -> None:
     utils_module.is_cuda = lambda: False
     utils_module.is_npu = lambda: False
     utils_module.is_xpu = lambda: False
+    utils_module.init_custom_process_group = lambda *args, **kwargs: None
+    utils_module.parse_connector_type = lambda url: str(url).split("://", 1)[0]
+    utils_module.ConcurrentCounter = _ConcurrentCounterStub
     sys.modules.setdefault("sglang.srt.utils", utils_module)
 
     sgl_kernel_module = ModuleType("sgl_kernel.kvcacheio")

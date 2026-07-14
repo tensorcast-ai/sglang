@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 from sglang.srt.tensorcast.request_bundle.prepared_bundle_admission import (
     PreparedBundleAdmissionBinder,
 )
@@ -19,6 +21,13 @@ def _rank(tp_rank: int, pp_rank: int = 0) -> RankCoord:
     return RankCoord(tp_rank=tp_rank, pp_rank=pp_rank)
 
 
+def _hash_token_ids(token_ids: list[int]) -> str:
+    hasher = hashlib.sha256()
+    for token_id in token_ids:
+        hasher.update(int(token_id).to_bytes(4, byteorder="little", signed=False))
+    return hasher.hexdigest()
+
+
 def _prepare_clean_bundle(
     registry: PreparedBundleRegistry,
     *,
@@ -26,9 +35,13 @@ def _prepare_clean_bundle(
     publish_manifest_digest: str,
     prompt_token_digest: str,
     cutoff_token_count: int,
+    logical_session_id: str | None = None,
+    session_generation: int | None = None,
 ) -> None:
     registry.begin_prepare(
         logical_request_id=logical_request_id,
+        logical_session_id=logical_session_id,
+        session_generation=session_generation,
         target_instance_id="instance-b",
         publish_manifest_digest=publish_manifest_digest,
         artifact_manifest_digest=f"artifact:{publish_manifest_digest}",
@@ -73,10 +86,10 @@ def test_binding_attaches_matching_prepared_bundle() -> None:
             cutoff_token_count=64,
             requested_at_ms=200,
         ),
-        attach_prepared_bundle=lambda record: attached_records.append(
-            record.publish_manifest_digest
-        )
-        or "prepared-bundle-key-1",
+        attach_prepared_bundle=lambda record: (
+            attached_records.append(record.publish_manifest_digest)
+            or "prepared-bundle-key-1"
+        ),
     )
 
     assert result.action == PreparedBundleBindAction.ATTACHED
@@ -106,10 +119,9 @@ def test_binding_falls_back_on_prompt_digest_mismatch() -> None:
             cutoff_token_count=64,
             requested_at_ms=200,
         ),
-        attach_prepared_bundle=lambda record: attach_calls.append(
-            record.publish_manifest_digest
-        )
-        or "unused",
+        attach_prepared_bundle=lambda record: (
+            attach_calls.append(record.publish_manifest_digest) or "unused"
+        ),
     )
 
     assert result.action == PreparedBundleBindAction.FALLBACK
@@ -290,3 +302,122 @@ def test_binding_attach_failure_taints_bundle_and_fails_closed() -> None:
     assert result.record is not None
     assert result.record.state == PreparedBundleLifecycleState.PREPARED
     assert result.record.tainted is True
+
+
+def test_session_binding_selects_longest_matching_prefix() -> None:
+    registry = PreparedBundleRegistry()
+    prompt_token_ids = list(range(96))
+    _prepare_clean_bundle(
+        registry,
+        logical_request_id="source-rid-short",
+        publish_manifest_digest="manifest-short",
+        prompt_token_digest=_hash_token_ids(prompt_token_ids[:32]),
+        cutoff_token_count=32,
+        logical_session_id="session-1",
+        session_generation=1,
+    )
+    _prepare_clean_bundle(
+        registry,
+        logical_request_id="source-rid-long",
+        publish_manifest_digest="manifest-long",
+        prompt_token_digest=_hash_token_ids(prompt_token_ids[:64]),
+        cutoff_token_count=64,
+        logical_session_id="session-1",
+        session_generation=2,
+    )
+
+    result = PreparedBundleAdmissionBinder(prepared_bundle_registry=registry).bind(
+        request=OrdinaryGenerateBindingRequest(
+            logical_request_id="target-unique-rid",
+            scheduler_rid="target-unique-rid",
+            logical_session_id="session-1",
+            prompt_token_digest=_hash_token_ids(prompt_token_ids),
+            prompt_token_ids=tuple(prompt_token_ids),
+            cutoff_token_count=len(prompt_token_ids),
+            requested_at_ms=300,
+        ),
+        attach_prepared_bundle=lambda record: (
+            f"attached:{record.publish_manifest_digest}"
+        ),
+    )
+
+    assert result.action == PreparedBundleBindAction.ATTACHED
+    assert result.record is not None
+    assert result.record.logical_request_id == "source-rid-long"
+    assert result.record.active_scheduler_rid == "target-unique-rid"
+    assert result.prepared_bundle_key == "attached:manifest-long"
+
+
+def test_session_binding_falls_back_on_prefix_digest_mismatch() -> None:
+    registry = PreparedBundleRegistry()
+    prompt_token_ids = list(range(64))
+    _prepare_clean_bundle(
+        registry,
+        logical_request_id="source-rid",
+        publish_manifest_digest="manifest-session-mismatch",
+        prompt_token_digest=_hash_token_ids([999, *prompt_token_ids[:31]]),
+        cutoff_token_count=32,
+        logical_session_id="session-2",
+    )
+    attach_calls: list[str] = []
+
+    result = PreparedBundleAdmissionBinder(prepared_bundle_registry=registry).bind(
+        request=OrdinaryGenerateBindingRequest(
+            logical_request_id="target-rid",
+            scheduler_rid="target-rid",
+            logical_session_id="session-2",
+            prompt_token_digest=_hash_token_ids(prompt_token_ids),
+            prompt_token_ids=tuple(prompt_token_ids),
+            cutoff_token_count=len(prompt_token_ids),
+            requested_at_ms=300,
+        ),
+        attach_prepared_bundle=lambda record: (
+            attach_calls.append(record.publish_manifest_digest) or "unused"
+        ),
+    )
+
+    assert result.action == PreparedBundleBindAction.FALLBACK
+    assert attach_calls == []
+
+
+def test_session_binding_fails_closed_on_concurrent_same_session_claim() -> None:
+    registry = PreparedBundleRegistry()
+    prompt_token_ids = list(range(64))
+    _prepare_clean_bundle(
+        registry,
+        logical_request_id="source-rid",
+        publish_manifest_digest="manifest-session-claim",
+        prompt_token_digest=_hash_token_ids(prompt_token_ids[:32]),
+        cutoff_token_count=32,
+        logical_session_id="session-3",
+    )
+    binder = PreparedBundleAdmissionBinder(prepared_bundle_registry=registry)
+    first = binder.bind(
+        request=OrdinaryGenerateBindingRequest(
+            logical_request_id="target-rid-1",
+            scheduler_rid="target-rid-1",
+            logical_session_id="session-3",
+            prompt_token_digest=_hash_token_ids(prompt_token_ids),
+            prompt_token_ids=tuple(prompt_token_ids),
+            cutoff_token_count=len(prompt_token_ids),
+            requested_at_ms=300,
+        ),
+        attach_prepared_bundle=lambda _: "attached",
+    )
+    assert first.action == PreparedBundleBindAction.ATTACHED
+
+    second = binder.bind(
+        request=OrdinaryGenerateBindingRequest(
+            logical_request_id="target-rid-2",
+            scheduler_rid="target-rid-2",
+            logical_session_id="session-3",
+            prompt_token_digest=_hash_token_ids(prompt_token_ids),
+            prompt_token_ids=tuple(prompt_token_ids),
+            cutoff_token_count=len(prompt_token_ids),
+            requested_at_ms=301,
+        ),
+        attach_prepared_bundle=lambda _: "unused",
+    )
+
+    assert second.action == PreparedBundleBindAction.FAIL_CLOSED
+    assert "already claimed or attached" in second.reason

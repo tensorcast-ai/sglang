@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import unittest
 import sys
+from contextlib import suppress
 from types import SimpleNamespace
 
 import torch
@@ -20,6 +21,10 @@ sys.modules.pop("sglang.srt.mem_cache.memory_pool_host", None)
 
 from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
+
+sys.modules.pop("sglang.srt.utils", None)
+with suppress(AttributeError):
+    delattr(sys.modules["sglang.srt"], "utils")
 
 
 class PageBlobDirectLayoutTest(unittest.TestCase):
@@ -109,6 +114,26 @@ class PageBlobDirectLayoutTest(unittest.TestCase):
         snapshot = pool.describe_page_slot(0)
         self.assertEqual(snapshot.state.value, "slot_free")
         self.assertEqual(snapshot.slot_generation, 1)
+
+    def test_free_defers_retained_page_blob_direct_slot_until_release(self) -> None:
+        pool = self._build_mha_pool()
+        slot_tokens = pool.slot_tokens_for_page_starts([0])
+        pool.commit_page_backup_success(slot_tokens, logical_keys=["page-a"])
+        pool.retain_page_slots(slot_tokens)
+
+        pool.free(torch.tensor([0, 1], dtype=torch.int64))
+
+        retained_snapshot = pool.describe_page_slot(0)
+        self.assertEqual(retained_snapshot.state.value, "slot_resident")
+        self.assertEqual(retained_snapshot.pin_count, 1)
+        self.assertEqual(retained_snapshot.slot_generation, 0)
+
+        pool.release_page_slot_retains(slot_tokens)
+
+        released_snapshot = pool.describe_page_slot(0)
+        self.assertEqual(released_snapshot.state.value, "slot_free")
+        self.assertEqual(released_snapshot.pin_count, 0)
+        self.assertEqual(released_snapshot.slot_generation, 1)
 
     def test_mla_page_blob_direct_matches_existing_direct_page_shape(self) -> None:
         device_pool = SimpleNamespace(

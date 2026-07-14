@@ -93,6 +93,25 @@ class HostSharedPageSlotTrackerTest(unittest.TestCase):
         with self.assertRaises(HostSharedPageSlotStateError):
             self.tracker.retire_slots(slot_tokens)
 
+    def test_backup_resident_slot_can_be_retained_and_released(self) -> None:
+        slot_tokens = (self.tracker.current_token(1),)
+        self.tracker.commit_backup_success(slot_tokens, logical_keys=["page-g"])
+        resident_snapshot = self.tracker.snapshot(1)
+        self.assertEqual(resident_snapshot.state, HostSharedPageSlotState.SLOT_RESIDENT)
+        self.assertEqual(resident_snapshot.logical_key, "page-g")
+        self.assertEqual(resident_snapshot.pin_count, 0)
+
+        self.tracker.retain_slots(slot_tokens)
+        retained_snapshot = self.tracker.snapshot(1)
+        self.assertEqual(retained_snapshot.pin_count, 1)
+
+        with self.assertRaises(HostSharedPageSlotStateError):
+            self.tracker.retire_slots(slot_tokens)
+
+        self.tracker.release_slots(slot_tokens)
+        released_snapshot = self.tracker.snapshot(1)
+        self.assertEqual(released_snapshot.pin_count, 0)
+
     def test_page_start_conversion_is_page_granular(self) -> None:
         self.assertEqual(self.tracker.slot_index_for_page_start(64), 2)
         self.assertEqual(self.tracker.page_start_for_slot_index(2), 64)

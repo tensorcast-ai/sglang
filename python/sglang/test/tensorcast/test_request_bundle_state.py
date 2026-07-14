@@ -34,6 +34,49 @@ def _rank(tp_rank: int, pp_rank: int = 0) -> RankCoord:
     return RankCoord(tp_rank=tp_rank, pp_rank=pp_rank)
 
 
+def test_request_bundle_state_persists_logical_session_metadata() -> None:
+    registry = RequestBundleStateRegistry()
+    record = registry.upsert_live_request(
+        logical_request_id="rid-1",
+        instance_id="instance-a",
+        engine_request_id="rid-1",
+        logical_session_id="session-a",
+        session_generation=3,
+        full_prompt_token_count=64,
+        model_fingerprint="model-a",
+        kv_layout_id="layout-a",
+        tp_size=1,
+        pp_size=1,
+        required_ranks=(_rank(0),),
+        now_ms=100,
+    )
+
+    assert record.logical_session_id == "session-a"
+    assert record.session_generation == 3
+
+
+def test_prepared_bundle_registry_indexes_session_records() -> None:
+    registry = PreparedBundleRegistry()
+    registry.begin_prepare(
+        logical_request_id="source-rid",
+        source_engine_request_id="engine-rid",
+        logical_session_id="session-a",
+        session_generation=4,
+        target_instance_id="instance-b",
+        publish_manifest_digest="manifest-a",
+        artifact_manifest_digest="artifact-a",
+        engine_owned_manifest_sha256="engine-a",
+        required_ranks=(_rank(0),),
+        now_ms=100,
+    )
+
+    session_records = registry.list_session_records(logical_session_id="session-a")
+    assert len(session_records) == 1
+    assert session_records[0].logical_request_id == "source-rid"
+    assert session_records[0].source_engine_request_id == "engine-rid"
+    assert session_records[0].session_generation == 4
+
+
 def test_resolve_page_closure_cutoff_keeps_full_prompt_and_records_tail() -> None:
     cutoff = resolve_page_closure_cutoff(
         requested_token_count=70,

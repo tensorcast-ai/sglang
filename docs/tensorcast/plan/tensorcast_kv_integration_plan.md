@@ -36,6 +36,7 @@ Current repo status:
   portion of `Phase 3D` are implemented in the current codebase.
 - Remaining planned work is:
   - the remote `M6` validation in `Phase 3D`,
+  - the session-scoped explicit request-transfer profile in `Phase 3E`,
   - and the hardening / observability / performance follow-up in `Phase 4`.
 
 ## Target Outcome
@@ -52,6 +53,10 @@ Current repo status:
 - Add the Phase-3 request-transfer surface centered on explicit
   `PublishManifest` / `EngineOwnedManifest`, not on implicit reuse of
   `engine_request_id`.
+- Extend the Phase-3 request-transfer surface with an explicit
+  request-transfer traffic policy and a session-scoped prepared-prefix profile
+  suitable for LLM routers that use unique per-turn request ids but stable
+  per-session routing metadata.
 
 ## Phase 0 - Foundation and Scope Freeze
 
@@ -989,6 +994,22 @@ Recommended Phase-3 milestones:
     a controller can serve on source, publish a full-prompt page-granular
     snapshot, optionally prefetch, hydrate on target, and resume through
     ordinary SGLang ingress.
+- `M7`
+  - **What it is**:
+    explicit request-transfer traffic policy plus session-scoped prepared-prefix
+    admission for unique-rid multi-turn streams.
+  - **What must be true when it is complete**:
+    ordinary serving traffic can run with Tensorcast-backed HiCache enabled
+    without continuously offloading every backed-up page; `publish()` can
+    force-flush the required prompt pages on demand; source and target
+    OpenAI-compatible requests can carry a stable `x-smg-routing-key` that
+    resolves to `logical_session_id`; hydrate can install prepared-prefix
+    candidates by session; and target admission can claim the longest
+    prompt-prefix-compatible candidate while preserving the current unique
+    serving `rid`.
+  - **What it does not include yet**:
+    benchmark-scale policy tuning. No E2E benchmark should be treated as a
+    validation gate until the Phase-3E unit tests are green.
 
 ### Phase 3A - SGLang Instance-Agent and Coordinator
 
@@ -1297,6 +1318,199 @@ Current status:
   - [x] leave decode-only target instances out of scope for the initial implementation; v1 first targets ordinary serving instances that run the first decode step locally.
   - [x] ordinary `/generate(rid)` should claim a clean prepared bundle when available, but warning + fall back to the normal SGLang path if only stale/tainted/incompatible prepared records exist.
 
+### Phase 3E - Explicit Request-Transfer Mode and Session-Scoped Prefix Reuse
+
+This phase extends the already-implemented exact-rid request-transfer path for
+router-driven multi-turn workloads. It keeps the OpenAI-compatible serving API
+non-invasive: tc-router uses `/v1/chat/completions`, carries a unique `rid` per
+turn, and sends the stable session namespace through `x-smg-routing-key`.
+
+Implementation must preserve these boundaries:
+
+- no Tensorcast-specific field is added to OpenAI-compatible request JSON,
+- SGLang core does not hardcode a parser for any router-specific `rid` format,
+- `logical_session_id` is resolved from ordinary serving metadata, captured in
+  SGLang request-bundle state, and copied through `PublishManifest`,
+- correctness still comes from model/layout compatibility plus token-prefix
+  digest verification, never from session id equality alone,
+- SGLang `routing_key` scheduling is an independent experiment variable and
+  must not be silently enabled by this feature.
+
+- [x] Add explicit request-transfer mode config:
+  - [x] Extend the Tensorcast HiCache extra-config parser with the flat SGLang
+    CLI shape:
+    - `tensorcast_kv_mode={passive_prefix_share,explicit_request_transfer}`,
+    - `background_page_publish`,
+    - `ordinary_storage_prefetch`,
+    - `record_host_residency_for_publish`,
+    - `logical_session_id_source={disabled,routing_key,routing_key_then_rid_regex}`,
+    - `logical_session_id_rid_regex`.
+  - [x] Validate invalid combinations with clear errors:
+    - `explicit_request_transfer` requires host-residency recording,
+    - regex fallback requires a valid named `session_id` capture,
+    - optional `generation` capture must parse as an integer when present.
+  - [x] Keep passive prefix-share as the default-compatible behavior for
+    existing Tensorcast HiCache users.
+  - [x] Unit-test config parsing, default values, invalid enum values, invalid
+    regexes, missing named captures, and mode-specific validation.
+- [x] Implement explicit-mode storage traffic policy:
+  - [x] Make ordinary `batch_set_v1(...)` record source host residency without
+    calling Tensorcast batch put when `tensorcast_kv_mode=explicit_request_transfer`.
+  - [x] Keep page-publication registry entries `absent` until a page is actually
+    published or adopted; never mark pages `ready` only because host bytes exist.
+  - [x] Record enough source metadata for later publish force flush:
+    - artifact identity,
+    - layout id,
+    - rank / shard ownership,
+    - host page index or slot token,
+    - host slot generation,
+    - host-residency validity.
+  - [x] Make `publish(engine_request_id=...)` force-flush every required
+    `absent` prompt page from a valid host slot before committing
+    `PublishManifest`.
+  - [x] Preserve existing publish behavior for `ready`, `inflight`, `failed`,
+    stale-slot, and missing-source-byte cases:
+    - reuse/adopt `ready`,
+    - wait/adopt compatible `inflight`,
+    - fail closed on stale, evicted, layout-mismatched, or missing host slots.
+  - [x] Unit-test no-background-put behavior, registry `absent` preservation,
+    ready/adopt/inflight handling, force-flush success, stale-slot failure, and
+    partial-rank failure aggregation.
+- [x] Add the logical-session resolver:
+  - [x] Implement a small SGLang-side resolver that returns:
+    - `logical_session_id`,
+    - optional `session_generation`,
+    - and a structured reason when no session id is available.
+  - [x] Prefer existing `routing_key` metadata.
+  - [x] Support `routing_key_then_rid_regex` only as explicit deployment
+    configuration; do not hardcode tc-router or any other router `rid` scheme.
+  - [x] Treat native `/generate` as out of the non-invasive v1 profile unless
+    it explicitly maps `x-smg-routing-key` into `GenerateReqInput.routing_key`
+    or intentionally uses its existing body `routing_key` field.
+  - [x] Unit-test:
+    - routing-key success,
+    - disabled resolver,
+    - missing metadata,
+    - regex fallback success,
+    - regex generation parsing,
+    - malformed generation fallback / rejection semantics,
+    - invalid regex config,
+    - and no hidden parser dependency on a router-specific `rid`.
+- [x] Wire OpenAI-compatible ingress metadata:
+  - [x] Ensure `/v1/chat/completions` and `/v1/completions` propagate
+    `x-smg-routing-key` into `GenerateReqInput.routing_key`.
+  - [x] Ensure tc-router / gateway-side clients preserve and forward
+    `x-smg-routing-key` for both the source request that will be published and
+    the later target request.
+  - [x] Keep SGLang routing-key scheduling disabled by default in the
+    request-transfer benchmark configs; enabling it must be an explicit
+    separate experiment variable.
+  - [x] Unit-test OpenAI request conversion with and without the header, and
+    gateway/client header forwarding where practical.
+- [x] Persist source-side session metadata before publish:
+  - [x] Run the logical-session resolver during source ordinary-request
+    admission.
+  - [x] Store the resolved `logical_session_id` and optional
+    `session_generation` in `RequestBundleState`.
+  - [x] Make `publish(engine_request_id=...)` copy the stored session fields into
+    the engine-owned manifest payload.
+  - [x] Emit `logical_session_id: null` when the source request had no resolved
+    session id; do not parse HTTP headers or structured `rid` during publish.
+  - [x] Unit-test source request tracking with routing key present, routing key
+    absent, regex fallback, retained prompt snapshots, and publish-manifest
+    payload generation.
+- [x] Install session-scoped prepared-prefix records during hydrate:
+  - [x] Preserve exact-rid hydrate behavior for existing request-transfer tests.
+  - [x] When manifest payload has `logical_session_id`, install a
+    target-local prepared-prefix candidate keyed by:
+    - `(logical_session_id, publish_manifest_digest)`.
+  - [x] Treat `PreparedBundleRecord.logical_request_id` as source / transfer
+    audit identity in the session-scoped profile, not as the future target
+    serving `rid`.
+  - [x] Preserve one-shot prepared-hold ownership and idempotent hydrate retry
+    semantics.
+  - [x] Unit-test session-keyed install, idempotent retry, exact-id coexistence,
+    missing-session manifest behavior, cleanup, and compatibility mismatch
+    failure.
+- [x] Implement session-scoped target admission:
+  - [x] Resolve the current target request's `logical_session_id` from
+    OpenAI-compatible request metadata.
+  - [x] Skip the session-scoped profile and follow ordinary SGLang admission if
+    no session id is resolved.
+  - [x] Look up all prepared records by `logical_session_id`.
+  - [x] Filter candidates by:
+    - prepared state,
+    - model/layout/topology/rank compatibility,
+    - non-stale / non-tainted status,
+    - `record.cutoff_token_count <= len(incoming_prompt_tokens)`,
+    - digest match over
+      `incoming_prompt_tokens[:record.cutoff_token_count]`.
+  - [x] Select the longest reusable prefix:
+    `record.cutoff_token_count - record.tail_valid_tokens`.
+  - [x] Break ties deterministically:
+    - highest non-null `session_generation`,
+    - newest `prepared_at_ms`,
+    - lexical `publish_manifest_digest`.
+  - [x] CAS-claim the selected record and bind it to the current unique
+    scheduler `rid`; do not rewrite the serving `rid`.
+  - [x] Avoid concurrent same-session claims unless a future controller
+    explicitly declares branch support.
+  - [x] Fall back to the normal SGLang path on no candidate, stale candidate,
+    digest mismatch, or compatibility mismatch.
+  - [x] Unit-test longest-prefix selection, tie-breaks, one-shot claim,
+    exact-id coexistence, no-session fallback, digest mismatch fallback,
+    stale/tainted fallback, active-rid conflict, and same-session concurrency
+    guard.
+- [ ] Add observability for debugging session-scoped transfer:
+  - [x] Log or count resolver outcomes:
+    - routing-key hit,
+    - regex fallback,
+    - missing session id,
+    - invalid generation.
+  - [x] Log or count explicit-mode publish force-flush outcomes:
+    - absent pages flushed,
+    - ready pages reused,
+    - inflight pages adopted,
+    - stale / missing host slots.
+  - [x] Log or count target admission outcomes:
+    - prepared candidate count,
+    - selected reusable-prefix length,
+    - fallback reason,
+    - claim conflict.
+  - [ ] Add a startup warning or config note when `routing_key` scheduling is
+    enabled together with session-scoped Tensorcast admission, because it changes
+    instance-local queue ordering and can confound router-policy benchmarks.
+  - [x] Unit-test structured reason propagation where the code exposes it
+    without making logging text itself the correctness contract.
+
+#### Phase 3E Unit-Test Validation Gate
+
+These unit tests are the validation gate for Phase 3E. Do not run or interpret
+router-scale E2E benchmarks for this profile until these pass in the project
+virtual environment:
+
+```bash
+source .venv/bin/activate
+python -m pytest \
+  python/sglang/test/tensorcast/test_tensorcast_store_config.py \
+  python/sglang/test/tensorcast/test_tensorcast_explicit_request_transfer_mode.py \
+  python/sglang/test/tensorcast/test_logical_session_resolver.py \
+  python/sglang/test/tensorcast/test_request_bundle_state.py \
+  python/sglang/test/tensorcast/test_request_bundle_publish.py \
+  python/sglang/test/tensorcast/test_request_bundle_hydrate.py \
+  python/sglang/test/tensorcast/test_prepared_bundle_admission.py \
+  python/sglang/test/tensorcast/test_openai_routing_key_session_profile.py
+```
+
+- [x] Add or extend the unit-test modules listed above.
+- [x] Keep exact-rid Phase-3 tests green while adding session-scoped behavior.
+- [x] Treat any unit-test regression in exact-rid publish / hydrate / admission
+  as a Phase-3E blocker.
+- [ ] Only after the unit-test gate is green, run a minimal local controller
+  smoke test for session-scoped reuse.
+- [ ] Only after the local smoke test is green, run tc-router E2E rebalance
+  validation.
+
 ### Phase 3 Exit Criteria
 
 - [x] Milestones `M0` through `M5` each have self-contained unit or local
@@ -1310,6 +1524,19 @@ Current status:
 - [x] Prepared-bundle claim revalidates incoming prompt tokenization against
   `prompt_token_digest` and `cutoff_token_count`.
 - [x] The integration keeps request-bundle metadata owned by SGLang, not Tensorcast core.
+- [x] Phase 3E unit-test validation gate is green before session-scoped
+  tc-router E2E validation.
+- [ ] A controller can publish one unique-rid source turn, hydrate the
+  prompt-only snapshot on a target instance, and let a later unique-rid target
+  turn reuse the longest compatible prepared prefix via `logical_session_id`.
+- [x] Explicit request-transfer mode prevents ordinary serving traffic from
+  continuously offloading backed-up pages, while `publish()` can still
+  force-flush the required prompt pages on demand.
+- [ ] The OpenAI-compatible session-scoped profile works through
+  `/v1/chat/completions` with `x-smg-routing-key`, without adding a
+  Tensorcast-specific JSON field to the request body.
+- [ ] Missing session metadata, digest mismatch, and stale prepared records all
+  fall back or fail closed according to the documented admission rules.
 
 ## Phase 4 - Hardening, Failure Semantics, and Performance
 
@@ -1423,7 +1650,19 @@ Already added for `evict_local(...)`:
 
 Remaining SGLang-side Phase-3 work is expected to land mainly in:
 
-- any narrow runtime glue discovered during remote `M6` validation.
+- Phase-3E session-scoped request-transfer modules:
+  - `sglang/python/sglang/srt/mem_cache/storage/tensorcast_store/config.py`
+  - `sglang/python/sglang/srt/mem_cache/storage/tensorcast_store/tensorcast_store.py`
+  - `sglang/python/sglang/srt/tensorcast/request_bundle/logical_session.py`
+    or an equivalent small resolver module,
+  - `sglang/python/sglang/srt/tensorcast/request_bundle/request_bundle_state.py`
+  - `sglang/python/sglang/srt/tensorcast/request_bundle/request_bundle_publish.py`
+  - `sglang/python/sglang/srt/tensorcast/request_bundle/request_bundle_hydrate.py`
+  - `sglang/python/sglang/srt/tensorcast/request_bundle/prepared_bundle_admission.py`
+  - OpenAI serving conversion code only if additional routing-key propagation
+    tests expose a gap,
+  - tc-router / gateway client code that must forward `x-smg-routing-key`.
+- any narrow runtime glue discovered during remote `M6` or Phase-3E validation.
 
 ### Phase 3 SGLang test map
 
@@ -1463,8 +1702,25 @@ Additional local integration coverage already added:
   instance-agent integration paths rather than only isolated state machines.
 
 Remaining Phase-3 validation is remote `M6` end-to-end verification plus any
-runtime hardening it uncovers; there is no known missing standalone unit-test
-module at this point.
+runtime hardening it uncovers.
+
+Additional Phase-3E unit-test gate:
+
+- `sglang/python/sglang/test/tensorcast/test_tensorcast_store_config.py`
+- `sglang/python/sglang/test/tensorcast/test_tensorcast_explicit_request_transfer_mode.py`
+- `sglang/python/sglang/test/tensorcast/test_logical_session_resolver.py`
+- `sglang/python/sglang/test/tensorcast/test_request_bundle_state.py`
+  - extend for source-side `logical_session_id` persistence.
+- `sglang/python/sglang/test/tensorcast/test_request_bundle_publish.py`
+  - extend for manifest session metadata and explicit-mode force flush.
+- `sglang/python/sglang/test/tensorcast/test_request_bundle_hydrate.py`
+  - extend for session-keyed prepared-prefix install.
+- `sglang/python/sglang/test/tensorcast/test_prepared_bundle_admission.py`
+  - extend for longest-prefix-compatible session-scoped admission.
+- `sglang/python/sglang/test/tensorcast/test_openai_routing_key_session_profile.py`
+  - add OpenAI-compatible `x-smg-routing-key` propagation coverage.
+
+Phase-3E E2E validation must remain behind that unit-test gate.
 
 ### Tensorcast files to modify
 

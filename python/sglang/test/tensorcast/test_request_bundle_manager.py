@@ -26,9 +26,6 @@ from sglang.srt.tensorcast.instance_ops.instance_ops_types import (
 from sglang.srt.tensorcast.request_bundle.request_bundle_publish import (
     RequestBundlePublishAggregator,
 )
-from sglang.srt.tensorcast.request_bundle.request_bundle_state import (
-    RequestBundleStateError,
-)
 from sglang.srt.tensorcast.request_bundle.request_bundle_types import (
     PreparedBundleBindAction,
     PreparedBundleLifecycleState,
@@ -294,7 +291,9 @@ class RequestBundleManagerTest(unittest.TestCase):
             len(publish_result.publish_manifest.artifact_manifest.entries), 2
         )
 
-    def test_live_request_publish_keeps_full_prompt_cutoff_and_records_tail(self) -> None:
+    def test_live_request_publish_keeps_full_prompt_cutoff_and_records_tail(
+        self,
+    ) -> None:
         client = FakeTensorcastPageClient()
         store = TensorcastStore(
             build_storage_config(tp_rank=0),
@@ -419,6 +418,77 @@ class RequestBundleManagerTest(unittest.TestCase):
         )
         self.assertEqual(publish_result.publish_manifest.cutoff_token_count, 2)
 
+    def test_explicit_publish_closure_requires_recorded_host_residency(self) -> None:
+        client = FakeTensorcastPageClient()
+        store = TensorcastStore(
+            build_storage_config(
+                tp_rank=0,
+                extra_config={
+                    "daemon_address": "127.0.0.1:50052",
+                    "namespace": "unit-test",
+                    "tensorcast_kv_mode": "explicit_request_transfer",
+                },
+            ),
+            FakeHostKVCache([1.0, 2.0], page_size=2),
+            page_client=client,
+        )
+        manager = store.request_bundle_manager
+        rank = RankCoord(tp_rank=0, pp_rank=0)
+        prompt_token_ids = [401, 402]
+        page_hash = get_hash_str(prompt_token_ids)
+        manager.start_live_request_tracking(
+            logical_request_id="rid-host-record",
+            engine_request_id="rid-host-record",
+            prompt_token_ids=prompt_token_ids,
+            requested_at_ms=100,
+        )
+        manager.observe_live_request_progress(
+            logical_request_id="rid-host-record",
+            visible_prompt_token_count=2,
+            emitted_decode_token_count=0,
+            now_ms=110,
+        )
+
+        page = manager.page_publication_registry.snapshot_rank(
+            logical_request_id="rid-host-record",
+            rank=rank,
+        )[0]
+        self.assertEqual(page.publication_state, PagePublicationState.ABSENT)
+        self.assertFalse(page.host_resident)
+        with manager._lock:
+            live_request = manager._require_publishable_source_request(
+                logical_request_id="rid-host-record",
+                now_ms=120,
+            )
+            self.assertFalse(
+                manager._publish_page_closure_ready_locked(
+                    live_request=live_request,
+                    cutoff_token_count=2,
+                    now_ms=120,
+                )
+            )
+
+        store.batch_set_v1([page_hash], torch.tensor([0, 1], dtype=torch.int64))
+
+        page = manager.page_publication_registry.snapshot_rank(
+            logical_request_id="rid-host-record",
+            rank=rank,
+        )[0]
+        self.assertEqual(page.publication_state, PagePublicationState.ABSENT)
+        self.assertTrue(page.host_resident)
+        with manager._lock:
+            live_request = manager._require_publishable_source_request(
+                logical_request_id="rid-host-record",
+                now_ms=130,
+            )
+            self.assertTrue(
+                manager._publish_page_closure_ready_locked(
+                    live_request=live_request,
+                    cutoff_token_count=2,
+                    now_ms=130,
+                )
+            )
+
     def test_publish_waits_for_inflight_page_to_reach_ready(self) -> None:
         client = FakeTensorcastPageClient()
         store = TensorcastStore(
@@ -477,7 +547,9 @@ class RequestBundleManagerTest(unittest.TestCase):
             client.artifact_id_for(page_hash),
         )
 
-    def test_publish_pins_retained_source_window_while_waiting_for_closure(self) -> None:
+    def test_publish_pins_retained_source_window_while_waiting_for_closure(
+        self,
+    ) -> None:
         client = FakeTensorcastPageClient()
         store = TensorcastStore(
             build_storage_config(tp_rank=0),

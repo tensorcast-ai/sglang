@@ -89,7 +89,12 @@ def _target_from_manifest(
     return HydrateTargetCompatibility.model_validate(payload)
 
 
-def _seed_local_publish_result(rank: RankCoord) -> SourcePublishClosureResult:
+def _seed_local_publish_result(
+    rank: RankCoord,
+    *,
+    logical_session_id: str | None = None,
+    session_generation: int | None = None,
+) -> SourcePublishClosureResult:
     page_registry = PagePublicationRegistry()
     bundle_registry = RequestBundleStateRegistry(
         page_publication_registry=page_registry
@@ -120,6 +125,8 @@ def _seed_local_publish_result(rank: RankCoord) -> SourcePublishClosureResult:
         logical_request_id="rid-1",
         instance_id="instance-a",
         engine_request_id="rid-1",
+        logical_session_id=logical_session_id,
+        session_generation=session_generation,
         full_prompt_token_count=70,
         model_fingerprint="model-a",
         kv_layout_id="layout-v1",
@@ -294,6 +301,39 @@ def test_local_hydrate_installs_prepared_bundle_and_hold_set() -> None:
     assert result.hold_set is not None
     assert result.hold_set.state == PreparedHoldSetState.ACTIVE
     assert len(result.hold_set.refs) == 2
+
+
+def test_local_hydrate_preserves_session_scoped_metadata() -> None:
+    publish_manifest = _seed_local_publish_result(
+        _rank(0),
+        logical_session_id="session-hydrate",
+        session_generation=11,
+    ).publish_manifest
+    prepared_bundle_registry = PreparedBundleRegistry()
+    prepared_hold_registry = PreparedHoldRegistry()
+
+    result = RequestBundleHydrator(
+        prepared_bundle_registry=prepared_bundle_registry,
+        prepared_hold_registry=prepared_hold_registry,
+    ).hydrate(
+        request=_hydrate_request(publish_manifest),
+        publish_manifest=publish_manifest,
+        target=_target_from_manifest(publish_manifest),
+        local_rank=_rank(0),
+        install_rank=lambda work_item: _ready_install_result(
+            work_item.rank,
+            f"rank{work_item.rank.tp_rank}",
+        ),
+        now_ms=200,
+    )
+
+    assert result.prepared_bundle.logical_request_id == "rid-1"
+    assert result.prepared_bundle.source_engine_request_id == "rid-1"
+    assert result.prepared_bundle.logical_session_id == "session-hydrate"
+    assert result.prepared_bundle.session_generation == 11
+    assert prepared_bundle_registry.list_session_records(
+        logical_session_id="session-hydrate"
+    ) == (result.prepared_bundle,)
 
 
 def test_local_hydrate_with_same_manifest_is_idempotent_retry() -> None:

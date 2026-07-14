@@ -28,6 +28,10 @@ from sglang.srt.tensorcast.request_bundle.prepared_bundle_admission import (
 from sglang.srt.tensorcast.request_bundle.prepared_bundle_evict import (
     PreparedBundleLocalEvictor,
 )
+from sglang.srt.tensorcast.request_bundle.logical_session import (
+    LogicalSessionResolution,
+    resolve_logical_session,
+)
 from sglang.srt.tensorcast.request_bundle.request_bundle_hydrate import (
     RequestBundleHydrator,
 )
@@ -48,6 +52,7 @@ from sglang.srt.tensorcast.request_bundle.request_bundle_types import (
     HydrateTargetCompatibility,
     OrdinaryGenerateBindingRequest,
     OrdinaryGenerateBindingResult,
+    PageClosureEntry,
     PagePublicationState,
     PreparedBundleBindAction,
     PreparedBundleLifecycleState,
@@ -82,6 +87,8 @@ _PUBLISH_CLOSURE_POLL_INTERVAL_S = 0.02
 class _PublishableSourceRequestState:
     logical_request_id: str
     engine_request_id: str
+    logical_session_id: str | None
+    session_generation: int | None
     prompt_token_ids: tuple[int, ...]
     prompt_token_digest: str
     requested_at_ms: int
@@ -91,6 +98,14 @@ class _PublishableSourceRequestState:
     parallel_sampling_count: int = 1
     session_lineage_depth: int = 0
     retained_until_ms: int | None = None
+
+
+@dataclass
+class _HostResidentPageRecord:
+    page_hash: str
+    page_start: int
+    slot_token: HostSharedPageSlotToken
+    updated_at_ms: int
 
 
 class RequestBundleManager:
@@ -157,6 +172,9 @@ class RequestBundleManager:
         self._instance_ops_coordinator_epoch = "unconfigured"
         self._live_source_requests: dict[str, _PublishableSourceRequestState] = {}
         self._retained_source_requests: dict[str, _PublishableSourceRequestState] = {}
+        self._host_resident_pages: dict[
+            tuple[tuple[int, int], str], _HostResidentPageRecord
+        ] = {}
 
     @property
     def prepared_bundle_registry(self) -> PreparedBundleRegistry:
@@ -220,17 +238,24 @@ class RequestBundleManager:
         engine_request_id: str,
         prompt_token_ids: list[int],
         requested_at_ms: int,
+        routing_key: str | None = None,
         batch_request_count: int = 1,
         parallel_sampling_count: int = 1,
         session_lineage_depth: int = 0,
     ) -> None:
         prompt_token_digest = get_hash_str(prompt_token_ids)
+        session_resolution = self._resolve_logical_session(
+            routing_key=routing_key,
+            rid=logical_request_id,
+        )
         with self._lock:
             self._discard_publishable_source_request_locked(logical_request_id)
             self._live_source_requests[logical_request_id] = (
                 _PublishableSourceRequestState(
                     logical_request_id=logical_request_id,
                     engine_request_id=engine_request_id,
+                    logical_session_id=session_resolution.logical_session_id,
+                    session_generation=session_resolution.session_generation,
                     prompt_token_ids=tuple(prompt_token_ids),
                     prompt_token_digest=prompt_token_digest,
                     requested_at_ms=int(requested_at_ms),
@@ -243,6 +268,8 @@ class RequestBundleManager:
                 logical_request_id=logical_request_id,
                 instance_id=self._instance_ops_instance_id,
                 engine_request_id=engine_request_id,
+                logical_session_id=session_resolution.logical_session_id,
+                session_generation=session_resolution.session_generation,
                 full_prompt_token_count=len(prompt_token_ids),
                 model_fingerprint=self._model_fingerprint,
                 kv_layout_id=self._layout_id,
@@ -250,6 +277,10 @@ class RequestBundleManager:
                 pp_size=self._pp_size,
                 required_ranks=self._required_ranks(),
                 now_ms=int(requested_at_ms),
+            )
+            self._log_logical_session_resolution(
+                rid=logical_request_id,
+                resolution=session_resolution,
             )
 
     def observe_live_request_progress(
@@ -297,6 +328,8 @@ class RequestBundleManager:
                     live_request.__class__(
                         logical_request_id=live_request.logical_request_id,
                         engine_request_id=live_request.engine_request_id,
+                        logical_session_id=live_request.logical_session_id,
+                        session_generation=live_request.session_generation,
                         prompt_token_ids=live_request.prompt_token_ids,
                         prompt_token_digest=live_request.prompt_token_digest,
                         requested_at_ms=live_request.requested_at_ms,
@@ -357,6 +390,11 @@ class RequestBundleManager:
                     ttl_ms=int(ttl_ms),
                 ),
                 now_ms=int(requested_at_ms),
+                force_flush_absent_page=(
+                    self._force_flush_absent_page_local
+                    if self._tensorcast_config.explicit_request_transfer_enabled
+                    else None
+                ),
             )
 
     def build_live_request_publish_request(
@@ -414,11 +452,14 @@ class RequestBundleManager:
             )
             return self._request_bundle_publisher.publish(
                 request=request.model_copy(
-                    update={
-                        "requested_cutoff_token_count": resolved_cutoff_token_count
-                    }
+                    update={"requested_cutoff_token_count": resolved_cutoff_token_count}
                 ),
                 now_ms=int(request.requested_at_ms),
+                force_flush_absent_page=(
+                    self._force_flush_absent_page_local
+                    if self._tensorcast_config.explicit_request_transfer_enabled
+                    else None
+                ),
             )
 
     def instance_hydrate_local(
@@ -473,12 +514,20 @@ class RequestBundleManager:
         scheduler_rid: str,
         prompt_token_ids: list[int],
         requested_at_ms: int,
+        routing_key: str | None = None,
     ) -> OrdinaryGenerateBindingResult:
         prompt_token_digest = get_hash_str(prompt_token_ids)
+        session_resolution = self._resolve_logical_session(
+            routing_key=routing_key,
+            rid=logical_request_id,
+        )
         binding_request = OrdinaryGenerateBindingRequest(
             logical_request_id=logical_request_id,
             scheduler_rid=scheduler_rid,
+            logical_session_id=session_resolution.logical_session_id,
+            session_generation=session_resolution.session_generation,
             prompt_token_digest=prompt_token_digest,
+            prompt_token_ids=tuple(prompt_token_ids),
             cutoff_token_count=len(prompt_token_ids),
             requested_at_ms=int(requested_at_ms),
         )
@@ -487,15 +536,29 @@ class RequestBundleManager:
                 logical_request_id=logical_request_id,
                 include_evicted=True,
             )
+            session_records = (
+                self._prepared_bundle_registry.list_session_records(
+                    logical_session_id=session_resolution.logical_session_id,
+                    include_evicted=True,
+                )
+                if session_resolution.logical_session_id is not None
+                else ()
+            )
             bind_result = self._prepared_bundle_admission_binder.bind(
                 request=binding_request,
                 attach_prepared_bundle=self._attach_prepared_bundle,
             )
+            self._log_logical_session_resolution(
+                rid=logical_request_id,
+                resolution=session_resolution,
+            )
         logger.debug(
-            "Tensorcast prepared-bundle bind logical_request_id=%s scheduler_rid=%s records=%s record_states=%s action=%s reason=%s",
+            "Tensorcast prepared-bundle bind logical_request_id=%s scheduler_rid=%s logical_session_id=%s exact_records=%s session_records=%s record_states=%s action=%s reason=%s",
             logical_request_id,
             scheduler_rid,
+            session_resolution.logical_session_id,
             len(existing_records),
+            len(session_records),
             [
                 (
                     record.publish_manifest_digest,
@@ -527,6 +590,18 @@ class RequestBundleManager:
                 logical_request_id=logical_request_id,
                 publish_manifest_digest=publish_manifest_digest,
             )
+            if record is None:
+                record = self._prepared_bundle_registry.get_by_publish_manifest_digest(
+                    publish_manifest_digest=publish_manifest_digest,
+                    include_evicted=False,
+                )
+                if (
+                    record is not None
+                    and record.active_scheduler_rid != logical_request_id
+                ):
+                    raise RequestBundleStateError(
+                        "session-scoped prepared bundle is attached to a different scheduler rid"
+                    )
             if record is None:
                 raise RequestBundleStateError(
                     "attached prepared bundle disappeared before ordinary generate consume"
@@ -640,6 +715,43 @@ class RequestBundleManager:
                     last_error=failure_reason,
                 )
 
+    def record_pages_host_resident(
+        self,
+        *,
+        page_hashes: Sequence[str],
+        page_starts: Sequence[int],
+        slot_tokens: Sequence[HostSharedPageSlotToken],
+        now_ms: int,
+    ) -> None:
+        if not self._tensorcast_config.record_host_residency_for_publish:
+            return
+        if len(page_hashes) != len(page_starts) or len(page_hashes) != len(slot_tokens):
+            raise ValueError(
+                "page_hashes, page_starts, and slot_tokens must have the same length"
+            )
+        with self._lock:
+            rank_key = self._current_rank().as_key()
+            for page_hash, page_start, slot_token in zip(
+                page_hashes,
+                page_starts,
+                slot_tokens,
+                strict=True,
+            ):
+                self._host_resident_pages[(rank_key, page_hash)] = (
+                    _HostResidentPageRecord(
+                        page_hash=str(page_hash),
+                        page_start=int(page_start),
+                        slot_token=slot_token,
+                        updated_at_ms=int(now_ms),
+                    )
+                )
+            if page_hashes:
+                self._update_live_page_publication_state_for_hashes(
+                    page_hashes=list(page_hashes),
+                    publication_state=PagePublicationState.ABSENT,
+                    now_ms=int(now_ms),
+                )
+
     def instance_hydrate_target(
         self,
         *,
@@ -662,6 +774,48 @@ class RequestBundleManager:
         hold_set: PreparedHoldSetRecord,
     ) -> None:
         self.release_prepared_hold_refs(hold_set.refs)
+
+    def _release_host_resident_page_locked(
+        self,
+        *,
+        rank_key: tuple[int, int],
+        page_hash: str,
+    ) -> None:
+        host_record = self._host_resident_pages.pop((rank_key, page_hash), None)
+        if host_record is None:
+            return
+        try:
+            self._mem_pool_host.release_page_slot_retains([host_record.slot_token])
+        except Exception:
+            logger.exception(
+                "Tensorcast explicit publish failed to release retained host slot page_hash=%s",
+                page_hash,
+            )
+
+    def _release_request_host_resident_pages_locked(
+        self,
+        *,
+        logical_request_id: str,
+    ) -> None:
+        rank = self._current_rank()
+        rank_key = rank.as_key()
+        pages = self._page_publication_registry.snapshot_rank(
+            logical_request_id=logical_request_id,
+            rank=rank,
+        )
+        for page in pages:
+            self._release_host_resident_page_locked(
+                rank_key=rank_key,
+                page_hash=page.page_hash,
+            )
+
+    def _host_resident_page_exists_locked(
+        self,
+        *,
+        rank_key: tuple[int, int],
+        page_hash: str,
+    ) -> bool:
+        return (rank_key, page_hash) in self._host_resident_pages
 
     def _page_start_indices(
         self,
@@ -688,6 +842,78 @@ class RequestBundleManager:
             and self._mem_pool_host.host_region_binding is not None
         )
 
+    def _allocator_backed_direct_put_enabled(self) -> bool:
+        return (
+            self._tensorcast_config.host_allocator_enabled
+            and self._mem_pool_host.host_region_binding is not None
+        )
+
+    def _force_flush_absent_page_local(
+        self,
+        rank: RankCoord,
+        page: PageClosureEntry,
+    ) -> PageClosureEntry:
+        if rank.as_key() != self._current_rank().as_key():
+            raise RequestBundleStateError(
+                f"cannot force-flush non-local rank={rank.as_key()}"
+            )
+        host_record = self._host_resident_pages.get((rank.as_key(), page.page_hash))
+        if host_record is None:
+            raise RequestBundleStateError(
+                f"missing host-resident page bytes for page_hash={page.page_hash}"
+            )
+        slot_snapshot = self._mem_pool_host.describe_page_slot(host_record.page_start)
+        if int(slot_snapshot.slot_generation) != int(
+            host_record.slot_token.slot_generation
+        ):
+            raise RequestBundleStateError(
+                f"stale host slot generation for page_hash={page.page_hash}"
+            )
+        if slot_snapshot.logical_key is not None and (
+            slot_snapshot.logical_key != page.page_hash
+        ):
+            raise RequestBundleStateError(
+                "host slot logical key no longer matches the requested page hash"
+            )
+        slot_state = getattr(slot_snapshot.state, "value", str(slot_snapshot.state))
+        if slot_state != "slot_resident":
+            raise RequestBundleStateError(
+                f"host slot is not resident for page_hash={page.page_hash}: state={slot_state}"
+            )
+        source_region_binding = (
+            self._mem_pool_host.host_region_binding
+            if self._allocator_backed_direct_put_enabled()
+            else None
+        )
+        result = self._page_client.batch_put(
+            [page.page_hash],
+            [self._mem_pool_host.get_data_page(host_record.page_start, flat=True)],
+            slot_tokens=[host_record.slot_token],
+            source_region_binding=source_region_binding,
+        )
+        if not result.success_mask or not result.success_mask[0]:
+            raise RequestBundleStateError(
+                f"force-flush failed for page_hash={page.page_hash}"
+            )
+        self._release_host_resident_page_locked(
+            rank_key=rank.as_key(),
+            page_hash=page.page_hash,
+        )
+        logger.debug(
+            "Tensorcast explicit publish force-flushed rank=%s page_index=%s page_hash=%s",
+            rank.as_key(),
+            page.logical_page_index,
+            page.page_hash,
+        )
+        return page.model_copy(
+            update={
+                "publication_state": PagePublicationState.READY,
+                "artifact_id": self._page_client.artifact_id_for(page.page_hash),
+                "host_resident": True,
+                "last_error": None,
+            }
+        )
+
     def _success_prefix_count(self, success_mask: tuple[bool, ...]) -> int:
         prefix_success = 0
         for success in success_mask:
@@ -700,8 +926,8 @@ class RequestBundleManager:
         self,
         work_item: HydrateRankWorkItem,
     ) -> HydrateRankInstallResult:
-        runnable_prefix_tokens = (
-            int(work_item.cutoff_token_count) - int(work_item.tail_valid_tokens)
+        runnable_prefix_tokens = int(work_item.cutoff_token_count) - int(
+            work_item.tail_valid_tokens
         )
         if runnable_prefix_tokens < 0:
             raise RequestBundleStateError(
@@ -815,6 +1041,33 @@ class RequestBundleManager:
     def _required_ranks(self) -> tuple[RankCoord, ...]:
         return (self._current_rank(),)
 
+    def _resolve_logical_session(
+        self,
+        *,
+        routing_key: str | None,
+        rid: str,
+    ) -> LogicalSessionResolution:
+        return resolve_logical_session(
+            source=self._tensorcast_config.logical_session_id_source,
+            routing_key=routing_key,
+            rid=rid,
+            rid_regex=self._tensorcast_config.logical_session_id_rid_regex,
+        )
+
+    def _log_logical_session_resolution(
+        self,
+        *,
+        rid: str,
+        resolution: LogicalSessionResolution,
+    ) -> None:
+        logger.debug(
+            "Tensorcast logical-session resolution rid=%s logical_session_id=%s generation=%s reason=%s",
+            rid,
+            resolution.logical_session_id,
+            resolution.session_generation,
+            resolution.reason,
+        )
+
     def _require_live_source_request(
         self, logical_request_id: str
     ) -> _PublishableSourceRequestState:
@@ -893,6 +1146,9 @@ class RequestBundleManager:
         logical_request_id: str,
         now_ms: int,
     ) -> None:
+        self._release_request_host_resident_pages_locked(
+            logical_request_id=logical_request_id
+        )
         self._discard_publishable_source_request_locked(logical_request_id)
         if self._request_bundle_registry.get(logical_request_id) is not None:
             with suppress(RequestBundleStateError):
@@ -958,11 +1214,12 @@ class RequestBundleManager:
                 )
             if page.publication_state != PagePublicationState.READY:
                 if not page.host_resident:
-                    raise RequestBundleStateError(
-                        "page publication cannot close full prompt boundary because "
-                        f"rank={current_rank.as_key()} page={page.logical_page_index} "
-                        "is not host resident"
-                    )
+                    return False
+                if (
+                    self._tensorcast_config.explicit_request_transfer_enabled
+                    and page.publication_state == PagePublicationState.ABSENT
+                ):
+                    continue
                 return False
             if not page.artifact_id:
                 return False
@@ -1087,6 +1344,10 @@ class RequestBundleManager:
         affected_request_ids: set[str] = set()
         for record in matching_records:
             next_state = publication_state
+            host_resident = self._host_resident_page_exists_locked(
+                rank_key=record.rank.as_key(),
+                page_hash=record.page_hash,
+            )
             if publication_state == PagePublicationState.INFLIGHT:
                 if record.publication_state == PagePublicationState.READY:
                     continue
@@ -1095,6 +1356,7 @@ class RequestBundleManager:
             elif publication_state == PagePublicationState.READY:
                 artifact_id = self._page_client.artifact_id_for(record.page_hash)
                 resolved_last_error = None
+                host_resident = record.host_resident or host_resident
             else:
                 if record.publication_state == PagePublicationState.READY:
                     continue
@@ -1108,7 +1370,7 @@ class RequestBundleManager:
                 page_hash=record.page_hash,
                 publication_state=next_state,
                 artifact_id=artifact_id,
-                host_resident=record.host_resident,
+                host_resident=host_resident,
                 last_error=resolved_last_error,
                 updated_at_ms=int(now_ms),
             )
@@ -1163,6 +1425,15 @@ class RequestBundleManager:
                 PagePublicationState.FAILED,
             }:
                 resolved_state = preserved_state
+            host_resident = self._host_resident_page_exists_locked(
+                rank_key=current_rank.as_key(),
+                page_hash=page_hash,
+            )
+            if (
+                resolved_state == PagePublicationState.READY
+                and existing_page is not None
+            ):
+                host_resident = existing_page.host_resident or host_resident
             record = self._page_publication_registry.set_page_state(
                 logical_request_id=live_request.logical_request_id,
                 rank=current_rank,
@@ -1174,7 +1445,7 @@ class RequestBundleManager:
                     if resolved_state == PagePublicationState.READY
                     else None
                 ),
-                host_resident=True,
+                host_resident=host_resident,
                 last_error=(
                     None
                     if resolved_state == PagePublicationState.READY

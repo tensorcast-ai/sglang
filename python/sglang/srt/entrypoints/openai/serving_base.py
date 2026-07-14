@@ -13,6 +13,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.entrypoints.openai.routing_key import extract_smg_routing_key
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.server_args import ServerArgs
 
@@ -284,6 +285,4 @@ class OpenAIServingBase(ABC):
         return custom_labels
 
     def extract_routing_key(self, raw_request):
-        if raw_request is None:
-            return None
-        return raw_request.headers.get("x-smg-routing-key")
+        return extract_smg_routing_key(raw_request)

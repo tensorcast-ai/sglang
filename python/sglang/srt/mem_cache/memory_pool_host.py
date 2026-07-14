@@ -81,9 +81,7 @@ class HostTensorAllocator(abc.ABC):
     def binding(self) -> Any | None:
         return None
 
-    def ensure_host_registration(
-        self, tensor: torch.Tensor, pin_memory: bool
-    ) -> None:
+    def ensure_host_registration(self, tensor: torch.Tensor, pin_memory: bool) -> None:
         if pin_memory:
             torch.cuda.cudart().cudaHostRegister(
                 tensor.data_ptr(), tensor.numel() * tensor.element_size(), 0
@@ -174,7 +172,6 @@ ALLOC_MEMORY_FUNCS = defaultdict(
 
 
 class HostKVCache(abc.ABC):
-
     def __init__(
         self,
         device_pool: KVCache,
@@ -210,9 +207,9 @@ class HostKVCache(abc.ABC):
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
-        assert (
-            self.size > device_pool.size
-        ), "The host memory should be larger than the device memory with the current protocol"
+        assert self.size > device_pool.size, (
+            "The host memory should be larger than the device memory with the current protocol"
+        )
 
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
@@ -301,15 +298,16 @@ class HostKVCache(abc.ABC):
             page_size=self.page_size,
             page_num=self.page_num,
         )
+        self._pending_retire_slot_tokens: dict[int, HostSharedPageSlotToken] = {}
 
     def available_size(self):
         return len(self.free_slots)
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        assert (
-            need_size % self.page_size == 0
-        ), "The requested size should be a multiple of the page size."
+        assert need_size % self.page_size == 0, (
+            "The requested size should be a multiple of the page size."
+        )
         if need_size > self.available_size():
             return None
 
@@ -320,31 +318,44 @@ class HostKVCache(abc.ABC):
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
-        self._retire_released_page_slots(indices)
-        self.free_slots = torch.cat([self.free_slots, indices])
+        releasable_indices = self._retire_released_page_slots(indices)
+        if releasable_indices.numel() > 0:
+            self.free_slots = torch.cat([self.free_slots, releasable_indices])
         return len(indices)
 
-    def _retire_released_page_slots(self, indices: torch.Tensor) -> None:
+    def _retire_released_page_slots(self, indices: torch.Tensor) -> torch.Tensor:
         if indices.numel() == 0 or indices.numel() % self.page_size != 0:
-            return
+            return indices
         retire_tokens: list[HostSharedPageSlotToken] = []
+        releasable_pages: list[torch.Tensor] = []
         for offset in range(0, indices.numel(), self.page_size):
+            page_indices = indices[offset : offset + self.page_size]
             page_start = int(indices[offset].item())
             slot_index = self.page_slot_tracker.slot_index_for_page_start(page_start)
             snapshot = self.page_slot_tracker.snapshot(slot_index)
             if snapshot.state == HostSharedPageSlotState.SLOT_FREE:
+                releasable_pages.append(page_indices)
                 continue
             if snapshot.state in {
                 HostSharedPageSlotState.SLOT_RESIDENT,
                 HostSharedPageSlotState.SLOT_INVALID,
             }:
+                if snapshot.pin_count > 0:
+                    self._pending_retire_slot_tokens[slot_index] = (
+                        self.page_slot_tracker.current_token(slot_index)
+                    )
+                    continue
                 retire_tokens.append(self.page_slot_tracker.current_token(slot_index))
+                releasable_pages.append(page_indices)
                 continue
             raise HostSharedPageSlotStateError(
                 "cannot free host page slots while they are reserved or in flight"
             )
         if retire_tokens:
             self.page_slot_tracker.retire_slots(retire_tokens)
+        if not releasable_pages:
+            return indices.new_empty((0,))
+        return torch.cat(releasable_pages)
 
     def _slot_indices_from_page_starts(
         self, page_starts: torch.Tensor | Sequence[int]
@@ -396,21 +407,55 @@ class HostKVCache(abc.ABC):
         self.page_slot_tracker.commit_get_success(slot_tokens, logical_keys)
 
     @synchronized
-    def fail_page_get(
+    def commit_page_backup_success(
+        self,
+        slot_tokens: Sequence[HostSharedPageSlotToken],
+        logical_keys: Sequence[str] | None = None,
+    ) -> None:
+        self.page_slot_tracker.commit_backup_success(slot_tokens, logical_keys)
+
+    @synchronized
+    def retain_page_slots(self, slot_tokens: Sequence[HostSharedPageSlotToken]) -> None:
+        self.page_slot_tracker.retain_slots(slot_tokens)
+
+    @synchronized
+    def release_page_slot_retains(
         self, slot_tokens: Sequence[HostSharedPageSlotToken]
     ) -> None:
+        self.page_slot_tracker.release_slots(slot_tokens)
+        releasable_pages: list[torch.Tensor] = []
+        for slot_token in slot_tokens:
+            slot_index = int(slot_token.slot_index)
+            pending_token = self._pending_retire_slot_tokens.get(slot_index)
+            if pending_token is None:
+                continue
+            snapshot = self.page_slot_tracker.snapshot(slot_index)
+            if snapshot.pin_count != 0:
+                continue
+            self.page_slot_tracker.retire_slots([pending_token])
+            self._pending_retire_slot_tokens.pop(slot_index, None)
+            page_start = self.page_slot_tracker.page_start_for_slot_index(slot_index)
+            releasable_pages.append(
+                torch.arange(
+                    page_start,
+                    page_start + self.page_size,
+                    dtype=self.free_slots.dtype,
+                    device=self.free_slots.device,
+                )
+            )
+        if releasable_pages:
+            self.free_slots = torch.cat([self.free_slots, *releasable_pages])
+
+    @synchronized
+    def fail_page_get(self, slot_tokens: Sequence[HostSharedPageSlotToken]) -> None:
         self.page_slot_tracker.fail_get(slot_tokens)
 
     @synchronized
-    def begin_page_put(
-        self, slot_tokens: Sequence[HostSharedPageSlotToken]
-    ) -> None:
+    def begin_page_put(self, slot_tokens: Sequence[HostSharedPageSlotToken]) -> None:
         self.page_slot_tracker.begin_put(slot_tokens)
 
     @synchronized
-    def finish_page_put(
-        self, slot_tokens: Sequence[HostSharedPageSlotToken]
-    ) -> None:
+    def finish_page_put(self, slot_tokens: Sequence[HostSharedPageSlotToken]) -> None:
         self.page_slot_tracker.finish_put(slot_tokens)
 
     @synchronized

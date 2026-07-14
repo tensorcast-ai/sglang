@@ -376,6 +376,8 @@ class RequestBundlePublishAggregator:
             logical_request_id=request.logical_request_id,
             instance_id=aggregate_state.instance_id,
             engine_request_id=request.engine_request_id,
+            logical_session_id=aggregate_state.logical_session_id,
+            session_generation=aggregate_state.session_generation,
             full_prompt_token_count=aggregate_state.full_prompt_token_count,
             model_fingerprint=aggregate_state.model_fingerprint,
             kv_layout_id=aggregate_state.kv_layout_id,
@@ -603,6 +605,9 @@ def build_publish_manifest_record(
     engine_owned_payload = EngineOwnedManifestPayload(
         transfer_mode=request.transfer_mode,
         logical_request_id=request_state.logical_request_id,
+        source_engine_request_id=request_state.engine_request_id,
+        logical_session_id=request_state.logical_session_id,
+        session_generation=request_state.session_generation,
         cutoff_token_count=cutoff_token_count,
         frozen_last_page_index=request_state.frozen_last_page_index,
         tail_valid_tokens=tail_valid_tokens,

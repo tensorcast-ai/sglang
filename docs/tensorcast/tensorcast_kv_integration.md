@@ -56,6 +56,14 @@ Status:
     `benchmark/tensorcast_benchmark/kv/request_transfer/`.
 - Remaining request-transfer work is now:
   - remote controller-driven end-to-end validation on real instances,
+  - an explicit request-transfer mode for deployments that want Tensorcast KV
+    offload only when a controller calls `publish()` / `hydrate()`, rather than
+    through ordinary background HiCache `batch_set_v1(...)`,
+  - session-scoped prepared-prefix admission keyed by a resolved
+    `logical_session_id` for unique-rid multi-turn request streams. In SGLang,
+    the preferred source is existing `routing_key` metadata from the HTTP
+    `x-smg-routing-key` header, not a new Tensorcast-specific request-body
+    field,
   - and any follow-up hardening discovered from that validation.
 
 ---
@@ -1114,12 +1122,17 @@ payload:
   schema: sglang.request_bundle_payload.v1
   transfer_mode: prefill_closed_prompt_reuse
   logical_request_id: "req-123"
+  source_engine_request_id: "req-123"
+  logical_session_id: null
+  session_generation: null
   cutoff_token_count: 11712
   frozen_last_page_index: 365
   tail_valid_tokens: 0
   prompt_token_digest:
     alg: sha256
+    token_count: 11712
     hex: "..."
+  bundle_id: "sglang-rqb:v1:sha256(...)"
   compatibility:
     model_fingerprint: llama3_70b_fp16_ckpt42
     kv_layout_id: sglang_kv_page_v2_page_blob_direct_torch.float16_ps32_mha
@@ -1169,6 +1182,19 @@ Recommended rules:
   - `prompt_token_digest`
 - the initial SGLang v1 profile SHOULD treat `cutoff_token_count` as the full
   prompt token count for the request rather than an aligned prefix cutoff.
+- `prompt_token_digest` MUST cover the published prompt token sequence up to
+  `cutoff_token_count`; exact request-id admission compares it with the full
+  incoming prompt boundary, while session-scoped admission compares it with the
+  same-length prefix of the incoming prompt.
+- `source_engine_request_id` records the source-side live request handle used by
+  `publish(engine_request_id=...)`; it is audit/correlation metadata, not the
+  target-side lookup key for session-scoped admission.
+- `logical_session_id`, when present, is only a target-local prepared-prefix
+  lookup namespace. Prompt-prefix digest verification remains the correctness
+  condition.
+- `session_generation`, when present, gives the controller a monotonic ordering
+  hint within one `logical_session_id` so stale or out-of-order prepared records
+  can be discarded deterministically.
 - the closed byte-artifact set still remains page-granular in v1.
 - if the full prompt ends inside a partially filled page, the source SHOULD
   record the trailing prompt remainder in `tail_valid_tokens` rather than
@@ -1441,7 +1467,97 @@ flowchart LR
     E --> F["Update prefix-bundle metadata when applicable"]
 ```
 
-### 5.7 Why this should not use external plans
+### 5.7 Tensorcast-backed HiCache operating modes
+
+The same Tensorcast-backed HiCache backend should support two operating modes
+over the same shared substrate.
+
+#### Passive prefix-share mode
+
+This is the distributed prefix-cache mode described above:
+
+```yaml
+hicache_storage_backend: tensorcast
+hicache_storage_backend_extra_config:
+  tensorcast_kv_mode: passive_prefix_share
+  background_page_publish: true
+  ordinary_storage_prefetch: true
+```
+
+In this mode:
+
+- `batch_set_v1(keys, host_indices, extra_info)` publishes host-resident pages
+  into Tensorcast through the byte-artifact / `HOST_SHARED` region path,
+- successful or duplicate page publication marks the page-publication registry
+  entry `ready`,
+- `batch_get_v1(...)` may fetch Tensorcast pages for ordinary prefix-share
+  hits,
+- request-level `publish()` can reuse, retain, or wait for these background
+  publications.
+
+#### Explicit request-transfer mode
+
+Some controller-driven migration workloads do not want ordinary serving traffic
+to continuously offload every backed-up KV page into Tensorcast. They only need
+KV bytes to enter Tensorcast when a controller explicitly calls `publish()`, and
+only need target materialization when the controller explicitly calls
+`hydrate()`.
+
+For that shape, the backend should support:
+
+```yaml
+hicache_storage_backend: tensorcast
+hicache_storage_backend_extra_config:
+  tensorcast_kv_mode: explicit_request_transfer
+  background_page_publish: false
+  ordinary_storage_prefetch: false
+  record_host_residency_for_publish: true
+  logical_session_id_source: routing_key
+  logical_session_id_rid_regex: null
+```
+
+In explicit request-transfer mode:
+
+1. SGLang still enables the Tensorcast HiCache backend so the instance-agent,
+   request-bundle manager, page identity, and host-residency tracking all share
+   one integration runtime.
+2. Ordinary `batch_set_v1(keys, host_indices, extra_info)` records local
+   publishability metadata, but does not call Tensorcast `batch_put` /
+   `BatchPutIfAbsentFromRegion`.
+3. The page-publication registry remains `absent` for those pages until an
+   explicit publish actually writes or adopts an artifact. The implementation
+   MUST NOT fake `ready` status just to let publish proceed.
+4. The recorded metadata must be sufficient for later source-side force flush:
+   page hash / artifact identity inputs, rank, layout, host page index or slot,
+   host-slot generation, and enough lifetime information to reject stale
+   reused slots.
+5. Ordinary Tensorcast-backed storage prefetch is disabled unless the
+   deployment intentionally combines explicit request transfer with passive
+   prefix share.
+6. `publish(engine_request_id=...)` becomes the closure-establishing operation
+   that force-flushes absent but still host-resident prompt pages into
+   Tensorcast.
+7. `hydrate(publish_manifest=...)` remains the only operation that prepares
+   target-local reusable state from the published artifacts.
+
+The `logical_session_id_*` fields configure only the session-scoped
+prepared-prefix resolver used by request-transfer admission. The preferred
+`routing_key` source uses SGLang's existing request metadata path populated by
+the HTTP `x-smg-routing-key` header on OpenAI-compatible endpoints. It does not
+add a Tensorcast-specific JSON field to `/v1/completions` or
+`/v1/chat/completions` requests. Native `/generate` is not part of this
+non-invasive OpenAI profile unless the server explicitly maps that header into
+`GenerateReqInput.routing_key`; otherwise it can only carry `routing_key`
+through its existing request-body field.
+
+This is not a second storage backend. It is a stricter traffic policy for the
+same Tensorcast KV backend:
+
+- passive prefix-share mode: ordinary HiCache writes may publish pages early;
+- explicit request-transfer mode: ordinary HiCache writes only record source
+  residency, and request-level `publish()` performs the actual offload.
+
+### 5.8 Why this should not use external plans
 
 Using an external caller and `Plan` for synchronous prefix share would be a bad
 fit because:
@@ -1452,7 +1568,7 @@ fit because:
 - `Plan` is a control-plane abstraction, not a per-page low-latency data-plane
   primitive.
 
-### 5.8 Optional programmability for prefix bundles
+### 5.9 Optional programmability for prefix bundles
 
 Programmability can still help for prefix share, but only at a coarse
 granularity such as:
@@ -1787,6 +1903,57 @@ The integration SHOULD also support two publishable source-state shapes:
 
 If neither source-state shape remains available, `publish()` MUST fail closed.
 
+#### Explicit-mode publish closure
+
+In passive prefix-share mode, many required pages may already be `ready` because
+ordinary HiCache backup has asynchronously published them into Tensorcast.
+
+In explicit request-transfer mode, most required pages may still be `absent`
+from the Tensorcast page-publication registry even though their bytes are
+available in SGLang host memory. This is expected. The source-side publish path
+must therefore shift from "wait for background READY" to "force flush missing
+pages at publish time".
+
+Recommended implementation:
+
+1. `batch_set_v1(keys, host_indices, extra_info)` in explicit mode updates a
+   local host-residency table:
+
+   ```yaml
+   HostResidentPageRef:
+     page_hash: "..."
+     logical_page_index: 365
+     tp_rank: 0
+     pp_rank: 0
+     host_page_index: 1024
+     host_slot_generation: 17
+     kv_layout_id: sglang_kv_page_v2_page_blob_direct_torch.float16_ps32_mha
+     artifact_id: cgid:byte_artifact~...
+     valid_until_ms: 1774223060123
+   ```
+
+2. `publish()` freezes the normal full-prompt cutoff and enumerates the
+   required page shards.
+3. For each required page shard:
+   - if publication state is `ready`, reuse and retain it;
+   - if state is `inflight`, wait for or adopt that compatible publication up
+     to the publish deadline;
+   - if state is `absent`, look up the matching `HostResidentPageRef`;
+   - if the host slot generation and layout still match, call the same
+     Tensorcast byte-artifact put path that passive `batch_set_v1(...)` would
+     have used, but synchronously under the publish operation;
+   - if the host slot has been reused, evicted, or layout-mismatched, fail the
+     publish rather than reporting a partial bundle.
+4. Only after every required page shard is `ready` or adopted does the
+   coordinator commit `PublishManifest`.
+
+The force-flush path should be factored so passive `batch_set_v1(...)` and
+explicit `publish()` use the same page serialization / artifact identity /
+retention logic. The difference is scheduling:
+
+- passive mode schedules puts during ordinary HiCache backup,
+- explicit mode schedules puts only inside request-level `publish()`.
+
 ### 6.7 Request-level publish flow
 
 The recommended source-side publish flow is:
@@ -1827,7 +1994,7 @@ flowchart TD
     E --> F["Each required rank materializes missing page artifacts into host pages"]
     F --> G["Each required rank reconstructs local decode-usable state"]
     G --> H["Coordinator gathers per-rank success / failure"]
-    H -->|All required ranks succeeded| I["Install prepared local request bundle<br/>keyed by logical_request_id"]
+    H -->|All required ranks succeeded| I["Install prepared local request bundle<br/>keyed by logical_request_id or logical_session_id"]
     H -->|Any required rank failed| J["Best-effort group cleanup / mark tainted"]
     I --> K["Return group-level HydrateResult"]
     J --> L["Return hydrate failure"]
@@ -1860,32 +2027,86 @@ In other words:
 
 #### 6.8.1 Target-side ingress after hydrate
 
-The preferred target-side ingress for decode continuation is:
+The preferred target-side ingress remains ordinary SGLang serving ingress:
 
-- `hydrate(publish_manifest=...)` prepares target-local request state,
-- the controller then sends the ordinary SGLang generate/decode request through
-  the normal serving endpoint,
-- and that ordinary request carries the same logical request id in the
-  caller-visible SGLang `rid` field.
+- `hydrate(publish_manifest=...)` prepares target-local reusable state,
+- the controller then sends an ordinary `/generate` request through the normal
+  serving endpoint,
+- and ordinary admission decides whether a prepared bundle can be claimed.
 
-Recommended target-side contract:
+There are two supported admission profiles.
+
+##### Exact request-id resume
+
+This is the initial local request-transfer profile:
 
 1. successful `hydrate()` stores one prepared local request bundle keyed by the
    logical request id carried through the publish/hydrate flow,
 2. the prepared bundle is local SGLang integration state rather than a
    Tensorcast directory object,
 3. when the controller later sends the ordinary `/generate` request with the
-   same `rid`, the target coordinator first re-runs ordinary prompt
-   tokenization / normalization and verifies the incoming request against the
-   prepared-bundle envelope, including at minimum
-   `prompt_token_digest` and `cutoff_token_count`,
+   same `rid`, the target coordinator re-runs ordinary prompt tokenization /
+   normalization and verifies the incoming request against the prepared-bundle
+   envelope, including at minimum `prompt_token_digest` and
+   `cutoff_token_count`,
 4. only after that revalidation passes may the target coordinator claim the
-   prepared bundle and resume decode without re-running prefill,
+   prepared bundle and resume decode without re-running the hydrated prefix
+   prefill,
 5. if no usable prepared bundle exists for that `rid`, the normal SGLang path
-   applies and no hidden transfer recovery occurs,
-6. if a prepared-bundle record exists but is stale, tainted, or incompatible
-   with the ordinary request, admission SHOULD log a warning, ignore that
-   record for this request, and fall back to the ordinary SGLang path.
+   applies and no hidden transfer recovery occurs.
+
+##### Session-scoped prepared prefix cache
+
+This profile is for request streams where every ordinary request has a unique
+SGLang `rid`, but related requests carry the same resolver-visible stable
+session key. In SGLang v1, the preferred source is the existing internal
+`routing_key` populated from the HTTP `x-smg-routing-key` header on
+OpenAI-compatible endpoints.
+
+1. successful `hydrate()` stores one target-local prepared-prefix generation
+   under:
+
+   ```text
+   (logical_session_id, publish_manifest_digest)
+   ```
+
+   while retaining `source_engine_request_id` only for audit and cleanup
+   correlation.
+2. A later ordinary serving request arrives with its own unique `rid` and the
+   same resolver-visible session key.
+3. The target coordinator tokenizes / normalizes the incoming prompt exactly as
+   ordinary SGLang admission would.
+4. It resolves `logical_session_id` from existing request metadata. If no
+   session id is resolved, this profile is skipped.
+5. It looks up all prepared records for `logical_session_id`.
+6. It filters candidates by:
+   - compatible model/layout/topology/rank set,
+   - non-stale, non-tainted prepared state,
+   - `candidate.cutoff_token_count <= len(incoming_prompt_tokens)`,
+   - digest match between `candidate.prompt_token_digest` and
+     `incoming_prompt_tokens[:candidate.cutoff_token_count]`.
+7. It chooses the candidate with the longest reusable prefix length, normally:
+
+   ```text
+   candidate.cutoff_token_count - candidate.tail_valid_tokens
+   ```
+
+   and breaks ties by highest `session_generation`, then newest
+   `prepared_at_ms`.
+8. It atomically claims the selected prepared record and attaches it to the
+   current unique scheduler `rid`.
+9. If no candidate is usable, admission falls back to the ordinary SGLang path.
+
+The session id is only a lookup namespace. It MUST NOT replace token-prefix
+verification. This lets a controller hydrate before the future request id is
+known, while keeping per-request `rid` uniqueness for serving lifecycle,
+logging, abort, and metrics.
+
+For this non-invasive v1 profile, "ordinary request" means the
+OpenAI-compatible serving path used by `/v1/chat/completions` or
+`/v1/completions`. Native `/generate` may participate only if it is extended to
+extract `x-smg-routing-key` into the same internal `routing_key` metadata, or
+if a deployment intentionally uses the existing `/generate` body field.
 
 This keeps the external serving ingress minimally invasive:
 
@@ -1897,9 +2118,9 @@ This keeps the external serving ingress minimally invasive:
 ```mermaid
 flowchart TD
     A["Controller runs hydrate(publish_manifest=...)"] --> B["Target coordinator installs prepared bundle"]
-    B --> C["Controller sends ordinary /generate with same rid"]
-    C --> D["SGLang request admission resolves rid -> prepared bundle"]
-    D -->|found| E["Resume decode without re-running prefill"]
+    B --> C["Controller sends ordinary /generate<br/>with same rid or same session key"]
+    C --> D["SGLang admission tokenizes prompt<br/>and resolves a compatible prepared bundle"]
+    D -->|found| E["Reuse hydrated prefix without re-running that prefill"]
     D -->|not found| F["Fall back to ordinary SGLang admission semantics"]
 ```
 
@@ -1933,9 +2154,9 @@ flowchart TD
 The target SGLang instance SHOULD receive only the explicit-handle form
 `hydrate(publish_manifest=...)`.
 
-#### 6.8.3 Initial SGLang v1 profile boundaries
+#### 6.8.3 SGLang request-transfer profile boundaries
 
-The baseline SGLang request-transfer profile SHOULD stay intentionally narrow:
+The baseline exact request-id profile stays intentionally narrow:
 
 - the controller provides one explicit stable `logical_request_id`,
 - source-side `/generate` uses caller-provided `rid=logical_request_id`,
@@ -1944,20 +2165,41 @@ The baseline SGLang request-transfer profile SHOULD stay intentionally narrow:
   caller-provided `rid=logical_request_id`,
 - the target runtime is an ordinary serving instance that accepts normal
   `/generate` ingress and executes the first decode step locally.
-- the published snapshot always contains only the prompt-only KV state for that
-  `logical_request_id`, never decode-token continuation state.
-- for v1, the closed byte-artifact set is page-granular over the full prompt
-  boundary, and any non-page-aligned prompt tail is carried only through
-  `tail_valid_tokens`.
 
-This equality is a v1 integration profile, not a permanent requirement of the
-Tensorcast protocol surface.
+The session-scoped prefix-reuse profile relaxes only the admission identity:
 
-The initial profile SHOULD reject:
+- every ordinary `/generate` still has a unique caller-provided `rid`,
+- source-side `publish(engine_request_id=...)` uses the source request's unique
+  `rid`,
+- every request in the stream carries the same resolver-visible session key,
+  normally `x-smg-routing-key` / internal `routing_key`,
+- `hydrate()` installs prepared-prefix candidates under `logical_session_id`,
+- ordinary target admission chooses the longest compatible candidate by prompt
+  token-prefix verification.
+
+Both profiles share the same data boundary:
+
+- the published snapshot always contains only prompt-only KV state for the
+  source request, never decode-token continuation state,
+- for v1, the closed byte-artifact set is page-granular over the source
+  request's full prompt boundary,
+- any non-page-aligned prompt tail is carried only through
+  `tail_valid_tokens`,
+- and session-scoped reuse of a prior prompt does not imply transfer of
+  source-emitted assistant/decode tokens. A later request can reuse only the
+  prefix that was actually published and verified as a prefix of its tokenized
+  prompt.
+
+The exact equality between `logical_request_id`, source `rid`, publish
+`engine_request_id`, and target `rid` is a profile choice, not a permanent
+requirement of the Tensorcast protocol surface.
+
+The request-transfer profiles SHOULD reject:
 
 - batch request handoff,
 - parallel-sampling handoff,
-- session append/replace lineage handoff,
+- session append/replace lineage handoff that tries to resume by session id
+  without prompt-token prefix verification,
 - deployments where post-hydrate ordinary `/generate` may be routed to a
   different DP replica than the one that executed `hydrate()`,
 - target decode-only disaggregation instances that do not accept the same
@@ -1969,6 +2211,73 @@ The initial profile MAY still allow `publish()` to be invoked after source-side
 decode has already begun, or after the ordinary source request has completed,
 provided the resulting published generation is still derived only from the
 request's full prompt boundary and never from decode-token continuation.
+
+#### 6.8.4 Logical-session resolver
+
+The session-scoped profile needs a stable session namespace, but it should not
+extend SGLang's public request JSON schema. The SGLang Tensorcast integration
+SHOULD instead resolve `logical_session_id` from existing ordinary request
+metadata:
+
+```yaml
+hicache_storage_backend_extra_config:
+  tensorcast_kv_mode: explicit_request_transfer
+  logical_session_id_source: routing_key
+  logical_session_id_rid_regex: null
+```
+
+Recommended resolver behavior:
+
+1. If `logical_session_id_source` is `disabled`, return no session id.
+2. If the request has a non-empty internal `routing_key`, return it as
+   `logical_session_id`. On OpenAI-compatible endpoints, SGLang already
+   populates `routing_key` from the HTTP `x-smg-routing-key` header without
+   changing the OpenAI JSON body.
+3. If no `routing_key` exists and `logical_session_id_source` is
+   `routing_key_then_rid_regex`, apply `logical_session_id_rid_regex` to the
+   current serving `rid`.
+4. The regex fallback MUST be deployment configuration. It MUST expose a named
+   `session_id` capture and MAY expose a named `generation` capture. If
+   `generation` is absent or cannot be parsed, `session_generation` remains
+   null.
+5. If no resolver source yields a session id, session-scoped prepared-prefix
+   admission is skipped and ordinary SGLang admission proceeds.
+
+The resolver must run at two ordinary-serving boundaries:
+
+- source ordinary-request admission resolves and stores `logical_session_id` /
+  `session_generation` in `RequestBundleState`;
+- target ordinary-request admission resolves the current request's
+  `logical_session_id` and uses it only to search prepared-prefix candidates.
+
+Tensorcast `publish(engine_request_id=...)` does not receive HTTP request
+headers. It MUST copy `logical_session_id` from the source-side
+`RequestBundleState` or leave it null.
+
+Example compatibility fallback:
+
+```yaml
+hicache_storage_backend_extra_config:
+  tensorcast_kv_mode: explicit_request_transfer
+  logical_session_id_source: routing_key_then_rid_regex
+  logical_session_id_rid_regex: "^session:(?P<session_id>[^:]+):turn:(?P<generation>[0-9]+)$"
+```
+
+SGLang core MUST NOT contain a parser for a particular router's structured
+`rid` format. A router that wants the session-scoped profile should set
+`x-smg-routing-key` on source and target OpenAI-compatible ordinary requests.
+Any gateway, proxy, or controller in front of SGLang MUST forward that header
+unchanged. `rid_regex` exists only for deployments that cannot set that header
+and accept a
+configuration-owned compatibility contract. Deployments that enable
+routing-key-aware scheduling must account for the existing scheduler semantics
+of `routing_key`; the Tensorcast resolver does not make `routing_key` a new
+request identity.
+
+Native `/generate` is not the non-invasive v1 session-scoped ingress unless it
+is extended to extract `x-smg-routing-key` into `GenerateReqInput.routing_key`.
+Without that extension, `/generate` can participate only by using its existing
+request-body `routing_key` field.
 
 ### 6.9 Instance-agent and EngineAdapter role
 
@@ -2107,6 +2416,8 @@ source snapshot. This record is the authoritative local source of truth for:
   prompt boundary,
 - the fixed cutoff chosen for one publish generation,
 - the ordered page membership of that generation,
+- the resolved `logical_session_id` and optional `session_generation` captured
+  during source ordinary-request admission,
 - the publish manifest generation last committed for that request,
 - and any short retained-publish window after the ordinary source request has
   completed.
@@ -2129,6 +2440,9 @@ class PageClosureEntry(BaseModel):
     publication_state: Literal["absent", "inflight", "ready", "failed"]
     artifact_id: str | None = None
     host_resident: bool
+    host_page_index: int | None = None
+    host_slot_generation: int | None = None
+    host_residency_valid_until_ms: int | None = None
     last_error: str | None = None
 
 
@@ -2145,6 +2459,8 @@ class RankSnapshotCursor(BaseModel):
 
 class RequestBundleState(BaseModel):
     logical_request_id: str
+    logical_session_id: str | None = None
+    session_generation: int | None = None
     instance_id: str
     engine_request_id: str
     full_prompt_token_count: int
@@ -2182,6 +2498,21 @@ Interpretation notes:
   in a more compact array-oriented form because page cardinality can be high.
 - `publication_state` should be derived from or reconciled with the shared
   page publication registry; it does not replace that registry.
+- `host_page_index`, `host_slot_generation`, and
+  `host_residency_valid_until_ms` are required only when the backend supports
+  explicit request-transfer mode. They let `publish()` force-flush an `absent`
+  but still host-resident page without relying on background page publication.
+- `logical_session_id` and `session_generation` are captured at source
+  ordinary-request admission time. Tensorcast `publish(engine_request_id=...)`
+  receives only the source engine request handle and MUST NOT attempt to parse
+  HTTP headers or router-specific `rid` structure.
+- If the source request did not resolve a `logical_session_id`, publish should
+  emit `logical_session_id: null` in the engine-owned manifest payload. Target
+  hydrate can still prepare an exact-id bundle, but session-scoped
+  prepared-prefix admission is unavailable for that generation.
+- The session fields are metadata for candidate lookup and deterministic
+  ordering. They do not change prompt cutoff, page membership, or digest
+  verification.
 - `latest_token_count` and `latest_last_page_index` refer to the
   current prompt materialization / publication frontier toward
   `full_prompt_token_count` in the SGLang v1 profile. Emitted decode tokens do
@@ -2264,9 +2595,10 @@ Recommended coordinator algorithm:
 6. For each page shard in cutoff order:
    - adopt if `publication_state=ready`,
    - join/wait if `publication_state=inflight`,
-   - if `absent`, call a rank-local `force_flush_to_cutoff()` path that pushes
-     the missing host-page shard into the shared substrate while publishable
-     source bytes still exist,
+   - if `absent`, call a rank-local `force_flush_to_cutoff()` path that
+     resolves the recorded host page index / slot generation and pushes the
+     missing host-page shard into the shared substrate while publishable source
+     bytes still exist,
    - fail if `failed`, if host/L2 materialization for the cutoff cannot be
      recovered, or if the source request has already completed and no
      publishable prompt bytes remain for an absent page.
@@ -2278,6 +2610,12 @@ Recommended coordinator algorithm:
 Recommended implementation rules:
 
 - `force_flush_to_cutoff()` MUST be bounded by the chosen cutoff.
+- `force_flush_to_cutoff()` MUST validate host-slot generation before reading
+  source bytes. If the slot has been recycled for a different page, publish
+  fails closed.
+- Explicit request-transfer mode MUST call this force-flush path for required
+  absent pages rather than waiting forever for background `batch_set_v1(...)`
+  to mark them `ready`.
 - A page for token frontier `N+1` MUST NOT be pulled into the current publish
   generation if the frozen cutoff is `N`.
 - In the SGLang v1 profile, "token frontier" here always means the
@@ -2321,10 +2659,16 @@ class RankInstallRecord(BaseModel):
 
 class PreparedBundleRecord(BaseModel):
     logical_request_id: str
+    source_engine_request_id: str
+    logical_session_id: str | None = None
+    session_generation: int | None = None
     target_instance_id: str
     publish_manifest_digest: str
     artifact_manifest_digest: str
     engine_owned_manifest_sha256: str
+    cutoff_token_count: int
+    tail_valid_tokens: int
+    prompt_token_digest: str
     prepared_hold_set_id: str | None = None
     state: Literal[
         "preparing",
@@ -2352,6 +2696,16 @@ Interpretation notes:
   directory object and not a distributed registry entry.
 - `publish_manifest_digest` is the primary generation key. The same
   `logical_request_id` may see more than one generation over time.
+- In the session-scoped profile, `logical_request_id` records the source
+  request / transfer audit identity carried by the manifest. It is not the
+  future target serving `rid` and MUST NOT be used as the target admission key.
+- `source_engine_request_id` records the source request used for publish. In
+  the session-scoped profile it is not the target admission key.
+- `logical_session_id` is optional. When present, it provides the target-local
+  secondary index for session-scoped prepared-prefix admission.
+- `cutoff_token_count`, `tail_valid_tokens`, and `prompt_token_digest` are the
+  minimum fields needed for target admission to verify exact prompt equality or
+  session-scoped prompt-prefix compatibility.
 - `claim_token` is an admission-time compare-and-swap token used to prevent two
   concurrent `/generate(rid)` requests from consuming the same prepared bundle.
 - if host-shared slots back the hydrated pages, `prepared_hold_set_id` points
@@ -2361,10 +2715,15 @@ Interpretation notes:
   flow and SHOULD NOT be consulted by ordinary radix-prefix match,
   `ongoing_prefetch`, or phase 2-2.5 page-substrate hot paths.
 
-Recommended table key:
+Recommended table keys:
 
-- primary key: `(logical_request_id, publish_manifest_digest)`
-- secondary admission index: `logical_request_id -> latest prepared generation`
+- exact request-id primary key: `(logical_request_id, publish_manifest_digest)`
+- exact request-id admission index:
+  `logical_request_id -> prepared generations`
+- session-scoped primary key:
+  `(logical_session_id, publish_manifest_digest)`
+- session-scoped admission index:
+  `logical_session_id -> prepared generations`
 
 #### 7.2.5 Target-side `PreparedBundleRecord` state machine
 
@@ -2396,52 +2755,89 @@ Recommended semantics:
 
 #### 7.2.6 Target-side admission binding algorithm
 
-Recommended coordinator algorithm for ordinary `/generate(rid)` after hydrate:
+Ordinary `/generate` admission should preserve the normal SGLang request
+lifecycle. The current request's scheduler `rid` remains unique even when it
+uses a hydrated prepared prefix.
 
-1. Request admission receives caller-provided `rid=logical_request_id`.
-2. Coordinator checks for an existing live request with the same logical id.
-3. Coordinator checks the prepared-bundle table for that logical id.
-4. If no prepared bundle exists:
-   - follow the normal SGLang path.
-5. If exactly one `PreparedBundleRecord(state="prepared")` exists:
-   - run the same incoming prompt tokenization / normalization that ordinary
-     SGLang admission would otherwise use,
-   - verify the resulting prompt against the prepared-bundle envelope,
-     including at minimum `prompt_token_digest` and `cutoff_token_count`,
-   - if this revalidation fails:
-     - log a warning,
-     - do not claim the prepared bundle,
-     - follow the normal SGLang path,
-   - otherwise:
-     - atomically transition it to `claimed`,
-     - mint `claim_token`,
-     - construct the live request from the prepared bundle,
-     - transition to `attached` and then `consumed`.
-6. If only stale, tainted, failed, evicted, or compatibility-mismatched
-   prepared records exist for that logical id:
-   - log a warning,
-   - ignore those records for this admission,
-   - and follow the normal SGLang path.
-7. If a clean prepared bundle is already in `claimed` or `attached`, or if
-   multiple clean prepared generations exist:
-   - fail closed rather than guessing or stealing ownership.
+Recommended shared prelude:
+
+1. Request admission receives the caller-provided current `rid`.
+2. Admission runs the logical-session resolver over existing request metadata:
+   - prefer internal `routing_key`, populated from HTTP `x-smg-routing-key`,
+   - optionally use configured `logical_session_id_rid_regex` as a fallback,
+   - return optional `logical_session_id` and optional `session_generation`.
+3. Coordinator rejects or falls back if another live request already owns the
+   current `rid`.
+4. Admission runs the same prompt tokenization / normalization that ordinary
+   SGLang would otherwise use.
+
+Exact request-id profile:
+
+1. Treat the current `rid` as `logical_request_id`.
+2. Look up prepared records by `logical_request_id`.
+3. If no record exists, follow the normal SGLang path.
+4. If exactly one clean `PreparedBundleRecord(state="prepared")` exists:
+   - require model/layout/topology compatibility,
+   - require incoming prompt compatibility with `cutoff_token_count` and
+     `prompt_token_digest`,
+   - atomically transition the record to `claimed`,
+   - mint `claim_token`,
+   - construct the live request from the prepared bundle under the current
+     `rid`,
+   - transition to `attached` and then `consumed`.
+5. If multiple clean exact-id records exist for the same logical request id,
+   fail closed rather than guessing.
+6. If only stale, tainted, failed, evicted, or incompatible records exist, log a
+   warning, ignore those records, and follow the normal SGLang path.
+
+Session-scoped prefix-reuse profile:
+
+1. If the resolver returned no `logical_session_id`, this profile is skipped.
+2. Look up prepared records by `logical_session_id`.
+3. Filter records to candidates where:
+   - `state="prepared"`,
+   - model/layout/topology/rank compatibility matches the current engine,
+   - the record is not stale, tainted, failed, evicted, claimed, or attached,
+   - `record.cutoff_token_count <= len(incoming_prompt_tokens)`,
+   - digest of `incoming_prompt_tokens[:record.cutoff_token_count]` equals
+     `record.prompt_token_digest`.
+4. Choose the candidate with the longest reusable prefix:
+
+   ```text
+   reusable_prefix_tokens = record.cutoff_token_count - record.tail_valid_tokens
+   ```
+
+5. Break ties deterministically:
+   - highest non-null `session_generation`,
+   - then newest `prepared_at_ms`,
+   - then lexical `publish_manifest_digest`.
+6. Atomically claim the selected record and attach it to the current unique
+   scheduler `rid` by setting `active_scheduler_rid=rid`.
+7. If no candidate remains after filtering, log at debug/info level and follow
+   the normal SGLang path.
 
 Recommended conflict rules:
 
-- If a live request already exists for `logical_request_id`, `hydrate()` SHOULD
-  reject installing a new prepared bundle for that id.
-- If a prepared bundle already exists with a different
-  `publish_manifest_digest`, a second hydrate SHOULD fail closed unless the
-  existing record has already been cleaned.
+- If a live request already exists for the current serving `rid`, admission
+  should reject the new ordinary request according to normal SGLang semantics.
+- If a live request already exists for the same `logical_session_id`,
+  session-scoped admission SHOULD avoid claiming a prepared record for another
+  request in that session unless the controller explicitly declares concurrent
+  branches supported. The baseline assumes per-session turns are serialized.
 - Repeated hydrate with the same `publish_manifest_digest` MAY be treated as an
   idempotent retry.
 - Prepared-bundle consumption SHOULD be one-shot. Reusing the same prepared
   bundle for multiple decode admissions should not be the default v1 behavior.
 - Incoming-request prompt revalidation failure SHOULD behave like a non-usable
-  prepared record for admission: warning + fall back to the normal SGLang path.
+  prepared record for admission: warning or debug log plus fall back to the
+  normal SGLang path.
 - Stale, tainted, failed, evicted, or compatibility-mismatched records SHOULD
   be cleaned best-effort and MUST NOT force ordinary `/generate` to fail when
   the normal prefill/prefix-reuse path remains available.
+
+This design deliberately avoids a consumer-rid alias. A hydrated prefix can be
+prepared before the future request id is known, and admission binds it to the
+actual current `rid` only after token-prefix compatibility is proven.
 
 ### 7.3 Bundle state models
 
@@ -2533,28 +2929,32 @@ request-level control plane:
 - runtime-bound `Plan`,
 - worker `prefetch_set` / `prefetch_manifest_result`,
 - instance `publish(engine_request_id=...)`,
+- `PublishResult.publish_manifest`,
+- opaque `EngineOwnedManifest` carriage in the instance-step result path,
+- canonical `hydrate(publish_manifest=...)`,
 - legacy `hydrate(engine_request_id=...)`,
 - `evict_local(engine_request_id=...)`,
 - `ManifestResult` and `ManifestArtifactSetBridge`.
 
-These are necessary building blocks, but not yet the complete target
-request-transfer surface.
+These are the necessary public request-transfer building blocks for the current
+explicit-handle protocol surface.
 
 ### 8.2 What Tensorcast does not yet directly provide
 
-Current Tensorcast does not yet directly provide all the primitives needed for
-the final explicit-handle request-transfer surface.
+Current Tensorcast / SGLang integration still needs runtime work for the
+explicit request-transfer and session-scoped prepared-prefix extensions
+described in this document.
 
 The main gaps are:
 
 - a stable public page-store-style batch API tailored for high-cardinality KV
   page IO, rather than today’s lower-level byte-artifact batch-region surfaces,
 - explicit public prefix-bundle programmability,
-- `PublishResult.publish_manifest`,
-- opaque `EngineOwnedManifest` carriage in the instance-step result path,
-- `hydrate(publish_manifest=...)`,
-- and a public hydrate-by-manifest or hydrate-by-artifact-set instance-step
-  surface.
+- explicit request-transfer mode in which ordinary `batch_set_v1(...)` records
+  host residency without background Tensorcast puts,
+- source-side publish force-flush from validated host slots for absent pages,
+- session-scoped prepared-prefix indexing by `logical_session_id`,
+- and longest-prefix-compatible target admission for unique-rid request streams.
 
 ### 8.3 Design consequence
 
@@ -2562,8 +2962,10 @@ Because of these gaps, the recommended implementation strategy is:
 
 - keep the already-implemented prefix-share path as an internal SGLang
   integration over Tensorcast byte-artifact and region-backed primitives,
-- while extending Tensorcast programmability for request transfer with as
-  little Tensorcast-core change as possible.
+- keep using the current explicit-handle Tensorcast request-transfer surface,
+- and implement the remaining explicit-mode / session-admission behavior inside
+  the SGLang Tensorcast integration with as little Tensorcast-core change as
+  possible.
 
 ---
 
@@ -2631,6 +3033,18 @@ Implement:
 
 - remote controller-driven validation from source publish to target ordinary
   `/generate(rid)` decode resume on real instances,
+- explicit request-transfer mode:
+  - `batch_set_v1(...)` records host residency but does not perform background
+    Tensorcast puts,
+  - `publish()` force-flushes required absent pages from validated host slots,
+  - page-publication registry `ready` means actually published/adopted, never
+    "pretend ready",
+- session-scoped prepared-prefix admission:
+  - request metadata carries a resolver-visible stable session key, preferably
+    SGLang's existing `routing_key` from the HTTP `x-smg-routing-key` header,
+  - hydrate indexes prepared records by session id and manifest generation,
+  - ordinary `/generate` keeps a unique current `rid`,
+  - admission selects the longest prompt-prefix-compatible prepared record,
 - and any small runtime hardening discovered while doing that validation.
 
 Already validated locally in-repo:
@@ -2698,10 +3112,14 @@ The recommended Tensorcast + SGLang KV integration is:
 - **upper interface A: prefix share**
   - internal SGLang hot path,
   - Mooncake-like batch exists/get/set,
-  - no per-request external programmability.
+  - no per-request external programmability,
+  - optional explicit request-transfer mode where ordinary HiCache writes record
+    host residency but do not publish until `publish()`.
 - **upper interface B: request transfer**
   - external caller-driven Tensorcast programmability,
   - coordinator-backed logical-instance `publish` / `hydrate` / `evict_local`,
-  - optional worker warmup via `prefetch_manifest_result(...)`.
+  - optional worker warmup via `prefetch_manifest_result(...)`,
+  - exact request-id resume or session-scoped prepared-prefix admission with
+    unique serving `rid` values.
 
 This is the intended design baseline for the implementation work that follows.

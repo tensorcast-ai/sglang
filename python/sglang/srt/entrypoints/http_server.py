@@ -211,9 +211,9 @@ async def init_multi_tokenizer() -> ServerArgs:
     port_args: PortArgs
 
     # API key authentication is not supported in multi-tokenizer mode
-    assert (
-        server_args.api_key is None
-    ), "API key is not supported in multi-tokenizer mode"
+    assert server_args.api_key is None, (
+        "API key is not supported in multi-tokenizer mode"
+    )
 
     # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
@@ -589,9 +589,9 @@ async def get_server_info():
 async def server_info():
     """Get the server information."""
     # Returns internal states per DP.
-    internal_states: List[Dict[Any, Any]] = (
-        await _global_state.tokenizer_manager.get_internal_state()
-    )
+    internal_states: List[
+        Dict[Any, Any]
+    ] = await _global_state.tokenizer_manager.get_internal_state()
 
     # This field is not serializable.
     if hasattr(_global_state.tokenizer_manager.server_args, "model_config"):
@@ -635,15 +635,19 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 async for out in _global_state.tokenizer_manager.generate_request(
                     obj, request
                 ):
-                    yield b"data: " + orjson.dumps(
-                        out, option=orjson.OPT_NON_STR_KEYS
-                    ) + b"\n\n"
+                    yield (
+                        b"data: "
+                        + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS)
+                        + b"\n\n"
+                    )
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
                 logger.error(f"[http_server] Error: {e}")
-                yield b"data: " + orjson.dumps(
-                    out, option=orjson.OPT_NON_STR_KEYS
-                ) + b"\n\n"
+                yield (
+                    b"data: "
+                    + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS)
+                    + b"\n\n"
+                )
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(
@@ -795,9 +799,11 @@ async def dump_expert_distribution_record_async():
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
     """Update the weights from disk inplace without re-launching the server."""
-    success, message, num_paused_requests = (
-        await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
-    )
+    (
+        success,
+        message,
+        num_paused_requests,
+    ) = await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
 
     content = {
         "success": success,
@@ -822,8 +828,12 @@ async def update_weights_from_tensorcast(
     obj: UpdateWeightsFromTensorcastReqInput, request: Request
 ):
     """Update the weights from Tensorcast by immutable key/version (pull-by-key)."""
-    success, message, status_code = (
-        await _global_state.tokenizer_manager.update_weights_from_tensorcast(obj, request)
+    (
+        success,
+        message,
+        status_code,
+    ) = await _global_state.tokenizer_manager.update_weights_from_tensorcast(
+        obj, request
     )
 
     content = {"success": success, "message": message}
@@ -835,10 +845,11 @@ async def update_weights_from_tensorcast(
 async def init_weights_send_group_for_remote_instance(
     obj: InitWeightsSendGroupForRemoteInstanceReqInput, request: Request
 ):
-    success, message = (
-        await _global_state.tokenizer_manager.init_weights_send_group_for_remote_instance(
-            obj, request
-        )
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.init_weights_send_group_for_remote_instance(
+        obj, request
     )
     content = {"success": success, "message": message}
     if success:
@@ -852,10 +863,11 @@ async def init_weights_send_group_for_remote_instance(
 async def send_weights_to_remote_instance(
     obj: SendWeightsToRemoteInstanceReqInput, request: Request
 ):
-    success, message = (
-        await _global_state.tokenizer_manager.send_weights_to_remote_instance(
-            obj, request
-        )
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.send_weights_to_remote_instance(
+        obj, request
     )
     content = {"success": success, "message": message}
     if success:
@@ -911,9 +923,10 @@ async def destroy_weights_update_group(
     obj: DestroyWeightsUpdateGroupReqInput, request: Request
 ):
     """Destroy the parameter update group."""
-    success, message = (
-        await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
-    )
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
     content = {"success": success, "message": message}
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
@@ -948,10 +961,11 @@ async def update_weights_from_distributed(
     obj: UpdateWeightsFromDistributedReqInput, request: Request
 ):
     """Update model parameter from distributed online."""
-    success, message = (
-        await _global_state.tokenizer_manager.update_weights_from_distributed(
-            obj, request
-        )
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.update_weights_from_distributed(
+        obj, request
     )
 
     content = {"success": success, "message": message}
@@ -1818,7 +1832,8 @@ def launch_server(
     try:
         if instance_agent_config is not None:
             tensorcast_instance_agent_service = TensorcastInstanceAgentServiceHandle(
-                instance_agent_config
+                instance_agent_config,
+                start_timeout_s=instance_agent_config.start_timeout_s,
             )
             tensorcast_instance_agent_service.start()
 

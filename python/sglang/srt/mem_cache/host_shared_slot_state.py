@@ -111,7 +111,9 @@ class HostSharedPageSlotTracker:
                 self._logical_keys[slot_index] = logical_keys[offset]
             else:
                 self._logical_keys[slot_index] = None
-        return tuple(self.current_token(slot_index) for slot_index in normalized_indices)
+        return tuple(
+            self.current_token(slot_index) for slot_index in normalized_indices
+        )
 
     def mark_get_inflight(self, slot_tokens: Sequence[HostSharedPageSlotToken]) -> None:
         normalized_indices = self._resolve_slot_tokens(slot_tokens)
@@ -157,6 +159,48 @@ class HostSharedPageSlotTracker:
         for slot_index in normalized_indices:
             self._states[slot_index] = HostSharedPageSlotState.SLOT_INVALID
             self._pin_counts[slot_index] = max(0, self._pin_counts[slot_index] - 1)
+
+    def commit_backup_success(
+        self,
+        slot_tokens: Sequence[HostSharedPageSlotToken],
+        logical_keys: Sequence[str] | None = None,
+    ) -> None:
+        normalized_indices = self._resolve_slot_tokens(slot_tokens)
+        self._validate_optional_logical_keys(normalized_indices, logical_keys)
+        self._ensure_states(
+            normalized_indices,
+            allowed_states={HostSharedPageSlotState.SLOT_FREE},
+            operation="commit_backup_success",
+        )
+        for offset, slot_index in enumerate(normalized_indices):
+            self._states[slot_index] = HostSharedPageSlotState.SLOT_RESIDENT
+            self._pin_counts[slot_index] = 0
+            if logical_keys is not None:
+                self._logical_keys[slot_index] = logical_keys[offset]
+
+    def retain_slots(self, slot_tokens: Sequence[HostSharedPageSlotToken]) -> None:
+        normalized_indices = self._resolve_slot_tokens(slot_tokens)
+        self._ensure_states(
+            normalized_indices,
+            allowed_states={HostSharedPageSlotState.SLOT_RESIDENT},
+            operation="retain_slots",
+        )
+        for slot_index in normalized_indices:
+            self._pin_counts[slot_index] += 1
+
+    def release_slots(self, slot_tokens: Sequence[HostSharedPageSlotToken]) -> None:
+        normalized_indices = self._resolve_slot_tokens(slot_tokens)
+        self._ensure_states(
+            normalized_indices,
+            allowed_states={HostSharedPageSlotState.SLOT_RESIDENT},
+            operation="release_slots",
+        )
+        for slot_index in normalized_indices:
+            if self._pin_counts[slot_index] <= 0:
+                raise HostSharedPageSlotStateError(
+                    f"slot {slot_index} cannot release without an active retain"
+                )
+            self._pin_counts[slot_index] -= 1
 
     def begin_put(self, slot_tokens: Sequence[HostSharedPageSlotToken]) -> None:
         normalized_indices = self._resolve_slot_tokens(slot_tokens)
@@ -234,7 +278,9 @@ class HostSharedPageSlotTracker:
             self._generations[slot_index] += 1
             self._pin_counts[slot_index] = 0
             self._logical_keys[slot_index] = None
-        return tuple(self.current_token(slot_index) for slot_index in normalized_indices)
+        return tuple(
+            self.current_token(slot_index) for slot_index in normalized_indices
+        )
 
     def retire_slots(
         self, slot_tokens: Sequence[HostSharedPageSlotToken]
@@ -258,7 +304,9 @@ class HostSharedPageSlotTracker:
         normalized_indices = self._normalize_slot_indices(
             [slot_token.slot_index for slot_token in slot_tokens]
         )
-        token_by_slot = {slot_token.slot_index: slot_token for slot_token in slot_tokens}
+        token_by_slot = {
+            slot_token.slot_index: slot_token for slot_token in slot_tokens
+        }
         for slot_index in normalized_indices:
             slot_token = token_by_slot[slot_index]
             current_generation = self._generations[slot_index]

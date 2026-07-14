@@ -96,6 +96,7 @@ class TensorcastInstanceAgentConfig:
     engine: str
     execution_endpoint: str
     instance_ops_ipc_name: str
+    start_timeout_s: float = 30.0
 
 
 def _json_dumps_bytes(payload: dict[str, object]) -> bytes:
@@ -275,8 +276,7 @@ class TensorcastInstanceOpsSchedulerRpcClient:
         )
         if not isinstance(response, PublishInstanceOpRespOutput):
             raise RuntimeError(
-                "unexpected scheduler publish response type: "
-                f"{type(response).__name__}"
+                f"unexpected scheduler publish response type: {type(response).__name__}"
             )
         if response.status != InstanceOpStatus.SUCCESS:
             raise RuntimeError(
@@ -299,8 +299,7 @@ class TensorcastInstanceOpsSchedulerRpcClient:
         )
         if not isinstance(response, HydrateInstanceOpRespOutput):
             raise RuntimeError(
-                "unexpected scheduler hydrate response type: "
-                f"{type(response).__name__}"
+                f"unexpected scheduler hydrate response type: {type(response).__name__}"
             )
         if response.status != InstanceOpStatus.SUCCESS:
             raise RuntimeError(
@@ -314,9 +313,7 @@ class TensorcastInstanceOpsSchedulerRpcClient:
         *,
         request: EvictLocalInstanceOpRequest,
     ) -> EvictLocalInstanceOpResult:
-        response = self._call(
-            EvictLocalInstanceOpReqInput(request=request)
-        )
+        response = self._call(EvictLocalInstanceOpReqInput(request=request))
         if not isinstance(response, EvictLocalInstanceOpRespOutput):
             raise RuntimeError(
                 "unexpected scheduler evict_local response type: "
@@ -612,12 +609,14 @@ def maybe_build_tensorcast_instance_agent_config(
         return None
     instance_id = f"{server_args.host}:{server_args.port}"
     engine = str(payload.get("engine", "sglang")).strip() or "sglang"
+    start_timeout_s = float(payload.get("instance_agent_start_timeout_s", 30.0))
     return TensorcastInstanceAgentConfig(
         daemon_address=daemon_address,
         instance_id=instance_id,
         engine=engine,
         execution_endpoint=execution_endpoint,
         instance_ops_ipc_name=str(instance_ops_ipc_name),
+        start_timeout_s=start_timeout_s,
     )
 
 

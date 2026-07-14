@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 
 import grpc
 
@@ -42,6 +43,7 @@ from sglang.srt.tensorcast.instance_ops.instance_agent import (
     TensorcastInstanceAgentConfig,
     TensorcastInstanceOpsSchedulerRpcClient,
     instance_publish_manifest_record_to_wire_manifest,
+    maybe_build_tensorcast_instance_agent_config,
     wire_manifest_to_instance_publish_manifest_record,
 )
 from sglang.srt.tensorcast.instance_ops.instance_agent_service import (
@@ -51,6 +53,15 @@ from sglang.srt.tensorcast.instance_ops.instance_agent_service import (
 from tensorcast.proto.node_agent.v1 import node_agent_pb2, node_agent_pb2_grpc
 from tensorcast.proto.plan.v1 import plan_pb2
 from tensorcast.api.context import CallContext
+
+
+@dataclass(frozen=True, slots=True)
+class _FakeServerArgsForInstanceAgentConfig:
+    node_rank: int
+    hicache_storage_backend: str
+    hicache_storage_backend_extra_config: str
+    host: str
+    port: int
 
 
 def _rank() -> RankCoord:
@@ -429,6 +440,31 @@ def test_instance_agent_serves_execute_plan_over_grpc() -> None:
         "publish-manifest-digest"
     )
     assert rpc_client.evict_calls[0]["request"].logical_request_id == "rid-1"
+
+
+def test_maybe_build_instance_agent_config_reads_start_timeout() -> None:
+    server_args = _FakeServerArgsForInstanceAgentConfig(
+        node_rank=0,
+        hicache_storage_backend="tensorcast",
+        hicache_storage_backend_extra_config=json.dumps(
+            {
+                "daemon_address": "127.0.0.1:50052",
+                "engine": "sglang",
+                "instance_agent_execution_endpoint": "127.0.0.1:34110",
+                "instance_agent_start_timeout_s": 180,
+            }
+        ),
+        host="127.0.0.1",
+        port=30000,
+    )
+
+    config = maybe_build_tensorcast_instance_agent_config(
+        server_args=server_args,
+        instance_ops_ipc_name="ipc://tensorcast-instance-ops",
+    )
+
+    assert config is not None
+    assert config.start_timeout_s == 180.0
 
 
 class _FakeRecvConnection:

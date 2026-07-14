@@ -5,10 +5,11 @@ from __future__ import annotations
 
 from enum import Enum
 
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
 class StrEnum(str, Enum):
     pass
-
-from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class _FrozenModel(BaseModel):
@@ -124,6 +125,8 @@ class RequestBundleState(_FrozenModel):
     logical_request_id: str = Field(min_length=1)
     instance_id: str = Field(min_length=1)
     engine_request_id: str = Field(min_length=1)
+    logical_session_id: str | None = None
+    session_generation: int | None = Field(default=None, ge=0)
     full_prompt_token_count: int = Field(ge=0)
     model_fingerprint: str = Field(min_length=1)
     kv_layout_id: str = Field(min_length=1)
@@ -198,6 +201,9 @@ class PreparedHoldSetRecord(_FrozenModel):
 
 class PreparedBundleRecord(_FrozenModel):
     logical_request_id: str = Field(min_length=1)
+    source_engine_request_id: str | None = None
+    logical_session_id: str | None = None
+    session_generation: int | None = Field(default=None, ge=0)
     target_instance_id: str = Field(min_length=1)
     publish_manifest_digest: str = Field(min_length=1)
     artifact_manifest_digest: str = Field(min_length=1)
@@ -245,7 +251,10 @@ class PreparedBundleBindAction(StrEnum):
 class OrdinaryGenerateBindingRequest(_FrozenModel):
     logical_request_id: str = Field(min_length=1)
     scheduler_rid: str = Field(min_length=1)
+    logical_session_id: str | None = None
+    session_generation: int | None = Field(default=None, ge=0)
     prompt_token_digest: str = Field(min_length=1)
+    prompt_token_ids: tuple[int, ...] = ()
     cutoff_token_count: int = Field(ge=0)
     requested_at_ms: int = Field(ge=0)
 
@@ -327,6 +336,9 @@ class EngineOwnedManifestPayload(_FrozenModel):
     )
     transfer_mode: str = Field(min_length=1)
     logical_request_id: str = Field(min_length=1)
+    source_engine_request_id: str | None = None
+    logical_session_id: str | None = None
+    session_generation: int | None = Field(default=None, ge=0)
     cutoff_token_count: int = Field(ge=0)
     frozen_last_page_index: int | None = Field(default=None, ge=-1)
     tail_valid_tokens: int = Field(default=0, ge=0)

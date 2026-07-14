@@ -46,11 +46,15 @@ class FakeTensorcastPageClient:
         self.last_get_slot_tokens: list[HostSharedPageSlotToken] | None = None
         self.last_put_source_region_binding: TensorcastHostRegionBinding | None = None
         self.last_get_target_region_binding: TensorcastHostRegionBinding | None = None
+        self.activated_stable_local_backing: tuple[str, int] | None = None
         self.batch_put_callback: Callable[[list[str]], None] | None = None
         self.batch_put_fail_keys: set[str] = set()
 
     def artifact_id_for(self, logical_key: str) -> str:
         return f"artifact::{logical_key}"
+
+    def activate_stable_local_backing(self, region_id: str, *, slot_bytes: int) -> None:
+        self.activated_stable_local_backing = (str(region_id), int(slot_bytes))
 
     def batch_exists(self, logical_keys: list[str]) -> TensorcastBatchExistsResult:
         return TensorcastBatchExistsResult(
@@ -134,12 +138,26 @@ class FakeHostKVCache:
         self.page_size = page_size
         self.layout = layout
         self.dtype = torch.float32
+        self.size_per_token = torch.tensor([], dtype=self.dtype).element_size()
         self.kv_buffer = torch.tensor(values, dtype=self.dtype).reshape(-1, page_size)
         self._host_region_binding = host_region_binding
         self._slot_generations: dict[int, int] = {
             page_start: (page_start // self.page_size) + 100
             for page_start in range(0, self.kv_buffer.numel(), self.page_size)
         }
+        self._slot_states: dict[int, str] = {
+            page_start: "slot_free"
+            for page_start in range(0, self.kv_buffer.numel(), self.page_size)
+        }
+        self._slot_pin_counts: dict[int, int] = {
+            page_start: 0
+            for page_start in range(0, self.kv_buffer.numel(), self.page_size)
+        }
+        self._slot_logical_keys: dict[int, str | None] = {
+            page_start: None
+            for page_start in range(0, self.kv_buffer.numel(), self.page_size)
+        }
+        self._pending_free_page_starts: set[int] = set()
         self._free_page_starts: list[int] = list(
             range(0, self.kv_buffer.numel(), self.page_size)
         )
@@ -181,9 +199,14 @@ class FakeHostKVCache:
         )
         self.free_calls.append(page_starts)
         for page_start in page_starts:
+            if self._slot_pin_counts[page_start] > 0:
+                self._pending_free_page_starts.add(page_start)
+                continue
             if page_start not in self._free_page_starts:
                 self._free_page_starts.append(page_start)
             self._slot_generations[page_start] += 1
+            self._slot_states[page_start] = "slot_free"
+            self._slot_logical_keys[page_start] = None
         self._free_page_starts.sort()
         return int(indices.numel())
 
@@ -208,6 +231,16 @@ class FakeHostKVCache:
             for page_start in page_starts
         )
 
+    def describe_page_slot(self, page_start: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            slot_index=page_start // self.page_size,
+            slot_generation=self._slot_generations[page_start],
+            page_start=page_start,
+            state=SimpleNamespace(value=self._slot_states[page_start]),
+            pin_count=self._slot_pin_counts[page_start],
+            logical_key=self._slot_logical_keys[page_start],
+        )
+
     def reserve_page_slots(
         self,
         page_starts: list[int],
@@ -219,12 +252,20 @@ class FakeHostKVCache:
                 list(logical_keys) if logical_keys is not None else None,
             )
         )
+        for offset, page_start in enumerate(page_starts):
+            self._slot_states[page_start] = "slot_reserved"
+            self._slot_pin_counts[page_start] = 1
+            if logical_keys is not None:
+                self._slot_logical_keys[page_start] = logical_keys[offset]
         return self.slot_tokens_for_page_starts(page_starts)
 
     def mark_page_get_inflight(
         self, slot_tokens: list[HostSharedPageSlotToken]
     ) -> None:
         self.mark_get_inflight_calls.append(list(slot_tokens))
+        for slot_token in slot_tokens:
+            page_start = slot_token.slot_index * self.page_size
+            self._slot_states[page_start] = "get_in_flight"
 
     def commit_page_get_success(
         self,
@@ -237,9 +278,60 @@ class FakeHostKVCache:
                 list(logical_keys) if logical_keys is not None else None,
             )
         )
+        for offset, slot_token in enumerate(slot_tokens):
+            page_start = slot_token.slot_index * self.page_size
+            self._slot_states[page_start] = "slot_resident"
+            self._slot_pin_counts[page_start] = max(
+                0, self._slot_pin_counts[page_start] - 1
+            )
+            if logical_keys is not None:
+                self._slot_logical_keys[page_start] = logical_keys[offset]
 
     def fail_page_get(self, slot_tokens: list[HostSharedPageSlotToken]) -> None:
         self.fail_get_calls.append(list(slot_tokens))
+        for slot_token in slot_tokens:
+            page_start = slot_token.slot_index * self.page_size
+            self._slot_states[page_start] = "slot_invalid"
+            self._slot_pin_counts[page_start] = max(
+                0, self._slot_pin_counts[page_start] - 1
+            )
+
+    def commit_page_backup_success(
+        self,
+        slot_tokens: list[HostSharedPageSlotToken],
+        logical_keys: list[str] | None = None,
+    ) -> None:
+        for offset, slot_token in enumerate(slot_tokens):
+            page_start = slot_token.slot_index * self.page_size
+            self._slot_states[page_start] = "slot_resident"
+            self._slot_pin_counts[page_start] = 0
+            if logical_keys is not None:
+                self._slot_logical_keys[page_start] = logical_keys[offset]
+
+    def retain_page_slots(self, slot_tokens: list[HostSharedPageSlotToken]) -> None:
+        for slot_token in slot_tokens:
+            page_start = slot_token.slot_index * self.page_size
+            self._slot_pin_counts[page_start] += 1
+
+    def release_page_slot_retains(
+        self, slot_tokens: list[HostSharedPageSlotToken]
+    ) -> None:
+        for slot_token in slot_tokens:
+            page_start = slot_token.slot_index * self.page_size
+            self._slot_pin_counts[page_start] = max(
+                0, self._slot_pin_counts[page_start] - 1
+            )
+            if (
+                self._slot_pin_counts[page_start] == 0
+                and page_start in self._pending_free_page_starts
+            ):
+                self._pending_free_page_starts.remove(page_start)
+                if page_start not in self._free_page_starts:
+                    self._free_page_starts.append(page_start)
+                self._slot_generations[page_start] += 1
+                self._slot_states[page_start] = "slot_free"
+                self._slot_logical_keys[page_start] = None
+                self._free_page_starts.sort()
 
 
 class StaleCommitHostKVCache(FakeHostKVCache):
