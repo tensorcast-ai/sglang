@@ -33,7 +33,13 @@ class SessionState:
     # Tensorcast-specific. Stored as opaque object so this module doesn't
     # need to import the Tensorcast SDK; tc_router populates it.
     last_published_manifest: Any | None = None
-    pending_migration: bool = False
+    pending_migration: MigrationFuture | None = None
+    migration_attempt_count: int = 0
+    last_migration_id: str = ""
+    last_migration_source_instance: InstanceId = ""
+    last_migration_target_instance: InstanceId = ""
+    pending_consumed_migration_id: str = ""
+    last_migration_completed_monotonic: float = 0.0
 
 
 @dataclass(frozen=True)

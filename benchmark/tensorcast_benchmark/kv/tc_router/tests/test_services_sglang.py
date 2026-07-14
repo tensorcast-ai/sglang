@@ -199,6 +199,46 @@ def test_storage_backend_tensorcast_emits_correct_flag() -> None:
     assert "--hicache-storage-backend tensorcast" in cmd
 
 
+def test_storage_backend_tensorcast_allocator_explicit_mode() -> None:
+    extra_config = {
+        "daemon_address": "127.0.0.1:61053",
+        "namespace": "unit",
+        "engine": "sglang",
+        "model_id": "Qwen3-32B",
+        "model_version": "abc123",
+        "policy_profile": "durable",
+        "instance_directory_address": "10.0.0.1:61050",
+        "instance_agent_execution_endpoint": "10.0.0.1:61400",
+        "tensorcast_kv_mode": "explicit_request_transfer",
+        "background_page_publish": False,
+        "ordinary_storage_prefetch": False,
+        "record_host_residency_for_publish": True,
+        "logical_session_id_source": "routing_key",
+        "host_allocator_enabled": True,
+        "host_allocator_region_ttl_ms": 600000,
+        "host_allocator_region_name": "tc_router_sglang_host_pool-unit-0",
+    }
+    cmd = build_launch_command(
+        make_spec(
+            enable_hierarchical_cache=True,
+            hicache_mem_layout="page_blob_direct",
+            hicache_io_backend="direct",
+            hicache_storage_backend="tensorcast",
+            hicache_storage_backend_extra_config=extra_config,
+        )
+    )
+
+    assert "--enable-hierarchical-cache" in cmd
+    assert "--hicache-mem-layout page_blob_direct" in cmd
+    assert "--hicache-io-backend direct" in cmd
+    assert "--hicache-storage-backend tensorcast" in cmd
+    expected_json = json.dumps(extra_config, separators=(",", ":"), sort_keys=True)
+    assert expected_json in cmd
+    assert '"tensorcast_kv_mode":"explicit_request_transfer"' in cmd
+    assert '"host_allocator_enabled":true' in cmd
+    assert "tc_router_sglang_host_pool-unit-0" in cmd
+
+
 # --- Misc --------------------------------------------------------------------
 
 

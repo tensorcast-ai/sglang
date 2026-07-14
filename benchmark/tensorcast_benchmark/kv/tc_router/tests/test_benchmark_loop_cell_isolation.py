@@ -194,64 +194,22 @@ async def test_tc_router_is_constructed_per_cell_while_tensorcast_stays_per_conf
     events: list[tuple[str, Any]] = []
     worker = _Worker(id="worker0", address="10.0.0.1", gpu_indices=(0, 1))
 
-    class FakeTensorcastLauncher:
-        async def launch_global_store(self, worker_arg, spec) -> Service:
-            events.append(("global_launch", worker_arg.id))
-            return Service(
-                name="global",
-                worker_id=worker_arg.id,
-                endpoints={
-                    "advertise_host": worker_arg.address,
-                    "grpc": "10.0.0.1:61050",
-                },
-                pid=1,
-                pid_path="/tmp/global.pid",
-                log_path="/tmp/global.log",
-            )
-
-        async def wait_global_ready(self, worker_arg, spec, service: Service) -> None:
-            events.append(("global_wait", service.endpoints["grpc"]))
-
-        async def launch_daemon(
-            self,
-            worker_arg,
-            spec,
-            *,
-            global_store_address: tuple[str, int],
-            capability_token_secret: str,
-        ) -> Service:
-            events.append(
-                (
-                    "daemon_launch",
-                    worker_arg.id,
-                    global_store_address,
-                    capability_token_secret,
-                )
-            )
-            return Service(
-                name="daemon",
-                worker_id=worker_arg.id,
-                endpoints={"grpc": "10.0.0.1:61053"},
-                pid=2,
-                pid_path="/tmp/daemon.pid",
-                log_path="/tmp/daemon.log",
-            )
-
-        async def wait_daemon_ready(self, worker_arg, spec, service: Service) -> None:
-            events.append(("daemon_wait", service.endpoints["grpc"]))
-
-        async def stop_daemon(self, worker_arg, spec, service: Service) -> None:
-            events.append(("daemon_stop", worker_arg.id))
-
-        async def stop_global(self, worker_arg, spec, service: Service) -> None:
-            events.append(("global_stop", worker_arg.id))
-
     class FakeTcRouter:
         def __init__(self, cfg, *, policy) -> None:
-            events.append(("tc_init", cfg.daemon_address, policy.name))
+            events.append(
+                (
+                    "tc_init",
+                    cfg.daemon_address,
+                    Path(cfg.migrations_path).relative_to(tmp_path),
+                    policy.name,
+                )
+            )
 
         async def start(self) -> None:
             events.append(("tc_start", None))
+
+        async def finalize_migrations(self) -> None:
+            events.append(("tc_finalize", None))
 
         async def close(self) -> None:
             events.append(("tc_close", None))
@@ -259,8 +217,14 @@ async def test_tc_router_is_constructed_per_cell_while_tensorcast_stays_per_conf
     async def fake_flush(instance_services: list, *, label: str) -> None:
         events.append(("flush", label, len(instance_services)))
 
+    async def fake_clear(instance_services: list, *, label: str) -> None:
+        events.append(("clear", label, len(instance_services)))
+
     async def fake_run_one_cell(**kwargs) -> tuple[RunSummary, dict]:
+        assert kwargs["migrations_path"] == kwargs["cell_dir"] / "migrations.jsonl"
         events.append(("run", kwargs["c_target"], kwargs["trial"]))
+        post_run_hook = kwargs["post_run_hook"]
+        await post_run_hook()
         return (
             RunSummary(
                 config=kwargs["cfg_kind"],
@@ -283,48 +247,144 @@ async def test_tc_router_is_constructed_per_cell_while_tensorcast_stays_per_conf
             },
         )
 
-    monkeypatch.setattr(benchmark_loop, "TensorcastLauncher", FakeTensorcastLauncher)
     monkeypatch.setattr(benchmark_loop, "TcRouter", FakeTcRouter)
     monkeypatch.setattr(benchmark_loop, "_flush_sglang_instances", fake_flush)
+    monkeypatch.setattr(benchmark_loop, "_clear_sglang_hicache_storage", fake_clear)
     monkeypatch.setattr(benchmark_loop, "_run_one_cell", fake_run_one_cell)
+    tensorcast_profile = benchmark_loop.TensorcastProfileServices(
+        spec=benchmark_loop.TensorcastLaunchSpec(
+            namespace="unit",
+            config_dir=str(tmp_path / "tc_cfg"),
+            log_dir=str(tmp_path / "tc_log"),
+            runtime_home_root=str(tmp_path / "tc_runtime"),
+        ),
+        launcher=object(),  # type: ignore[arg-type]
+        global_worker=worker,
+        global_store_service=Service(
+            name="global",
+            worker_id=worker.id,
+            endpoints={"advertise_host": worker.address, "grpc": "10.0.0.1:61050"},
+            pid=1,
+            pid_path="/tmp/global.pid",
+            log_path="/tmp/global.log",
+        ),
+        daemon_services=(
+            (
+                worker,
+                Service(
+                    name="daemon",
+                    worker_id=worker.id,
+                    endpoints={"grpc": "10.0.0.1:61053"},
+                    pid=2,
+                    pid_path="/tmp/daemon.pid",
+                    log_path="/tmp/daemon.log",
+                ),
+            ),
+        ),
+        global_store_address=("10.0.0.1", 61050),
+    )
 
     rows = await benchmark_loop._run_tc_router_config(
         cfg_spec=ConfigSpec(kind="tc_router"),
-        bench_cfg=_benchmark_config(),
-        cluster_provider=_ClusterProvider(worker),
+        bench_cfg=_benchmark_config().model_copy(
+            update={"configs": (ConfigSpec(kind="tc_router"),)}
+        ),
         instance_services=(
             _service("10.0.0.1:55001", "http://10.0.0.1:55001"),
             _service("10.0.0.1:55002", "http://10.0.0.1:55002"),
         ),
-        placements=[
-            InstanceAssignment(worker=worker, port=55001, gpu_indices=(0,)),
-            InstanceAssignment(worker=worker, port=55002, gpu_indices=(1,)),
-        ],
+        tensorcast_profile=tensorcast_profile,
         pool=[],
         run_dir=tmp_path,
     )
 
     assert [row.c_target for row in rows] == [2, 4]
     assert events == [
-        ("global_launch", "worker0"),
-        ("global_wait", "10.0.0.1:61050"),
-        (
-            "daemon_launch",
-            "worker0",
-            ("10.0.0.1", 61050),
-            "tc_router-unit",
-        ),
-        ("daemon_wait", "10.0.0.1:61053"),
         ("flush", "tc_router c=2 trial=0", 2),
-        ("tc_init", "10.0.0.1:61053", "NeverRebalance"),
+        ("clear", "tc_router c=2 trial=0", 2),
+        (
+            "tc_init",
+            "10.0.0.1:61053",
+            Path("tc_router/c2/trial0/migrations.jsonl"),
+            "NeverRebalance",
+        ),
         ("tc_start", None),
         ("run", 2, 0),
+        ("tc_finalize", None),
         ("tc_close", None),
         ("flush", "tc_router c=4 trial=0", 2),
-        ("tc_init", "10.0.0.1:61053", "NeverRebalance"),
+        ("clear", "tc_router c=4 trial=0", 2),
+        (
+            "tc_init",
+            "10.0.0.1:61053",
+            Path("tc_router/c4/trial0/migrations.jsonl"),
+            "NeverRebalance",
+        ),
         ("tc_start", None),
         ("run", 4, 0),
+        ("tc_finalize", None),
         ("tc_close", None),
-        ("daemon_stop", "worker0"),
-        ("global_stop", "worker0"),
     ]
+
+
+def test_tensorcast_backend_extra_config_uses_unique_allocator_regions(
+    tmp_path: Path,
+) -> None:
+    worker = _Worker(id="worker0", address="10.0.0.1", gpu_indices=(0, 1))
+    bench_cfg = _benchmark_config().model_copy(
+        update={"configs": (ConfigSpec(kind="tc_router"),)}
+    )
+    tensorcast_profile = benchmark_loop.TensorcastProfileServices(
+        spec=benchmark_loop.TensorcastLaunchSpec(
+            namespace="unit",
+            config_dir=str(tmp_path / "tc_cfg"),
+            log_dir=str(tmp_path / "tc_log"),
+            runtime_home_root=str(tmp_path / "tc_runtime"),
+        ),
+        launcher=object(),  # type: ignore[arg-type]
+        global_worker=worker,
+        global_store_service=Service(
+            name="global",
+            worker_id=worker.id,
+            endpoints={"advertise_host": worker.address, "grpc": "10.0.0.1:61050"},
+            pid=1,
+            pid_path="/tmp/global.pid",
+            log_path="/tmp/global.log",
+        ),
+        daemon_services=(
+            (
+                worker,
+                Service(
+                    name="daemon",
+                    worker_id=worker.id,
+                    endpoints={"grpc": "10.0.0.1:61053"},
+                    pid=2,
+                    pid_path="/tmp/daemon.pid",
+                    log_path="/tmp/daemon.log",
+                ),
+            ),
+        ),
+        global_store_address=("10.0.0.1", 61050),
+    )
+
+    first = benchmark_loop._tensorcast_backend_extra_config(
+        bench_cfg=bench_cfg,
+        tensorcast_profile=tensorcast_profile,
+        placement=InstanceAssignment(worker=worker, port=55001, gpu_indices=(0,)),
+        placement_index=0,
+    )
+    second = benchmark_loop._tensorcast_backend_extra_config(
+        bench_cfg=bench_cfg,
+        tensorcast_profile=tensorcast_profile,
+        placement=InstanceAssignment(worker=worker, port=55002, gpu_indices=(1,)),
+        placement_index=1,
+    )
+
+    assert first["tensorcast_kv_mode"] == "explicit_request_transfer"
+    assert first["daemon_address"] == "127.0.0.1:61053"
+    assert first["instance_directory_address"] == "10.0.0.1:61050"
+    assert first["instance_agent_execution_endpoint"] == "10.0.0.1:61400"
+    assert first["instance_agent_start_timeout_s"] == 180.0
+    assert second["instance_agent_execution_endpoint"] == "10.0.0.1:61401"
+    assert first["host_allocator_enabled"] is True
+    assert first["host_allocator_region_name"] != second["host_allocator_region_name"]

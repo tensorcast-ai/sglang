@@ -169,6 +169,10 @@ def render_daemon_config(
 
     cfg.setdefault("communicator", {})["enable_rdma"] = bool(spec.enable_rdma)
 
+    capability_directory = cfg.setdefault("capability_directory", {})
+    capability_directory["enabled"] = True
+    capability_directory["gateway_ingress_enabled"] = True
+
     # Capability-token rotation needs *some* secret; supply a per-run one
     # rather than relying on whatever the template ships with.
     caps = cfg.setdefault("capability_tokens", {})

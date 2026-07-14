@@ -21,17 +21,26 @@ def test_session_state_defaults() -> None:
     assert s.turn_count == 0
     assert s.last_engine_request_id == ""
     assert s.last_published_manifest is None
-    assert s.pending_migration is False
+    assert s.pending_migration is None
+    assert s.migration_attempt_count == 0
+    assert s.pending_consumed_migration_id == ""
+    assert s.last_migration_completed_monotonic == 0.0
 
 
 def test_session_state_is_mutable() -> None:
     s = SessionState(session_id="x")
+    pending = MigrationFuture(
+        session_id="x",
+        source_instance="inst-0",
+        target_instance="inst-1",
+        started_monotonic=1.0,
+    )
     s.home_instance = "inst-0"
     s.turn_count += 1
-    s.pending_migration = True
+    s.pending_migration = pending
     assert s.home_instance == "inst-0"
     assert s.turn_count == 1
-    assert s.pending_migration is True
+    assert s.pending_migration is pending
 
 
 def test_load_sample_queue_depth() -> None:

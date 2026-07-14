@@ -626,12 +626,13 @@ those in is now a one-file delta when the policy is added.
 - [x] `configs/benchmark_tc_router_smoke.yaml` — identical to `benchmark_baseline_smoke.yaml` except `configs: [{kind: tc_router, policy: {kind: never_rebalance, seed: 0}}]`. Ports moved to 61101-61103 (above Linux ephemeral range) + gateway 61200; this also fixes a port-collision crash hit during Phase 5 retries.
 - [x] Unit tests: `tests/test_policy.py` (13 tests — protocol shape, power-of-two correctness with skewed/missing loads, NeverRebalance returns nothing-to-rebalance, deterministic seed, `make_policy` factory), `tests/test_tc_router.py` (5 async tests — same-session stickiness via fake aiohttp servers, distinct sessions can land on different homes, runtime close releases the fake `tc.Runtime`, turn-count tracking).
 
-**Deferred to future Phase 7+** (deliberately not implemented in stub):
+**Deferred from the Phase-7 stub; status after Phase 8**:
 
 - [ ] `router/rebalancer.py` — Rebalancer background task.
 - [ ] Real `ThresholdPolicy` implementation.
-- [ ] `metrics/migrations.py` + per-migration JSONL writer.
-- [ ] Reuse of `request_transfer.caller_driver` publish/hydrate helpers.
+- [x] `metrics/migrations.py` + per-migration JSONL writer.
+- [x] Mirror the known-good `request_transfer.caller_driver`
+  publish/hydrate call shape in the tc_router migration client.
 
 **Validation gate**:
 
@@ -664,31 +665,518 @@ those in is now a one-file delta when the policy is added.
 
 ---
 
-## 8. Full sweep + report
+## 8. Session-scoped request migration E2E
 
-**Goal**: produce the headline plot + supporting charts.
+**Goal**: turn the Phase-7 `NeverRebalance` tc_router stub into a
+minimal migration-capable router and run one end-to-end smoke proving
+session-scoped request migration works:
 
-**Deliverables**:
+1. a source turn records publishable request-bundle state,
+2. tc_router explicitly calls Tensorcast `publish` / `hydrate`,
+3. the next turn of the same `session_id` lands on the target instance,
+4. SGLang target admission attaches the hydrated prepared bundle,
+5. the target turn reports non-zero `cached_tokens`.
 
-- [ ] `configs/benchmark_main.yaml` — the publication-grade config: 4 configs × 6 C_target × 3 trials × `agent_medium` preset
-- [ ] `configs/benchmark_preset_sweep.yaml` — 4 configs × 1 C_target (12) × 3 trials × 3 presets, for the 3-act story
-- [ ] `tools/plot.py`
-  - [ ] x-axis `c_target` / y-axis P95 TTFT, one curve per config, error bars across trials
-  - [ ] Secondary plot: `cached_token_ratio_mean` per config per C_target
-  - [ ] Secondary plot: per-cell `migration_count` and `migration_utilization` for tc_router only
-  - [ ] Preset-sweep plot (3-act story)
-- [ ] `README.md`
-  - [ ] How to acquire a 3-worker cluster (out of band)
-  - [ ] How to populate `cluster_brainctl_<id>.yaml` (or `cluster_static_<id>.yaml`)
-  - [ ] How to run `benchmark_main.yaml`
-  - [ ] How to run `benchmark_preset_sweep.yaml`
-  - [ ] How to regenerate plots from outputs
-- [ ] Final validation per arch § 12 (steps 1–6 done, reproducibility green)
+This phase is **not** the final routing-policy experiment. The required
+policy can be deliberately simple (`migrate_once_after_turn`) so we
+validate the migration primitive before tuning any load-aware policy.
 
-**Validation gate**:
-- [ ] Main plot reproducibly shows tc_router below gw_cache_aware below gw_load_aware in P95 TTFT at moderate `c_target` (per arch § 4.3 expected curve shape)
-- [ ] Preset-sweep plot shows the 3-act story (curves merge at fast preset, separate at medium, mooncake closes the gap at slow)
-- [ ] CSV is fully populated, every cell has 3 trials of data
+### 8.1 Tensorcast serving-profile config schema
+
+- [x] Add `TensorcastConfig` to `driver/config.py`.
+  - [x] `global_store_port: int`
+  - [x] `daemon_port: int`
+  - [x] `daemon_p2p_port: int`
+  - [x] `instance_agent_base_port: int`
+  - [x] `daemon_stable_bytes: str`
+  - [x] `clear_storage_between_cells: bool = true`
+  - [x] `hicache_mem_layout: str = "page_blob_direct"`
+  - [x] `hicache_io_backend: str = "direct"`
+  - [x] `host_allocator_enabled: bool = true`
+  - [x] `host_allocator_region_ttl_ms: int`
+  - [x] `host_allocator_region_name_prefix: str`
+- [x] Add validation rules for allocator-backed Tensorcast HiCache mode.
+  - [x] If `host_allocator_enabled=true`, require
+    `hicache_mem_layout == "page_blob_direct"`.
+  - [x] If `host_allocator_enabled=true`, require
+    `hicache_io_backend == "direct"`.
+  - [x] Require `instance_agent_base_port + instances.count - 1 <= 65535`.
+  - [x] Reject port overlap between SGLang serving ports, NCCL ports,
+    gateway port, Tensorcast global-store port, Tensorcast daemon port,
+    daemon P2P port, Mooncake ports, and instance-agent ports.
+  - [x] Validate that `tensorcast` config is only required/consumed when
+    at least one `configs[].kind == "tc_router"`.
+- [x] Update benchmark YAML examples to show the `tensorcast:` block.
+- [x] Unit tests:
+  - [x] `TensorcastConfig` parses valid allocator-backed config.
+  - [x] Config validation rejects allocator mode without
+    `page_blob_direct`.
+  - [x] Config validation rejects allocator mode without `direct` IO.
+  - [x] Config validation rejects instance-agent port overflow.
+  - [x] Config validation rejects port collisions.
+
+### 8.2 Tensorcast serving-profile lifecycle
+
+- [x] Split serving profiles in `driver/benchmark_loop.py`.
+  - [x] `plain = gw_load_aware | gw_cache_aware`.
+  - [x] `mooncake = gw_load_aware_mooncake`.
+  - [x] `tensorcast = tc_router`.
+  - [x] Remove `tc_router` from the plain profile.
+- [x] Refactor Tensorcast service startup out of `_run_tc_router_config`
+  and into the tensorcast profile setup, because SGLang must receive
+  Tensorcast extra config at launch time.
+- [x] Tensorcast profile startup order:
+  - [x] Plan placements exactly once, shared with other profiles.
+  - [x] Launch Tensorcast global store on
+    `cluster.service_placement.global_store_worker_id`.
+  - [x] Launch one Tensorcast daemon on each worker that hosts at least
+    one SGLang placement.
+  - [x] Wait for global store `SERVING`.
+  - [x] Wait for every daemon ready.
+  - [x] Launch SGLang fleet with Tensorcast HiCache explicit mode.
+  - [x] Wait for SGLang HTTP readiness.
+  - [x] Wait for Tensorcast directory readiness for every SGLang
+    logical instance id.
+- [x] Tensorcast profile teardown order:
+  - [x] Stop SGLang fleet first.
+  - [x] Stop daemons.
+  - [x] Stop global store.
+  - [x] Preserve best-effort cleanup if a mid-launch step fails.
+- [x] Preserve `--config-filter` semantics:
+  - [x] Selecting only gateway configs must not launch Tensorcast.
+  - [x] Selecting only `tc_router` must not launch plain or Mooncake
+    SGLang profiles.
+  - [x] Selecting mixed configs launches separate fleets per profile.
+- [x] Unit tests:
+  - [x] Tensorcast profile starts global store and daemons before SGLang.
+  - [x] Tensorcast profile stops SGLang before daemons/global store.
+  - [x] `--config-filter tc_router` skips plain and Mooncake services.
+  - [x] Mixed selected configs do not reuse Tensorcast SGLang for gateway
+    baselines.
+
+### 8.3 SGLang Tensorcast explicit request-transfer launch
+
+- [x] Extend `_launch_sglang_fleet(...)` or add a tensorcast-specific
+  launcher path that can pass per-placement Tensorcast backend options.
+- [x] For every placement, build Tensorcast backend extra config:
+  - [x] `daemon_address = "127.0.0.1:<daemon_port>"` from the SGLang
+    process to its worker-local daemon.
+  - [x] `namespace = bench_cfg.run_id`.
+  - [x] `engine = "sglang"`.
+  - [x] `model_id` derived from model path basename unless explicitly set
+    later.
+  - [x] `model_version` stable for the model path.
+  - [x] `policy_profile = "durable"`.
+  - [x] `instance_directory_address = "<global_store_advertise_host>:<port>"`.
+  - [x] `instance_agent_execution_endpoint =
+    "<worker.address>:<instance_agent_base_port + placement_index>"`.
+  - [x] `tensorcast_kv_mode = "explicit_request_transfer"`.
+  - [x] `background_page_publish = false`.
+  - [x] `ordinary_storage_prefetch = false`.
+  - [x] `record_host_residency_for_publish = true`.
+  - [x] `logical_session_id_source = "routing_key"`.
+  - [x] `host_allocator_enabled = true`.
+  - [x] `host_allocator_region_ttl_ms` copied from
+    `bench_cfg.tensorcast`.
+  - [x] `host_allocator_region_name` derived from
+    `<prefix>-<run_id>-<placement_index>` so allocator-backed HOST_SHARED
+    slabs do not collide across instances or runs.
+- [x] Force Tensorcast SGLang launch args required by allocator-backed mode:
+  - [x] `--enable-hierarchical-cache`.
+  - [x] `--hicache-mem-layout page_blob_direct`.
+  - [x] `--hicache-io-backend direct`.
+  - [x] `--hicache-storage-backend tensorcast`.
+  - [x] `--hicache-storage-backend-extra-config <json>`.
+  - [x] Keep `--enable-cache-report`.
+  - [x] Preserve TP, GPU pinning, `--page-size`,
+    `--mem-fraction-static`, and SGLang log-level passthrough.
+- [x] Keep instance id consistent across SGLang, Tensorcast directory,
+  and tc_router:
+  - [x] For tensorcast profile, do not bind SGLang with
+    `--host 0.0.0.0`.
+  - [x] Use `--host <worker.address>` so SGLang registers
+    `<worker.address>:<port>`.
+  - [x] Build `instance_endpoints` with the same
+    `<worker.address>:<port>` keys.
+  - [x] Document/guard that static cluster configs used for Tensorcast
+    E2E must use driver-reachable worker addresses.
+- [x] Unit tests:
+  - [x] SGLang command contains allocator-required
+    `--hicache-mem-layout page_blob_direct`.
+  - [x] SGLang command contains Tensorcast backend and explicit-mode JSON.
+  - [x] Extra config contains `host_allocator_enabled: true`.
+  - [x] Extra config contains unique `host_allocator_region_name` per
+    placement.
+  - [x] Tensorcast profile does not pass wildcard bind host.
+
+### 8.4 Tensorcast directory readiness gate
+
+- [x] Add a helper that connects to the primary daemon and waits for every
+  expected SGLang `instance_id` to resolve through
+  `runtime.directory().resolve_instance_execution(instance_id)`.
+- [x] The helper must report actionable timeout errors:
+  - [x] missing instance id,
+  - [x] observed route with wrong execution endpoint,
+  - [x] daemon/global-store connection error,
+  - [x] instance-agent registration absent.
+- [x] Close the temporary runtime after readiness checks.
+- [x] Reuse this helper before the first tc_router cell starts.
+- [x] Unit tests:
+  - [x] readiness succeeds when all fake routes appear.
+  - [x] readiness retries until routes appear.
+  - [x] readiness times out with missing ids.
+  - [x] readiness validates execution endpoint when expected endpoints are
+    supplied.
+
+### 8.5 Routing-key propagation to SGLang
+
+- [x] Extend `router/_chat_client.py::chat_completion_stream(...)` to
+  accept optional HTTP headers and pass them to `aiohttp.ClientSession.post`.
+- [x] Preserve `proxy=None` and `trust_env=False` behavior.
+- [x] In `TcRouter.generate(...)`, send
+  `X-SMG-Routing-Key: <session_id>` for every direct SGLang
+  `/v1/chat/completions` request.
+- [x] Keep `rid` in the OpenAI body as the per-turn engine request id.
+- [x] Do not add `logical_session_id` to the OpenAI JSON body.
+- [x] Unit tests:
+  - [x] fake chat server observes `X-SMG-Routing-Key`.
+  - [x] fake chat server observes the original `rid` body field.
+  - [x] gateway router behavior is unchanged unless explicitly extended
+    later.
+
+### 8.6 Tensorcast migration client
+
+- [x] Add `router/migration.py` or equivalent with a small
+  `TensorcastMigrationClient`.
+- [x] Mirror the known-good request-transfer call shape from
+  `kv/request_transfer/caller_driver.py`.
+  - [x] Resolve source route with
+    `runtime.directory().resolve_instance_execution(source_instance_id)`.
+  - [x] Resolve target route with
+    `runtime.directory().resolve_instance_execution(target_instance_id)`.
+  - [x] Convert resolved routes to `tensorcast.api.plan.Instance`.
+  - [x] Build `CallContext` for publish with stable
+    `request_id` / `idempotency_key`.
+  - [x] Call
+    `plan.on_instance(source).publish(engine_request_id=last_rid, ttl_ms=...)`.
+  - [x] Require `PublishResult.publish_manifest` to be non-null.
+  - [x] Decode the SGLang embedded publish manifest enough to record
+    publish manifest digest, artifact manifest digest, cutoff token count,
+    and tail-valid token count.
+  - [x] Build `CallContext` for hydrate.
+  - [x] Call `plan.on_instance(target).hydrate(publish_manifest=...)`.
+  - [x] Require `HydrateResult`.
+  - [x] Return publish/hydrate latency and manifest metadata.
+- [x] Run blocking Tensorcast SDK calls through `loop.run_in_executor`.
+- [x] Error handling:
+  - [x] publish failure returns a structured failure; it must not crash the
+    workload session.
+  - [x] hydrate failure returns a structured failure; `home_instance`
+    remains source.
+  - [x] directory resolution failure is recorded as migration failure.
+  - [x] timeout is recorded as migration failure.
+- [x] Unit tests with a fake Tensorcast runtime:
+  - [x] successful publish/hydrate call order.
+  - [x] publish without manifest fails closed.
+  - [x] hydrate wrong result type fails closed.
+  - [x] directory resolution failure is propagated as structured error.
+  - [x] manifest metadata decoder accepts current SGLang schema.
+
+### 8.7 Minimal migration policy
+
+- [x] Implement `MigrateOnceAfterTurnPolicy` in `router/policy.py`.
+- [x] Extend `make_policy(...)` to accept:
+  - [x] `kind: migrate_once_after_turn`
+  - [x] `seed`
+  - [x] `after_turn_count`
+  - [x] `target_strategy: next_instance | least_loaded`
+  - [x] `max_migrations_per_session`
+  - [x] `pending_migration_wait_timeout_s`
+  - [x] `plan_deadline_ms`
+  - [x] `publish_ttl_ms`
+- [x] Keep `NeverRebalance` behavior unchanged.
+- [x] Extend router/session state as needed:
+  - [x] migration count issued per session,
+  - [x] last migration id,
+  - [x] last successful migration source/target,
+  - [x] pending consumed migration metadata,
+  - [x] last migration completion timestamp.
+- [x] Policy behavior:
+  - [x] Initial home still uses power-of-two unless policy config says
+    otherwise later.
+  - [x] A session is eligible only after a successful turn updates
+    `last_engine_request_id`.
+  - [x] A session is eligible only when `turn_count >= after_turn_count`.
+  - [x] A session is not eligible while `pending_migration` exists.
+  - [x] A session is not eligible after
+    `max_migrations_per_session` migrations have been attempted.
+  - [x] `next_instance` target strategy picks the next stable instance id
+    in sorted/router order, excluding source.
+  - [x] `least_loaded` target strategy picks the non-source candidate with
+    smallest observed queue depth.
+- [x] Unit tests:
+  - [x] factory builds policy from YAML dict.
+  - [x] policy proposes no migration before `after_turn_count`.
+  - [x] policy proposes exactly one migration after eligibility.
+  - [x] policy excludes current home from targets.
+  - [x] policy respects pending migration.
+  - [x] policy respects max migrations per session.
+
+### 8.8 TcRouter migration execution and pending-routing semantics
+
+- [x] Add migration scheduling to `TcRouter.generate(...)` after a
+  successful source turn.
+- [x] Do not run Tensorcast publish/hydrate on the request hot path.
+  - [x] Create an asyncio task per scheduled migration.
+  - [x] Store a `MigrationFuture` / task handle in session state before
+    issuing Tensorcast calls.
+  - [x] Keep one in-flight migration per session.
+- [x] At the start of `generate(...)`, if the session has a pending
+  migration:
+  - [x] wait up to `pending_migration_wait_timeout_s`,
+  - [x] route to the target if migration succeeded,
+  - [x] route to the source/current home if migration failed,
+  - [x] route to current home if the wait itself times out.
+- [x] On migration success:
+  - [x] update `home_instance = target`,
+  - [x] store manifest metadata for consumption tracking,
+  - [x] keep source KV in place; do not call `evict_local`.
+- [x] On migration failure:
+  - [x] leave `home_instance` unchanged,
+  - [x] clear pending migration,
+  - [x] record failure in migration metrics.
+- [x] On the next successful turn after a migration:
+  - [x] mark `was_just_migrated=true` when it lands on the target,
+  - [x] mark `used_hydrated_bundle=true` when it was just migrated and
+    `cached_tokens > 0`,
+  - [x] attach `consumed_by_turn_rid`,
+  - [x] record `target_turn_cached_tokens`.
+- [x] Router close:
+  - [x] await or cancel outstanding migration tasks with bounded timeout,
+  - [x] finalize unconsumed migration records as `wasted=true`,
+  - [x] close Tensorcast runtime and aiohttp session.
+- [x] Unit tests:
+  - [x] same-session request waits for pending migration and routes target
+    after success.
+  - [x] pending migration failure keeps routing on source.
+  - [x] wait timeout does not fail the request.
+  - [x] unrelated sessions are not blocked by another session's migration.
+  - [x] successful just-migrated turn sets per-turn flags.
+
+### 8.9 Migration metrics and summary integration
+
+- [x] Add `metrics/migrations.py`.
+  - [x] `MigrationRecord` schema matching `arch.md` § 10.2.
+  - [x] JSONL writer that writes one finalized row per migration.
+  - [x] Status enum: `consumed`, `unconsumed`, `publish_failed`,
+    `hydrate_failed`, `timeout`.
+  - [x] Include `is_warmup`.
+  - [x] Include publish/hydrate latency.
+  - [x] Include manifest digests, cutoff token count, tail-valid tokens.
+  - [x] Include prepared-bundle log verification fields when available.
+- [x] Update `_run_one_cell(...)` to accept an optional migration writer
+  and pass `migrations_path` into `aggregate_cell(...)`.
+- [x] For tc_router cells:
+  - [x] create `migrations.jsonl` beside `turns.jsonl`,
+  - [x] pass the writer into `TcRouter`,
+  - [x] aggregate summaries with `migrations_path`.
+- [x] Preserve gateway cells with `migrations_path=None`.
+- [x] Update `aggregate_cell(...)` only if needed to handle the finalized
+  migration schema.
+- [x] Unit tests:
+  - [x] migration writer emits valid JSONL rows.
+  - [x] summary reports `migration_count`.
+  - [x] summary reports `migration_utilization`.
+  - [x] summary excludes warmup migrations.
+  - [x] summary handles publish/hydrate failure rows.
+
+### 8.10 Tensorcast cell isolation
+
+- [x] For every tc_router cell, keep existing direct SGLang
+  `/flush_cache` before router startup.
+- [x] If `bench_cfg.tensorcast.clear_storage_between_cells=true`, POST
+  `/clear_hicache_storage_backend` to every SGLang endpoint after
+  `/flush_cache` succeeds.
+- [x] Do not fail fast on the first clear failure:
+  - [x] poll all endpoints,
+  - [x] log all non-200 responses,
+  - [x] require all endpoints to return HTTP 200 before starting the
+    next cell.
+- [x] Keep Tensorcast daemons/global store alive across cells unless the
+  E2E smoke shows allocator-backed region state requires per-cell daemon
+  restart.
+- [x] Fresh `TcRouter` per cell remains required.
+- [x] Unit tests:
+  - [x] tc_router cells call `/flush_cache`.
+  - [x] tc_router cells call `/clear_hicache_storage_backend` when
+    enabled.
+  - [x] tc_router cells skip storage clear when disabled.
+  - [x] router process/state is fresh per cell.
+
+### 8.11 Prepared-bundle verification
+
+- [x] Reuse/adapt `request_transfer.caller_driver` log-signal parsing.
+  - [x] Search target SGLang log for
+    `Tensorcast prepared-bundle attached`.
+  - [x] Match expected request id and publish manifest digest.
+  - [x] Detect matching fallback lines.
+  - [x] Detect matching fail-closed lines.
+  - [x] Detect matching consume-failed lines.
+- [x] Decide where verification runs:
+  - [x] use a post-cell verifier that updates/finalizes migration rows
+    before summary aggregation.
+- [x] E2E validation must not rely only on `cached_tokens`; it must also
+  inspect target logs for the attached-bundle signal.
+- [x] Unit tests:
+  - [x] parser detects attached signal.
+  - [x] parser detects fallback/fail-closed/consume-failed.
+  - [x] parser ignores unrelated manifest digests.
+
+### 8.12 E2E smoke configuration
+
+- [x] Add a checked-in smoke config, for example:
+  `configs/benchmark_static_tc_router_migration_smoke_4inst_tp2.yaml`.
+- [x] Use the same static cluster shape as:
+  `outputs/20260710-132000_static-mooncake-rdma-mlx5_0-4inst-tp2-c4-8-16-32-64-128-wall1000-warmup50-count30-agent-slow`.
+  - [x] Same local+remote worker inventory.
+  - [x] Same model path: `/mnt/data/models/Qwen3-32B`.
+  - [x] Same dataset path:
+    `/mnt/data/dataset/OpenHands-Sampled-Trajectories`.
+  - [x] Same TP and placement intent: `instances.count=4`,
+    `model.tp_size=2`, two local instances and two remote instances if
+    the referenced cluster config provides that GPU layout.
+  - [x] Same RDMA-capable static environment and worker addresses as the
+    referenced run.
+- [x] Keep workload small enough for a smoke test:
+  - [x] `inter_turn_delay.preset: agent_fast` or a short custom preset.
+  - [x] `wall_seconds: 120` to `180`.
+  - [x] `warmup_seconds: 0` or small.
+  - [x] `warmup_counts: 0` or small.
+  - [x] `c_target_sweep: [2, 4]` or `[4]`.
+  - [x] `trials: 1`.
+  - [x] `max_new_tokens_clip: 128` or `256`.
+  - [x] `pool_filter.min_turns >= 4` so each session has enough turns to
+    publish on one turn and consume on a later turn.
+- [x] Config uses only:
+  ```yaml
+  configs:
+    - kind: tc_router
+      policy:
+        kind: migrate_once_after_turn
+        seed: 0
+        after_turn_count: 1
+        target_strategy: next_instance
+        max_migrations_per_session: 1
+        pending_migration_wait_timeout_s: 30
+        plan_deadline_ms: 30000
+        publish_ttl_ms: 600000
+  ```
+- [x] Tensorcast config in the smoke must enable allocator mode:
+  ```yaml
+  tensorcast:
+    global_store_port: 61050
+    daemon_port: 61053
+    daemon_p2p_port: 61090
+    instance_agent_base_port: 61400
+    daemon_stable_bytes: 16GB
+    clear_storage_between_cells: true
+    hicache_mem_layout: page_blob_direct
+    hicache_io_backend: direct
+    host_allocator_enabled: true
+    host_allocator_region_ttl_ms: 600000
+    host_allocator_region_name_prefix: tc_router_sglang_host_pool
+  ```
+- [x] Validation command uses the project venv:
+  ```bash
+  cd /mnt/data/tot
+  source .venv/bin/activate
+  export PYTHONPATH=/mnt/data/tot/thirdparty/sglang/benchmark:${PYTHONPATH:-}
+  cd thirdparty/sglang/benchmark
+  uv run --active python -m tensorcast_benchmark.kv.tc_router.run_benchmark \
+    --cluster tensorcast_benchmark/kv/tc_router/configs/cluster_static_local_h800_plus_10_0_10_58_2local_2remote.yaml \
+    --bench tensorcast_benchmark/kv/tc_router/configs/benchmark_static_tc_router_migration_smoke_4inst_tp2.yaml \
+    --config-filter tc_router
+  ```
+
+### 8.13 Unit-test validation gate
+
+- [x] Run targeted unit tests before any E2E attempt:
+  ```bash
+  cd /mnt/data/tot
+  source .venv/bin/activate
+  export PYTHONPATH=/mnt/data/tot/thirdparty/sglang/benchmark:${PYTHONPATH:-}
+  cd thirdparty/sglang/benchmark
+  uv run --active pytest \
+    tensorcast_benchmark/kv/tc_router/tests/test_benchmark_config.py \
+    tensorcast_benchmark/kv/tc_router/tests/test_services_sglang.py \
+    tensorcast_benchmark/kv/tc_router/tests/test_benchmark_loop_outputs.py \
+    tensorcast_benchmark/kv/tc_router/tests/test_benchmark_loop_cell_isolation.py \
+    tensorcast_benchmark/kv/tc_router/tests/test_policy.py \
+    tensorcast_benchmark/kv/tc_router/tests/test_tc_router.py \
+    tensorcast_benchmark/kv/tc_router/tests/test_summary.py
+  ```
+- [x] Run the full tc_router test suite if targeted tests pass:
+  ```bash
+  cd /mnt/data/tot
+  source .venv/bin/activate
+  export PYTHONPATH=/mnt/data/tot/thirdparty/sglang/benchmark:${PYTHONPATH:-}
+  cd thirdparty/sglang/benchmark
+  uv run --active pytest tensorcast_benchmark/kv/tc_router/tests
+  ```
+  Completed validation: `221 passed in 12.64s` with the command above.
+
+### 8.14 E2E validation gate
+
+- [x] Run the static 4-instance TP=2 smoke.
+- [x] Confirm Tensorcast profile startup:
+  - [x] global store ready,
+  - [x] local daemon ready,
+  - [x] remote daemon ready,
+  - [x] every SGLang instance launched with Tensorcast explicit
+    request-transfer backend,
+  - [x] every SGLang instance launched with allocator-backed
+    `page_blob_direct` mode,
+  - [x] every expected instance id resolves in Tensorcast directory.
+- [x] Confirm workload success:
+  - [x] `turns.jsonl` exists for every cell,
+  - [x] request failure count is zero or explained,
+  - [x] sessions continue after migration.
+- [x] Confirm migration success:
+  - [x] `migrations.jsonl` exists for every tc_router cell,
+  - [x] at least one migration row has successful publish and hydrate,
+  - [x] at least one migration row is `status=consumed`,
+  - [x] `summary.csv` reports `migration_count > 0`,
+  - [x] `summary.csv` reports non-null `migration_utilization`,
+  - [x] `summary.csv` reports mean publish/hydrate latency.
+- [x] Confirm bundle reuse:
+  - [x] consumed turn has `was_just_migrated=true`,
+  - [x] consumed turn has `used_hydrated_bundle=true`,
+  - [x] consumed turn has `cached_tokens > 0`,
+  - [x] target SGLang log contains
+    `Tensorcast prepared-bundle attached` for the migration manifest,
+  - [x] target SGLang log has no matching fallback/fail-closed/consume
+    failure for that manifest.
+- [x] Resolve code/import/path/config mismatches found during bring-up and
+  repeat targeted tests.
+- [x] No unresolved environmental blocker remained in the successful smoke
+  run.
+- [x] Completed E2E validation run:
+  `outputs/20260713-135900_static-tc-router-migration-smoke-4inst-tp2`.
+  - [x] `turns=73`, `success=73`, `fail=0`.
+  - [x] `migration_count=12`, `status=consumed` for 6 rows, and
+    `migration_utilization=0.5`.
+  - [x] 6 target turns reported both `was_just_migrated=true` and
+    `used_hydrated_bundle=true`.
+  - [x] `summary.csv` reports mean publish latency
+    `4479.552660999616 ms` and mean hydrate latency
+    `1058.8641934167147 ms`.
+
+### 8.15 Deferred until after Phase 8
+
+- [ ] Real `ThresholdPolicy` tuning.
+- [ ] Publication-grade C-target sweep.
+- [ ] Plotting/report generation.
+- [ ] Multi-trial reproducibility runs.
 
 ---
 
@@ -726,8 +1214,8 @@ those in is now a one-file delta when the policy is added.
 These are flagged so we can hit them deliberately rather than be
 surprised:
 
-- [ ] **`/v1/chat/completions` `cached_tokens` field availability**: SGLang exposes `meta_info.cached_tokens` on `/generate`; verify the same field comes through on `/v1/chat/completions` final chunk. If not, we may need to switch to `/generate` with manual chat templating (reverses the arch § 5.2.2 decision and is a lot of work). **Verify in Phase 5 validation, before going further.**
-- [ ] **Mooncake + SGLang HiCache version compatibility**: the `--hicache-storage-backend mooncake` flag and config schema may have shifted between SGLang versions. Check against installed SGLang in Phase 6 day 0.
+- [x] **`/v1/chat/completions` `cached_tokens` field availability**: verified by gateway and tc_router E2E runs; per-turn records and `summary.csv` consume the final-chunk `usage` / cache-report metadata without switching to `/generate`.
+- [x] **Mooncake + SGLang HiCache version compatibility**: verified by successful Mooncake RDMA run `outputs/20260710-083129_static-mooncake-rdma-mlx5_0-4inst-tp2-c4-8-16-32-64-wall600-warmup30`.
 - [ ] **Tensorcast publish on completed request retention window**: arch § 6.5 documents this caveat. Our `inter_turn_delay_p90 = 56s` for `agent_medium` puts most "next turn" arrivals well within typical retention, but `agent_slow` P95 = 311s might exceed it. If publish failures spike at `agent_slow`, we may need to surface a SGLang config knob to lengthen the snapshot retention.
 - [ ] **Gateway response header for served-instance**: not all sgl-model-gateway versions expose this. If absent, we'll need a wrapper that infers from upstream URL or maintains its own session→instance map (defeats the gateway-as-blackbox abstraction). Verify in Phase 5 validation.
 - [ ] **TP=2 KV pool sizing**: Qwen3-32B at `tp_size=2, kv_pool_size_gb=auto` may auto-size differently across replicas if GPU partitioning is not symmetric. Lock `--mem-fraction-static` to a consistent value across instances if observed inconsistent.
@@ -745,9 +1233,13 @@ surprised:
 | 4 | Router interface | Both gateway and tc routers implement it |
 | 5 | Gateway baseline | First end-to-end. Validates assumptions about `/v1/chat/completions` & `cached_tokens` BEFORE we commit to building tc_router on the same assumption |
 | 6 | Mooncake | Adds substrate baseline; mostly orthogonal to router |
-| 7 | tc_router | The big one; everything before is prerequisite |
-| 8 | Sweep + plot | Producing the result |
+| 7 | tc_router stub | Validates Tensorcast service wiring, sticky routing, and cell execution before enabling migration |
+| 8 | Session-scoped request migration E2E | Proves the `publish` / `hydrate` primitive, routing-key session identity, allocator-backed Tensorcast HiCache launch, and prepared-bundle reuse before policy tuning |
 
 If Phase 5 validation fails on `cached_tokens` not being exposed via
 `/v1/chat/completions`, we redesign before proceeding to Phase 6+.
 This is the most important early checkpoint.
+
+The publication-grade sweep, plotting, and report-generation work moves
+after Phase 8. It should not start until the Phase-8 E2E smoke has at
+least one consumed migration with verified prepared-bundle attachment.

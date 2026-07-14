@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import logging
 import re
 import shutil
@@ -19,11 +20,14 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 import yaml
 
 from ..metrics.per_turn import TurnRecordWriter
+from ..metrics.prepared_bundle_signals import (
+    verify_prepared_bundle_signals_for_migrations,
+)
 from ..metrics.summary import RunSummary, aggregate_cell, write_summary_csv
 from ..resource import factory as resource_factory
 from ..resource.base import ClusterConfig, Worker, load_cluster_config
@@ -67,14 +71,29 @@ _GATEWAY_POLICY = {
     "gw_load_aware_mooncake": "power_of_two",
 }
 
-_PLAIN_CONFIG_KINDS = frozenset({"gw_load_aware", "gw_cache_aware", "tc_router"})
+_PLAIN_CONFIG_KINDS = frozenset({"gw_load_aware", "gw_cache_aware"})
 _MOONCAKE_CONFIG_KINDS = frozenset({"gw_load_aware_mooncake"})
+_TENSORCAST_CONFIG_KINDS = frozenset({"tc_router"})
 
 
 @dataclass(frozen=True)
 class MooncakeBackendOptions:
     extra_config: dict[str, object]
     extra_env: dict[str, str]
+
+
+@dataclass(frozen=True)
+class TensorcastProfileServices:
+    spec: TensorcastLaunchSpec
+    launcher: TensorcastLauncher
+    global_worker: Worker
+    global_store_service: Service
+    daemon_services: tuple[tuple[Worker, Service], ...]
+    global_store_address: tuple[str, int]
+
+    @property
+    def primary_daemon_service(self) -> Service:
+        return self.daemon_services[0][1]
 
 
 def _gateway_extra_args(cfg_spec: ConfigSpec) -> tuple[str, ...]:
@@ -107,6 +126,8 @@ def _serving_profile_for_config(kind: str) -> str:
         return "plain"
     if kind in _MOONCAKE_CONFIG_KINDS:
         return "mooncake"
+    if kind in _TENSORCAST_CONFIG_KINDS:
+        return "tensorcast"
     raise ValueError(f"unknown config kind for serving profile: {kind}")
 
 
@@ -194,6 +215,235 @@ async def _mooncake_backend_options(
     if device_name:
         payload["device_name"] = device_name
     return MooncakeBackendOptions(extra_config=payload, extra_env=extra_env)
+
+
+def _safe_name(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "run"
+
+
+def _model_version(model_path: str) -> str:
+    return hashlib.sha256(str(model_path).encode("utf-8")).hexdigest()[:16]
+
+
+def _daemon_workers_for_placements(
+    placements: list[InstanceAssignment],
+    *,
+    global_store_worker: Worker,
+) -> list[Worker]:
+    daemon_workers: list[Worker] = []
+    seen: set[str] = set()
+    for placement in placements:
+        worker_id = placement.worker.id
+        if worker_id in seen:
+            continue
+        seen.add(worker_id)
+        daemon_workers.append(placement.worker)
+    if global_store_worker.id not in {worker.id for worker in daemon_workers}:
+        daemon_workers.insert(0, global_store_worker)
+    return daemon_workers
+
+
+async def _launch_tensorcast_profile_services(
+    *,
+    cfg_kind: str,
+    bench_cfg: BenchmarkConfig,
+    cluster_provider,
+    placements: list[InstanceAssignment],
+    profile_dir: Path,
+) -> TensorcastProfileServices:
+    cluster_cfg = cluster_provider._config  # type: ignore[attr-defined]
+    workers_by_id = {worker.id: worker for worker in cluster_provider.workers()}
+    global_worker = workers_by_id[cluster_cfg.service_placement.global_store_worker_id]
+    tc_spec = TensorcastLaunchSpec(
+        namespace=bench_cfg.run_id,
+        global_store_port=bench_cfg.tensorcast.global_store_port,
+        daemon_port=bench_cfg.tensorcast.daemon_port,
+        daemon_p2p_port=bench_cfg.tensorcast.daemon_p2p_port,
+        daemon_stable_bytes=bench_cfg.tensorcast.daemon_stable_bytes,
+        config_dir=str(profile_dir / "tensorcast_configs"),
+        log_dir=str(profile_dir / "tensorcast_log"),
+        runtime_home_root=str(profile_dir / "tensorcast_runtime"),
+        enable_rdma=bench_cfg.transport.use_rdma,
+    )
+    launcher = TensorcastLauncher()
+    global_store_service = await launcher.launch_global_store(global_worker, tc_spec)
+    await launcher.wait_global_ready(global_worker, tc_spec, global_store_service)
+    global_store_address = (
+        str(global_store_service.endpoints["advertise_host"]),
+        tc_spec.global_store_port,
+    )
+    daemon_services: list[tuple[Worker, Service]] = []
+    capability_secret = f"tc_router-{bench_cfg.run_id}"
+    try:
+        for worker in _daemon_workers_for_placements(
+            placements,
+            global_store_worker=global_worker,
+        ):
+            logger.info(
+                "[%s] launching tensorcast daemon on %s...", cfg_kind, worker.id
+            )
+            service = await launcher.launch_daemon(
+                worker,
+                tc_spec,
+                global_store_address=global_store_address,
+                capability_token_secret=capability_secret,
+            )
+            await launcher.wait_daemon_ready(worker, tc_spec, service)
+            daemon_services.append((worker, service))
+            logger.info("[%s] daemon ready at %s", cfg_kind, service.endpoints["grpc"])
+    except BaseException:
+        for worker, service in reversed(daemon_services):
+            with suppress(Exception):
+                await launcher.stop_daemon(worker, tc_spec, service)
+        with suppress(Exception):
+            await launcher.stop_global(global_worker, tc_spec, global_store_service)
+        raise
+
+    return TensorcastProfileServices(
+        spec=tc_spec,
+        launcher=launcher,
+        global_worker=global_worker,
+        global_store_service=global_store_service,
+        daemon_services=tuple(daemon_services),
+        global_store_address=global_store_address,
+    )
+
+
+async def _stop_tensorcast_profile_services(
+    services: TensorcastProfileServices | None,
+) -> None:
+    if services is None:
+        return
+    for worker, service in reversed(services.daemon_services):
+        with suppress(Exception):
+            await services.launcher.stop_daemon(worker, services.spec, service)
+    with suppress(Exception):
+        await services.launcher.stop_global(
+            services.global_worker,
+            services.spec,
+            services.global_store_service,
+        )
+
+
+def _tensorcast_backend_extra_config(
+    *,
+    bench_cfg: BenchmarkConfig,
+    tensorcast_profile: TensorcastProfileServices,
+    placement: InstanceAssignment,
+    placement_index: int,
+) -> dict[str, object]:
+    safe_run_id = _safe_name(bench_cfg.run_id)
+    payload: dict[str, object] = {
+        "daemon_address": f"127.0.0.1:{tensorcast_profile.spec.daemon_port}",
+        "namespace": bench_cfg.run_id,
+        "engine": "sglang",
+        "model_id": Path(bench_cfg.model.path).name,
+        "model_version": _model_version(bench_cfg.model.path),
+        "policy_profile": "durable",
+        "instance_directory_address": (
+            f"{tensorcast_profile.global_store_address[0]}:"
+            f"{tensorcast_profile.global_store_address[1]}"
+        ),
+        "instance_agent_execution_endpoint": (
+            f"{placement.worker.address}:"
+            f"{bench_cfg.tensorcast.instance_agent_base_port + placement_index}"
+        ),
+        "instance_agent_start_timeout_s": (
+            bench_cfg.tensorcast.instance_agent_start_timeout_s
+        ),
+        "tensorcast_kv_mode": "explicit_request_transfer",
+        "background_page_publish": False,
+        "ordinary_storage_prefetch": False,
+        "record_host_residency_for_publish": True,
+        "logical_session_id_source": "routing_key",
+    }
+    if bench_cfg.tensorcast.host_allocator_enabled:
+        payload["host_allocator_enabled"] = True
+        payload["host_allocator_region_ttl_ms"] = (
+            bench_cfg.tensorcast.host_allocator_region_ttl_ms
+        )
+        payload["host_allocator_region_name"] = (
+            f"{bench_cfg.tensorcast.host_allocator_region_name_prefix}-"
+            f"{safe_run_id}-{placement_index}"
+        )
+    return payload
+
+
+def _wait_tensorcast_instance_routes_sync(
+    *,
+    daemon_address: str,
+    expected_routes: dict[str, str],
+    timeout_s: float,
+    poll_interval_s: float,
+) -> None:
+    import tensorcast as tc
+
+    runtime = tc.connect(daemon_address=daemon_address)
+    deadline = time.monotonic() + timeout_s
+    last_error = "no probe yet"
+    try:
+        while time.monotonic() < deadline:
+            missing: list[str] = []
+            mismatched: list[str] = []
+            for instance_id, expected_endpoint in expected_routes.items():
+                try:
+                    route = (
+                        runtime.directory()
+                        .resolve_instance_execution(instance_id)
+                        .value
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    missing.append(instance_id)
+                    last_error = f"{instance_id}: {type(exc).__name__}: {exc}"
+                    continue
+                actual_endpoint = str(route.execution_endpoint or "")
+                if expected_endpoint and actual_endpoint != expected_endpoint:
+                    mismatched.append(
+                        f"{instance_id} expected={expected_endpoint} "
+                        f"actual={actual_endpoint}"
+                    )
+            if not missing and not mismatched:
+                return
+            detail = []
+            if missing:
+                detail.append(f"missing={missing}")
+            if mismatched:
+                detail.append(f"mismatched={mismatched}")
+            last_error = "; ".join(detail)
+            time.sleep(poll_interval_s)
+    finally:
+        with suppress(Exception):
+            runtime.close()
+    raise TimeoutError(
+        "Tensorcast instance directory routes not ready within "
+        f"{timeout_s}s: {last_error}"
+    )
+
+
+async def _wait_tensorcast_instance_routes(
+    *,
+    bench_cfg: BenchmarkConfig,
+    tensorcast_profile: TensorcastProfileServices,
+    placements: list[InstanceAssignment],
+    timeout_s: float,
+) -> None:
+    expected_routes = {
+        placement.instance_id: (
+            f"{placement.worker.address}:"
+            f"{bench_cfg.tensorcast.instance_agent_base_port + placement_index}"
+        )
+        for placement_index, placement in enumerate(placements)
+    }
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None,
+        lambda: _wait_tensorcast_instance_routes_sync(
+            daemon_address=tensorcast_profile.primary_daemon_service.endpoints["grpc"],
+            expected_routes=expected_routes,
+            timeout_s=timeout_s,
+            poll_interval_s=2.0,
+        ),
+    )
 
 
 def _now_stamp() -> str:
@@ -284,6 +534,7 @@ async def _launch_sglang_fleet(
     ready_timeout_s: float,
     bind_host: str | None = None,
     mooncake_service: Service | None = None,
+    tensorcast_profile: TensorcastProfileServices | None = None,
 ) -> list:
     """Launch every SGLang instance in parallel, then wait for readiness."""
     services: list[object | None] = [None] * len(placements)
@@ -292,16 +543,30 @@ async def _launch_sglang_fleet(
         extra_args = ("--log-level", bench_cfg.instances.sglang_log_level)
 
     async def launch_one(idx: int, p: InstanceAssignment) -> None:
-        mooncake_extra_config = None
-        mooncake_extra_env: dict[str, str] = {}
+        storage_backend = None
+        storage_extra_config = None
+        storage_extra_env: dict[str, str] = {}
+        hicache_mem_layout = "page_first_direct"
+        hicache_io_backend = "direct"
         if mooncake_service is not None:
             mooncake_options = await _mooncake_backend_options(
                 bench_cfg=bench_cfg,
                 mooncake_service=mooncake_service,
                 worker=p.worker,
             )
-            mooncake_extra_config = mooncake_options.extra_config
-            mooncake_extra_env = mooncake_options.extra_env
+            storage_backend = "mooncake"
+            storage_extra_config = mooncake_options.extra_config
+            storage_extra_env = mooncake_options.extra_env
+        if tensorcast_profile is not None:
+            storage_backend = "tensorcast"
+            storage_extra_config = _tensorcast_backend_extra_config(
+                bench_cfg=bench_cfg,
+                tensorcast_profile=tensorcast_profile,
+                placement=p,
+                placement_index=idx,
+            )
+            hicache_mem_layout = bench_cfg.tensorcast.hicache_mem_layout
+            hicache_io_backend = bench_cfg.tensorcast.hicache_io_backend
         spec = SGLangLaunchSpec(
             model_path=bench_cfg.model.path,
             host=p.worker.address,
@@ -312,13 +577,15 @@ async def _launch_sglang_fleet(
             gpu_indices=p.gpu_indices,
             mem_fraction_static=bench_cfg.instances.mem_fraction_static,
             page_size=bench_cfg.instances.page_size,
-            enable_hierarchical_cache=mooncake_service is not None,
-            hicache_storage_backend=(
-                "mooncake" if mooncake_service is not None else None
+            enable_hierarchical_cache=(
+                mooncake_service is not None or tensorcast_profile is not None
             ),
-            hicache_storage_backend_extra_config=mooncake_extra_config,
+            hicache_mem_layout=hicache_mem_layout,
+            hicache_io_backend=hicache_io_backend,
+            hicache_storage_backend=storage_backend,
+            hicache_storage_backend_extra_config=storage_extra_config,
             extra_args=extra_args,
-            extra_env=mooncake_extra_env,
+            extra_env=storage_extra_env,
         )
         service = await sglang_launcher.launch(p.worker, spec)
         services[idx] = service
@@ -404,6 +671,8 @@ async def _run_one_cell(
     pool,
     sampler: LogNormalSampler,
     router: Router,
+    migrations_path: Path | None = None,
+    post_run_hook: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[RunSummary, dict]:
     cell_dir.mkdir(parents=True, exist_ok=True)
     turns_path = cell_dir / "turns.jsonl"
@@ -425,9 +694,12 @@ async def _run_one_cell(
         )
         outcome = await wd.run()
 
+    if post_run_hook is not None:
+        await post_run_hook()
+
     summary = aggregate_cell(
         turns_path=turns_path,
-        migrations_path=None,
+        migrations_path=migrations_path,
         config=cfg_kind,
         c_target=c_target,
         trial=trial,
@@ -547,158 +819,99 @@ async def _run_tc_router_config(
     *,
     cfg_spec: ConfigSpec,
     bench_cfg: BenchmarkConfig,
-    cluster_provider,
     instance_services: list,
-    placements: list[InstanceAssignment],
+    tensorcast_profile: TensorcastProfileServices,
     pool,
     run_dir: Path,
 ) -> list[RunSummary]:
-    """Phase 7 stub: launch Tensorcast global store + daemon (on the placement's
-    primary worker), connect a TcRouter via the daemon, run the C × trials sweep.
-
-    Migration policy is `_NeverRebalance`: no plans issued, no migrations
-    recorded, but the wiring (poller / runtime / session-state map) is live.
-    """
+    """Run tc_router cells against an already-launched Tensorcast serving profile."""
     cfg_dir = run_dir / cfg_spec.kind
     cfg_dir.mkdir(parents=True, exist_ok=True)
 
-    # Pick the worker that hosts the global store. The cluster YAML's
-    # `service_placement.global_store_worker_id` is the canonical source of
-    # truth; we hit `cluster_provider` to resolve that worker.
-    cluster_cfg = cluster_provider._config  # type: ignore[attr-defined]
-    gs_worker_id = cluster_cfg.service_placement.global_store_worker_id
-    workers_by_id = {w.id: w for w in cluster_provider.workers()}
-    gs_worker = workers_by_id[gs_worker_id]
-    # Daemon-bearing workers are unique by worker_id present in placements.
-    daemon_workers = []
-    seen: set[str] = set()
-    for p in placements:
-        wid = p.worker.id
-        if wid in seen:
-            continue
-        seen.add(wid)
-        daemon_workers.append(p.worker)
-    if gs_worker_id not in {w.id for w in daemon_workers}:
-        # Global store is also where SGLang lives in the smoke setup.
-        daemon_workers.insert(0, gs_worker)
-
-    tc_spec = TensorcastLaunchSpec(
-        namespace=bench_cfg.run_id,
-        config_dir=str(cfg_dir / "tensorcast_configs"),
-        log_dir=str(cfg_dir / "tensorcast_log"),
-        runtime_home_root=str(cfg_dir / "tensorcast_runtime"),
-        enable_rdma=bench_cfg.transport.use_rdma,
-    )
-
-    tc_launcher = TensorcastLauncher()
-    global_store_svc: Optional[object] = None
-    daemon_svcs: list = []
     summary_rows: list[RunSummary] = []
-    try:
-        # 1. Global store
-        logger.info(
-            "[%s] launching tensorcast global store on %s...",
-            cfg_spec.kind,
-            gs_worker.id,
-        )
-        global_store_svc = await tc_launcher.launch_global_store(gs_worker, tc_spec)
-        await tc_launcher.wait_global_ready(gs_worker, tc_spec, global_store_svc)
-        gs_host_port = (
-            str(global_store_svc.endpoints["advertise_host"]),
-            tc_spec.global_store_port,
-        )
-        logger.info("[%s] global store ready at %s:%d", cfg_spec.kind, *gs_host_port)
+    primary_daemon = tensorcast_profile.primary_daemon_service
+    instance_endpoints = {
+        svc.endpoints["instance_id"]: svc.endpoints["serving_http"]
+        for svc in instance_services
+    }
+    instance_log_paths = {
+        str(svc.endpoints["instance_id"]): Path(svc.log_path)
+        for svc in instance_services
+    }
 
-        # 2. Daemons (one per unique worker)
-        capability_secret = f"tc_router-{bench_cfg.run_id}"
-        for w in daemon_workers:
-            logger.info(
-                "[%s] launching tensorcast daemon on %s...", cfg_spec.kind, w.id
+    delay_params = DelayParams.from_preset(
+        Preset(bench_cfg.workload.inter_turn_delay.preset),
+        custom_mu=bench_cfg.workload.inter_turn_delay.custom_mu,
+        custom_sigma=bench_cfg.workload.inter_turn_delay.custom_sigma,
+    )
+    for c_target in bench_cfg.workload.c_target_sweep:
+        for trial in range(bench_cfg.workload.trials):
+            cell_dir = cfg_dir / f"c{c_target}" / f"trial{trial}"
+            migrations_path = cell_dir / "migrations.jsonl"
+            sampler = LogNormalSampler(
+                delay_params,
+                seed=hash((cfg_spec.kind, c_target, trial)) & 0xFFFFFFFF,
             )
-            svc = await tc_launcher.launch_daemon(
-                w,
-                tc_spec,
-                global_store_address=gs_host_port,
-                capability_token_secret=capability_secret,
+            print(f"[run] {cfg_spec.kind} c={c_target} trial={trial} -> {cell_dir}")
+            await _flush_sglang_instances(
+                instance_services,
+                label=f"{cfg_spec.kind} c={c_target} trial={trial}",
             )
-            await tc_launcher.wait_daemon_ready(w, tc_spec, svc)
-            daemon_svcs.append((w, svc))
-            logger.info("[%s] daemon ready at %s", cfg_spec.kind, svc.endpoints["grpc"])
-
-        # 3. TcRouter connection target. For multi-worker setups we pick the
-        # first daemon; its directory connects to the global store, which sees
-        # all daemons.
-        primary_daemon = daemon_svcs[0][1]
-        instance_endpoints = {
-            svc.endpoints["instance_id"]: svc.endpoints["serving_http"]
-            for svc in instance_services
-        }
-        tc_router_cfg = TcRouterConfig(
-            instance_endpoints=instance_endpoints,
-            default_model=bench_cfg.model.path,
-            daemon_address=primary_daemon.endpoints["grpc"],
-            request_timeout_s=600.0,
-            load_polling_period_ms=bench_cfg.load_polling.period_ms,
-        )
-
-        # 4. Sweep cells
-        delay_params = DelayParams.from_preset(
-            Preset(bench_cfg.workload.inter_turn_delay.preset),
-            custom_mu=bench_cfg.workload.inter_turn_delay.custom_mu,
-            custom_sigma=bench_cfg.workload.inter_turn_delay.custom_sigma,
-        )
-        for c_target in bench_cfg.workload.c_target_sweep:
-            for trial in range(bench_cfg.workload.trials):
-                cell_dir = cfg_dir / f"c{c_target}" / f"trial{trial}"
-                sampler = LogNormalSampler(
-                    delay_params,
-                    seed=hash((cfg_spec.kind, c_target, trial)) & 0xFFFFFFFF,
-                )
-                print(f"[run] {cfg_spec.kind} c={c_target} trial={trial} -> {cell_dir}")
-                await _flush_sglang_instances(
+            if bench_cfg.tensorcast.clear_storage_between_cells:
+                await _clear_sglang_hicache_storage(
                     instance_services,
                     label=f"{cfg_spec.kind} c={c_target} trial={trial}",
                 )
 
-                policy = make_policy(cfg_spec.policy)
-                tc_router = TcRouter(tc_router_cfg, policy=policy)
-                try:
-                    await tc_router.start()
-                    logger.info(
-                        "[%s] TcRouter ready (policy=%s, daemon=%s, %d instances)",
-                        cfg_spec.kind,
-                        policy.name,
-                        primary_daemon.endpoints["grpc"],
-                        len(instance_endpoints),
+            policy = make_policy(cfg_spec.policy)
+            tc_router_cfg = TcRouterConfig(
+                instance_endpoints=instance_endpoints,
+                default_model=bench_cfg.model.path,
+                daemon_address=primary_daemon.endpoints["grpc"],
+                request_timeout_s=600.0,
+                load_polling_period_ms=bench_cfg.load_polling.period_ms,
+                migrations_path=str(migrations_path),
+            )
+            tc_router = TcRouter(tc_router_cfg, policy=policy)
+            try:
+                await tc_router.start()
+                logger.info(
+                    "[%s] TcRouter ready (policy=%s, daemon=%s, %d instances)",
+                    cfg_spec.kind,
+                    policy.name,
+                    primary_daemon.endpoints["grpc"],
+                    len(instance_endpoints),
+                )
+
+                async def finalize_and_verify_migrations() -> None:
+                    await tc_router.finalize_migrations()
+                    await verify_prepared_bundle_signals_for_migrations(
+                        migrations_path=migrations_path,
+                        instance_log_paths=instance_log_paths,
                     )
-                    summary, info = await _run_one_cell(
-                        cell_dir=cell_dir,
-                        cfg_kind=cfg_spec.kind,
-                        c_target=c_target,
-                        trial=trial,
-                        bench_cfg=bench_cfg,
-                        pool=pool,
-                        sampler=sampler,
-                        router=tc_router,
-                    )
-                    summary_rows.append(summary)
-                    print(
-                        f"  -> turns={info['total_turns']} "
-                        f"(success={info['successful_turns']}, fail={info['failed_turns']}); "
-                        f"ttft p50={summary.ttft_p50_ms} p95={summary.ttft_p95_ms} "
-                        f"cached_ratio={summary.cached_token_ratio_mean}"
-                    )
-                finally:
-                    with suppress(Exception):
-                        await tc_router.close()
-    finally:
-        # Stop daemons first, then global store.
-        for w, svc in reversed(daemon_svcs):
-            with suppress(Exception):
-                await tc_launcher.stop_daemon(w, tc_spec, svc)
-        if global_store_svc is not None:
-            with suppress(Exception):
-                await tc_launcher.stop_global(gs_worker, tc_spec, global_store_svc)
+
+                summary, info = await _run_one_cell(
+                    cell_dir=cell_dir,
+                    cfg_kind=cfg_spec.kind,
+                    c_target=c_target,
+                    trial=trial,
+                    bench_cfg=bench_cfg,
+                    pool=pool,
+                    sampler=sampler,
+                    router=tc_router,
+                    migrations_path=migrations_path,
+                    post_run_hook=finalize_and_verify_migrations,
+                )
+                summary_rows.append(summary)
+                print(
+                    f"  -> turns={info['total_turns']} "
+                    f"(success={info['successful_turns']}, fail={info['failed_turns']}); "
+                    f"ttft p50={summary.ttft_p50_ms} p95={summary.ttft_p95_ms} "
+                    f"cached_ratio={summary.cached_token_ratio_mean}"
+                )
+            finally:
+                with suppress(Exception):
+                    await tc_router.close()
     return summary_rows
 
 
@@ -809,6 +1022,7 @@ async def run_benchmark(
             mooncake_worker: Worker | None = None
             mooncake_launcher: MooncakeLauncher | None = None
             mooncake_service: Service | None = None
+            tensorcast_profile: TensorcastProfileServices | None = None
             instance_services: list = []
             try:
                 if profile == "mooncake":
@@ -825,6 +1039,19 @@ async def run_benchmark(
                         "[run_benchmark] Mooncake master ready at "
                         f"{mooncake_service.endpoints['master_server_address']}"
                     )
+                if profile == "tensorcast":
+                    print("[run_benchmark] launching Tensorcast profile services...")
+                    tensorcast_profile = await _launch_tensorcast_profile_services(
+                        cfg_kind="tc_router",
+                        bench_cfg=bench_cfg,
+                        cluster_provider=provider,
+                        placements=placements,
+                        profile_dir=run_dir / "tc_router",
+                    )
+                    print(
+                        "[run_benchmark] Tensorcast services ready; primary daemon "
+                        f"at {tensorcast_profile.primary_daemon_service.endpoints['grpc']}"
+                    )
 
                 print(
                     f"[run_benchmark] launching {len(placements)} SGLang instances "
@@ -838,14 +1065,27 @@ async def run_benchmark(
                     sglang_launcher=sglang_launcher,
                     ready_timeout_s=sglang_ready_timeout_s,
                     bind_host=(
-                        "0.0.0.0" if cluster_cfg.provider.kind == "static" else None
+                        "0.0.0.0"
+                        if cluster_cfg.provider.kind == "static"
+                        and profile != "tensorcast"
+                        else None
                     ),
                     mooncake_service=mooncake_service,
+                    tensorcast_profile=tensorcast_profile,
                 )
                 print(
                     "[run_benchmark] SGLang instances ready in "
                     f"{time.monotonic() - t0:.1f}s (profile={profile})"
                 )
+                if tensorcast_profile is not None:
+                    print("[run_benchmark] waiting for Tensorcast instance routes...")
+                    await _wait_tensorcast_instance_routes(
+                        bench_cfg=bench_cfg,
+                        tensorcast_profile=tensorcast_profile,
+                        placements=placements,
+                        timeout_s=180.0,
+                    )
+                    print("[run_benchmark] Tensorcast instance routes ready")
 
                 for cfg_spec in profile_configs:
                     try:
@@ -862,12 +1102,15 @@ async def run_benchmark(
                                 ),
                             )
                         elif cfg_spec.kind == "tc_router":
+                            if tensorcast_profile is None:
+                                raise RuntimeError(
+                                    "tc_router requires tensorcast profile services"
+                                )
                             rows = await _run_tc_router_config(
                                 cfg_spec=cfg_spec,
                                 bench_cfg=bench_cfg,
-                                cluster_provider=provider,
                                 instance_services=instance_services,
-                                placements=placements,
+                                tensorcast_profile=tensorcast_profile,
                                 pool=pool,
                                 run_dir=run_dir,
                             )
@@ -901,6 +1144,10 @@ async def run_benchmark(
                     print("[run_benchmark] tearing down Mooncake master...")
                     with suppress(Exception):
                         await mooncake_launcher.stop(mooncake_worker, mooncake_service)
+                if tensorcast_profile is not None:
+                    print("[run_benchmark] tearing down Tensorcast services...")
+                    with suppress(Exception):
+                        await _stop_tensorcast_profile_services(tensorcast_profile)
 
         # Per-run summary
         write_summary_csv(summary_rows, run_dir / "summary.csv")

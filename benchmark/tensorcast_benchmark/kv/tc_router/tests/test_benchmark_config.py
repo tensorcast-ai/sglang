@@ -134,6 +134,89 @@ def test_mooncake_config_rejects_duplicate_ports(tmp_path: Path) -> None:
         load_benchmark_yaml(_write(tmp_path, bad))
 
 
+def test_tensorcast_config_parses_allocator_mode(tmp_path: Path) -> None:
+    data = copy.deepcopy(GOOD)
+    data["configs"] = [{"kind": "tc_router"}]
+    data["tensorcast"] = {
+        "global_store_port": 61050,
+        "daemon_port": 61053,
+        "daemon_p2p_port": 61090,
+        "instance_agent_base_port": 61400,
+        "instance_agent_start_timeout_s": 180,
+        "daemon_stable_bytes": "16GB",
+        "clear_storage_between_cells": True,
+        "hicache_mem_layout": "page_blob_direct",
+        "hicache_io_backend": "direct",
+        "host_allocator_enabled": True,
+        "host_allocator_region_ttl_ms": 600000,
+        "host_allocator_region_name_prefix": "tc_router_sglang_host_pool",
+    }
+
+    cfg = load_benchmark_yaml(_write(tmp_path, data))
+
+    assert cfg.configs[0].kind == "tc_router"
+    assert cfg.tensorcast.host_allocator_enabled is True
+    assert cfg.tensorcast.hicache_mem_layout == "page_blob_direct"
+    assert cfg.tensorcast.hicache_io_backend == "direct"
+    assert cfg.tensorcast.instance_agent_start_timeout_s == 180
+
+
+def test_tensorcast_allocator_requires_page_blob_direct(tmp_path: Path) -> None:
+    bad = copy.deepcopy(GOOD)
+    bad["configs"] = [{"kind": "tc_router"}]
+    bad["tensorcast"] = {
+        "host_allocator_enabled": True,
+        "hicache_mem_layout": "page_first_direct",
+        "hicache_io_backend": "direct",
+    }
+
+    with pytest.raises(Exception, match="page_blob_direct"):
+        load_benchmark_yaml(_write(tmp_path, bad))
+
+
+def test_tensorcast_allocator_requires_direct_io(tmp_path: Path) -> None:
+    bad = copy.deepcopy(GOOD)
+    bad["configs"] = [{"kind": "tc_router"}]
+    bad["tensorcast"] = {
+        "host_allocator_enabled": True,
+        "hicache_mem_layout": "page_blob_direct",
+        "hicache_io_backend": "kernel",
+    }
+
+    with pytest.raises(Exception, match="direct"):
+        load_benchmark_yaml(_write(tmp_path, bad))
+
+
+def test_tensorcast_instance_agent_port_overflow_rejected(tmp_path: Path) -> None:
+    bad = copy.deepcopy(GOOD)
+    bad["configs"] = [{"kind": "tc_router"}]
+    bad["instances"]["count"] = 3
+    bad["tensorcast"] = {"instance_agent_base_port": 65534}
+
+    with pytest.raises(Exception, match="instance_agent_base_port"):
+        load_benchmark_yaml(_write(tmp_path, bad))
+
+
+def test_tensorcast_port_collision_rejected_for_tc_router(tmp_path: Path) -> None:
+    bad = copy.deepcopy(GOOD)
+    bad["configs"] = [{"kind": "tc_router"}]
+    bad["tensorcast"] = {"global_store_port": bad["instances"]["base_port"]}
+
+    with pytest.raises(Exception, match="port collision"):
+        load_benchmark_yaml(_write(tmp_path, bad))
+
+
+def test_tensorcast_default_ports_not_consumed_by_gateway_only(tmp_path: Path) -> None:
+    data = copy.deepcopy(GOOD)
+    data["configs"] = [{"kind": "gw_load_aware"}]
+    data["gateway"] = {"host": "127.0.0.1", "port": 61050}
+
+    cfg = load_benchmark_yaml(_write(tmp_path, data))
+
+    assert cfg.configs[0].kind == "gw_load_aware"
+    assert cfg.gateway.port == 61050
+
+
 def test_extra_field_rejected(tmp_path: Path) -> None:
     bad = copy.deepcopy(GOOD)
     bad["unexpected"] = "x"
@@ -269,6 +352,25 @@ def test_shipped_static_tc_router_8inst_tp2_yaml_parses() -> None:
     assert (
         cfg.workload.dataset_path == "/mnt/data/dataset/OpenHands-Sampled-Trajectories"
     )
+
+
+def test_shipped_static_tc_router_migration_smoke_yaml_parses() -> None:
+    p = (
+        Path(__file__).resolve().parent.parent
+        / "configs"
+        / "benchmark_static_tc_router_migration_smoke_4inst_tp2.yaml"
+    )
+    cfg = load_benchmark_yaml(p)
+    assert cfg.run_id == "static-tc-router-migration-smoke-4inst-tp2"
+    assert cfg.configs[0].kind == "tc_router"
+    assert cfg.configs[0].policy["kind"] == "migrate_once_after_turn"
+    assert cfg.model.path == "/mnt/data/models/Qwen3-32B"
+    assert cfg.model.tp_size == 2
+    assert cfg.instances.count == 4
+    assert cfg.transport.use_rdma is True
+    assert cfg.tensorcast.host_allocator_enabled is True
+    assert cfg.tensorcast.hicache_mem_layout == "page_blob_direct"
+    assert cfg.tensorcast.hicache_io_backend == "direct"
 
 
 def test_shipped_static_mooncake_4inst_tp2_yaml_parses() -> None:

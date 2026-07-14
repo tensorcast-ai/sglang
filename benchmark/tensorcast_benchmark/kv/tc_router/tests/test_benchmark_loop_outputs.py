@@ -10,8 +10,13 @@ from tensorcast_benchmark.kv.tc_router.driver.benchmark_loop import (
     _cluster_config_for_run,
     _derive_nccl_port,
     _save_resolved_configs,
+    _serving_profile_for_config,
+    _serving_profiles_for_configs,
 )
-from tensorcast_benchmark.kv.tc_router.driver.config import load_benchmark_yaml
+from tensorcast_benchmark.kv.tc_router.driver.config import (
+    ConfigSpec,
+    load_benchmark_yaml,
+)
 from tensorcast_benchmark.kv.tc_router.resource.base import load_cluster_config
 
 
@@ -143,3 +148,17 @@ def test_save_resolved_configs_writes_effective_cluster_yaml(tmp_path: Path) -> 
 def test_derive_nccl_port_uses_nearby_non_serving_port() -> None:
     assert _derive_nccl_port(65101) == 65201
     assert _derive_nccl_port(65500) == 65400
+
+
+def test_tc_router_uses_tensorcast_serving_profile() -> None:
+    assert _serving_profile_for_config("gw_load_aware") == "plain"
+    assert _serving_profile_for_config("gw_cache_aware") == "plain"
+    assert _serving_profile_for_config("gw_load_aware_mooncake") == "mooncake"
+    assert _serving_profile_for_config("tc_router") == "tensorcast"
+    assert _serving_profiles_for_configs(
+        [
+            ConfigSpec(kind="gw_load_aware"),
+            ConfigSpec(kind="tc_router"),
+            ConfigSpec(kind="gw_load_aware_mooncake"),
+        ]
+    ) == ["plain", "tensorcast", "mooncake"]

@@ -33,6 +33,9 @@ class Policy(Protocol):
     """Pluggable routing policy. All hooks are pure (no I/O)."""
 
     name: str
+    pending_migration_wait_timeout_s: float
+    plan_deadline_ms: int
+    publish_ttl_ms: int
 
     def should_rebalance(
         self,
@@ -108,6 +111,9 @@ class _NeverRebalance:
 
     name: str = "NeverRebalance"
     seed: int = 0
+    pending_migration_wait_timeout_s: float = 0.0
+    plan_deadline_ms: int = 30_000
+    publish_ttl_ms: int = 600_000
 
     def __post_init__(self) -> None:
         self._rng = random.Random(self.seed)
@@ -146,11 +152,119 @@ class _NeverRebalance:
         return False
 
 
+@dataclass
+class MigrateOnceAfterTurnPolicy:
+    """Correctness policy: migrate each eligible session at most once."""
+
+    name: str = "MigrateOnceAfterTurnPolicy"
+    seed: int = 0
+    after_turn_count: int = 1
+    target_strategy: str = "next_instance"
+    max_migrations_per_session: int = 1
+    pending_migration_wait_timeout_s: float = 30.0
+    plan_deadline_ms: int = 30_000
+    publish_ttl_ms: int = 600_000
+
+    def __post_init__(self) -> None:
+        if self.after_turn_count < 1:
+            raise ValueError("after_turn_count must be >= 1")
+        if self.max_migrations_per_session < 1:
+            raise ValueError("max_migrations_per_session must be >= 1")
+        if self.target_strategy not in {"next_instance", "least_loaded"}:
+            raise ValueError(
+                "target_strategy must be one of: next_instance, least_loaded"
+            )
+        if self.pending_migration_wait_timeout_s < 0:
+            raise ValueError("pending_migration_wait_timeout_s must be >= 0")
+        if self.plan_deadline_ms <= 0:
+            raise ValueError("plan_deadline_ms must be > 0")
+        if self.publish_ttl_ms <= 0:
+            raise ValueError("publish_ttl_ms must be > 0")
+        self._rng = random.Random(self.seed)
+
+    def should_rebalance(
+        self,
+        loads: Mapping[InstanceId, LoadSample],
+        sessions: Mapping[SessionId, SessionState],
+        now_ts: float,
+    ) -> list[MigrationDecision]:
+        decisions: list[MigrationDecision] = []
+        candidates = sorted(
+            set(loads) | {session.home_instance for session in sessions.values()}
+        )
+        for session in sessions.values():
+            if not self.should_consider_session_for_migration(session, now_ts):
+                continue
+            target = self.pick_target_instance(session, candidates, loads)
+            if target == session.home_instance:
+                continue
+            decisions.append(
+                MigrationDecision(
+                    session_id=session.session_id,
+                    source_instance=session.home_instance,
+                    target_instance=target,
+                    decided_by=self.name,
+                )
+            )
+        return decisions
+
+    def pick_target_instance(
+        self,
+        session: SessionState,
+        candidates: Sequence[InstanceId],
+        loads: Mapping[InstanceId, LoadSample],
+    ) -> InstanceId:
+        non_source = [
+            candidate for candidate in candidates if candidate != session.home_instance
+        ]
+        if not non_source:
+            return session.home_instance
+        if self.target_strategy == "least_loaded":
+            return min(
+                non_source,
+                key=lambda instance_id: (
+                    loads[instance_id].queue_depth if instance_id in loads else 0
+                ),
+            )
+        ordered = sorted(candidates)
+        try:
+            idx = ordered.index(session.home_instance)
+        except ValueError:
+            return non_source[0]
+        for offset in range(1, len(ordered) + 1):
+            candidate = ordered[(idx + offset) % len(ordered)]
+            if candidate != session.home_instance:
+                return candidate
+        return session.home_instance
+
+    def pick_session_for_initial_home(
+        self,
+        session_id: SessionId,
+        candidates: Sequence[InstanceId],
+        loads: Mapping[InstanceId, LoadSample],
+    ) -> InstanceId:
+        return power_of_two_pick(candidates, loads, self._rng)
+
+    def should_consider_session_for_migration(
+        self,
+        session: SessionState,
+        now_ts: float,
+    ) -> bool:
+        return (
+            bool(session.home_instance)
+            and bool(session.last_engine_request_id)
+            and session.turn_count >= self.after_turn_count
+            and session.pending_migration is None
+            and session.migration_attempt_count < self.max_migrations_per_session
+        )
+
+
 def make_policy(spec: Optional[dict]) -> Policy:
     """Build a Policy from a `benchmark.yaml`-style `policy:` dict.
 
-    Phase 7 supports only `kind: never_rebalance` (or absent → default to
-    NeverRebalance). Later phases register threshold / eager / etc. here.
+    `never_rebalance` preserves the Phase 7 sticky stub. Phase 8 adds
+    `migrate_once_after_turn` to validate the migration primitive before
+    tuning a real load-aware policy.
     """
     if spec is None:
         return _NeverRebalance()
@@ -158,6 +272,19 @@ def make_policy(spec: Optional[dict]) -> Policy:
     if kind in {"never_rebalance", "never", "stub"}:
         seed = int(spec.get("seed", 0))
         return _NeverRebalance(seed=seed)
+    if kind in {"migrate_once_after_turn", "migrate_once", "migration_smoke"}:
+        return MigrateOnceAfterTurnPolicy(
+            seed=int(spec.get("seed", 0)),
+            after_turn_count=int(spec.get("after_turn_count", 1)),
+            target_strategy=str(spec.get("target_strategy", "next_instance")),
+            max_migrations_per_session=int(spec.get("max_migrations_per_session", 1)),
+            pending_migration_wait_timeout_s=float(
+                spec.get("pending_migration_wait_timeout_s", 30.0)
+            ),
+            plan_deadline_ms=int(spec.get("plan_deadline_ms", 30_000)),
+            publish_ttl_ms=int(spec.get("publish_ttl_ms", 600_000)),
+        )
     raise ValueError(
-        f"unknown policy kind {kind!r}; Phase 7 supports only 'never_rebalance'"
+        "unknown policy kind "
+        f"{kind!r}; supported: 'never_rebalance', 'migrate_once_after_turn'"
     )

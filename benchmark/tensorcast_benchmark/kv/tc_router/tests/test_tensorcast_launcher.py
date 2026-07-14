@@ -13,6 +13,7 @@ from tensorcast_benchmark.kv.tc_router.services.tensorcast import (
     _is_loopback_or_unspecified_host,
     _service_cmd,
     _tensorcast_advertise_host,
+    render_daemon_config,
 )
 
 
@@ -106,3 +107,18 @@ def test_loopback_or_unspecified_host_detection() -> None:
     assert _is_loopback_or_unspecified_host("0.0.0.0")
     assert _is_loopback_or_unspecified_host("localhost")
     assert not _is_loopback_or_unspecified_host("10.0.10.49")
+
+
+def test_render_daemon_config_enables_gateway_ingress() -> None:
+    spec = TensorcastLaunchSpec(namespace="unit")
+
+    cfg = render_daemon_config(
+        spec,
+        advertise_host="10.0.10.49",
+        global_store_endpoint=("10.0.10.49", 61050),
+        log_path="/tmp/tensorcast.log",
+        capability_token_secret="secret",
+    )
+
+    assert cfg["capability_directory"]["enabled"] is True
+    assert cfg["capability_directory"]["gateway_ingress_enabled"] is True

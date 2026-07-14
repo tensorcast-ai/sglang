@@ -70,6 +70,7 @@ async def chat_completion_stream(
     *,
     base_url: str,
     body: dict,
+    headers: dict[str, str] | None = None,
 ) -> GenerateResult:
     """POST `body` to `<base_url>/v1/chat/completions` (streaming) and return GenerateResult.
 
@@ -84,7 +85,7 @@ async def chat_completion_stream(
     served_instance = ""
 
     try:
-        async with session.post(url, json=body, proxy=None) as resp:
+        async with session.post(url, json=body, headers=headers, proxy=None) as resp:
             if resp.status != 200:
                 err_text = await resp.text()
                 return GenerateResult(

@@ -57,8 +57,12 @@ The model, TP size, instance count, placement plan, and workload are
 identical across configs. The serving launch profile is identical for
 the plain gateway baselines (`gw_load_aware`, `gw_cache_aware`). The
 Mooncake baseline uses the same fleet shape but starts SGLang with
-HiCache backed by Mooncake. The Tensorcast router uses the same plain
-SGLang fleet shape plus Tensorcast services and an in-process router.
+HiCache backed by Mooncake. The Tensorcast router uses the same placement
+plan and TP shape, but it is a distinct Tensorcast serving profile:
+SGLang starts with Tensorcast HiCache in explicit request-transfer mode,
+one Tensorcast daemon runs on each worker, a global store runs on the
+configured service worker, and the in-process router drives
+`publish` / `hydrate` plans through the Tensorcast runtime.
 
 `gw_load_aware_mooncake` is the most important baseline: it tells us
 whether the win comes from "anyone can pull prefix pages out of a shared
@@ -640,6 +644,48 @@ The benchmark intentionally does **not** set Mooncake
 `prefetch_threshold`; SGLang's default value is used so this baseline
 tracks upstream SGLang behavior rather than a benchmark-specific tuning.
 
+#### 6.2.2 Session identity for Tensorcast request migration
+
+The Tensorcast router uses the OpenAI-compatible
+`/v1/chat/completions` endpoint directly on each selected SGLang
+instance. It does **not** extend the OpenAI request JSON body with a
+benchmark-specific session field. Instead, every request that tc_router
+sends to SGLang carries:
+
+```http
+X-SMG-Routing-Key: <session_id>
+```
+
+SGLang already extracts this header into its internal `routing_key`.
+When the Tensorcast HiCache backend is configured with:
+
+```json
+{
+  "tensorcast_kv_mode": "explicit_request_transfer",
+  "logical_session_id_source": "routing_key"
+}
+```
+
+the request-bundle manager records the same value as
+`logical_session_id`. This gives the source instance enough metadata to
+publish a bundle for "the latest request of session S", and gives the
+target instance enough metadata to find the longest prepared-prefix
+bundle for the next request of session S.
+
+The benchmark's `rid` remains the per-turn engine request id:
+
+```text
+tcrouter:<session_id>:turn<turn_index>
+```
+
+`rid` is used for `publish(engine_request_id=...)` and for per-turn
+traceability. It is intentionally **not** the primary session contract.
+The routing-key header is the primary session contract because it avoids
+embedding a tc_router-specific `rid` parser inside SGLang. A
+deployment that cannot set `X-SMG-Routing-Key` may opt into SGLang's
+configured `logical_session_id_rid_regex` fallback, but that fallback is
+not used by this benchmark.
+
 ### 6.3 Internal contract of `tc_router`
 
 The Tensorcast router maintains:
@@ -660,20 +706,31 @@ The Tensorcast router maintains:
 
 On each `generate(rid, session_id, messages, tools, ...)` call:
 
-1. Resolve target instance:
+1. If `session_id` has a pending migration, wait for that migration up to
+   `pending_migration_wait_timeout_s`. This is required for the E2E
+   migration smoke test: the first post-migration turn should not race
+   ahead to the old home before `hydrate` finishes.
+2. Resolve target instance:
    - if `session_id` has a `home_instance`, route there
-   - else assign `home_instance` (round-robin or load-aware among
-     instances) and route there
-2. Use the workload-provided unique `rid` for this turn, store it as
-   `session_state[session_id].last_engine_request_id`, then post the
-   chat-completions request to the chosen instance with body field
-   `rid`. Record per-turn metrics.
-3. Update `last_active_ts`, `turn_count`, `last_prompt_tokens`.
-4. **Asynchronously** invoke `Rebalancer.maybe_rebalance(...)`. This
-   never blocks the response.
+   - else assign `home_instance` using the policy's initial-placement hook
+     and route there
+3. Build the OpenAI chat-completions request with the workload-provided
+   unique `rid` in the SGLang `rid` field.
+4. POST to the chosen instance with `X-SMG-Routing-Key: <session_id>`.
+   This is the only session-scoped metadata sent to SGLang.
+5. Record per-turn metrics. If this turn consumed the next request after
+   a successful migration, set `was_just_migrated=true`; if the request's
+   `cached_tokens > 0` and the router has a matching consumed migration,
+   set `used_hydrated_bundle=true`.
+6. On success, update `last_active_ts`, `turn_count`,
+   `last_prompt_tokens`, and `last_engine_request_id = rid`.
+7. Let the policy decide whether a migration should be scheduled. The
+   initial E2E smoke policy schedules immediately after a successful
+   source turn; later load-aware policies may schedule from a background
+   tick.
 
-A background `Rebalancer` task ticks every `rebalance_period_ms` (default
-500 ms):
+The full rebalancer path is a background task that ticks every
+`rebalance_period_ms` (default 500 ms):
 
 1. Refresh `instance_loads`.
 2. Call `policy.should_rebalance(instance_loads, session_state) ->
@@ -686,6 +743,14 @@ A background `Rebalancer` task ticks every `rebalance_period_ms` (default
 4. The rebalancer respects a per-session cooldown so the same session is
    not migrated back and forth within `migration_cooldown_s` (default
    30 s).
+
+The first runnable migration implementation is allowed to use the same
+execution machinery without a sophisticated background policy. A
+`migrate_once_after_turn` smoke policy may schedule exactly one migration
+for a session immediately after `turn_count >= after_turn_count` and
+`last_engine_request_id` is available. This separates the correctness of
+session-scoped request migration from the quality of the future
+load-balancing policy.
 
 ### 6.4 Policy interface
 
@@ -721,7 +786,24 @@ class Policy(Protocol):
     ) -> bool: ...
 ```
 
-v1 ships **one** concrete `ThresholdPolicy`:
+The policy module must support three layers:
+
+- `NeverRebalance`: baseline/stub policy. It assigns initial homes using
+  the same power-of-two load-aware rule as `gw_load_aware`, never
+  proposes migrations, and is the regression guard that tc_router can
+  behave like a normal sticky load-aware router.
+- `MigrateOnceAfterTurnPolicy`: E2E correctness policy. It is not meant
+  to be a good load-balancer. It picks an initial home, waits until a
+  session has completed `after_turn_count` successful turns, then
+  migrates that session once to a different instance. Target selection is
+  deterministic (`next_instance`) or least-loaded among non-source
+  candidates. This policy is the validation gate for Tensorcast
+  `publish` / `hydrate` and session-scoped prepared-bundle reuse.
+- `ThresholdPolicy`: headline experiment policy. It is the first
+  programmable load-aware policy and can be tuned after the migration
+  primitive is correct.
+
+`ThresholdPolicy` behavior:
 
 - `should_rebalance`: if `max_load / min_load > rebalance_ratio` and
   `max_load - min_load > rebalance_abs`, select up to
@@ -740,11 +822,128 @@ mechanism by which user-space programmability is demonstrated.
 
 ### 6.5 Migration mechanic
 
+#### 6.5.1 Required SGLang serving profile
+
+`tc_router` request migration requires SGLang to be launched in
+Tensorcast explicit request-transfer mode. Starting Tensorcast services
+beside a plain SGLang fleet is insufficient: the source instance would
+not record publishable request-bundle state, the target instance would
+not run prepared-bundle admission, and the Tensorcast directory would
+not know how to execute `plan.on_instance(...)`.
+
+For a tc_router config, the driver must therefore use a dedicated
+`tensorcast` serving profile with this startup order:
+
+1. Plan SGLang placements exactly as the gateway baselines do.
+2. Start the Tensorcast global store on
+   `cluster.yaml.service_placement.global_store_worker_id`.
+3. Start one Tensorcast daemon on every worker that hosts at least one
+   SGLang instance. The daemon's advertised address must be reachable
+   from the driver and from other daemons.
+4. Launch every SGLang instance with Tensorcast HiCache enabled and an
+   instance-agent execution endpoint assigned to that logical instance.
+5. Wait for both OpenAI serving readiness and Tensorcast directory
+   readiness before starting workload traffic.
+
+The SGLang CLI flags are:
+
+```bash
+--enable-hierarchical-cache
+--hicache-storage-backend tensorcast
+--hicache-storage-backend-extra-config '<json>'
+```
+
+The extra config is a flat JSON object:
+
+```jsonc
+{
+  "daemon_address": "127.0.0.1:61053",
+  "namespace": "<run_id>",
+  "engine": "sglang",
+  "model_id": "Qwen3-32B",
+  "model_version": "<stable-model-version>",
+  "policy_profile": "durable",
+  "instance_directory_address": "<global_store_advertise_host>:61050",
+  "instance_agent_execution_endpoint": "<worker_address>:<agent_port>",
+  "tensorcast_kv_mode": "explicit_request_transfer",
+  "background_page_publish": false,
+  "ordinary_storage_prefetch": false,
+  "record_host_residency_for_publish": true,
+  "logical_session_id_source": "routing_key"
+}
+```
+
+`daemon_address` is from the SGLang process to its worker-local daemon.
+For the current static/local deployments, that should be
+`127.0.0.1:<daemon_port>` because the daemon runs on the same worker as
+the SGLang process. The router's `tc.connect(...)` target is separate:
+it connects to the first daemon's driver-reachable advertised address.
+That daemon's directory view resolves all workers through the global
+store.
+
+`instance_directory_address` is the global store's advertised
+`<host>:<port>`, not a local loopback address, because remote workers
+must register their SGLang instances into the same global directory.
+
+`instance_agent_execution_endpoint` must be a worker-reachable endpoint
+dedicated to the SGLang instance-agent sidecar. The benchmark should
+derive it deterministically from a base port plus placement index, for
+example `<worker.address>:<instance_agent_base_port + i>`. The endpoint
+must not collide with the serving HTTP port, Tensorcast daemon port,
+daemon P2P port, Mooncake ports, or NCCL ports.
+
+The logical Tensorcast `instance_id` for request-level transfer is the
+whole SGLang serving instance / TP group:
+
+```text
+<server_args.host>:<server_args.port>
+```
+
+For tc_router runs, `server_args.host` must be the same worker-reachable
+host used by the benchmark's `instance_endpoints` map. If the process is
+launched with `--host 0.0.0.0`, SGLang would register
+`0.0.0.0:<port>` while the router tries to resolve
+`<worker.address>:<port>`, and `resolve_instance_execution()` would fail.
+The tensorcast profile should therefore bind SGLang to `worker.address`
+unless the SGLang integration grows a separate explicit
+`instance_id` override.
+
+After all SGLang instances report HTTP readiness, the driver performs a
+Tensorcast directory readiness gate:
+
+```python
+runtime = tc.connect(daemon_address=primary_daemon_address)
+for instance_id in instance_endpoints:
+    runtime.directory().resolve_instance_execution(instance_id)
+```
+
+All instance routes must resolve before the cell sweep begins. This gate
+catches missing `instance_directory_address`, bad instance-agent
+endpoints, host/port identity mismatches, and stale directory state
+before workload traffic starts.
+
+#### 6.5.2 Publish and hydrate plan shape
+
 For session `S` with `home_instance = A` and target instance `B`:
 
 ```python
 # Inside the rebalancer task; never on the request hot path.
 last_rid = session_state[S].last_engine_request_id
+
+source_route = runtime.directory().resolve_instance_execution(A).value
+target_route = runtime.directory().resolve_instance_execution(B).value
+source_instance = tc.Instance(
+    instance_id=source_route.instance_id,
+    daemon_id=source_route.daemon_id,
+    engine=source_route.engine or "sglang",
+    execution_endpoint=source_route.execution_endpoint,
+)
+target_instance = tc.Instance(
+    instance_id=target_route.instance_id,
+    daemon_id=target_route.daemon_id,
+    engine=target_route.engine or "sglang",
+    execution_endpoint=target_route.execution_endpoint,
+)
 
 ctx_pub = tc.context(
     request_id=f"migrate-pub:{S}:{epoch}",
@@ -752,7 +951,7 @@ ctx_pub = tc.context(
     deadline_ms=15_000,
 )
 plan_pub = runtime.plan(ctx_pub)
-pub_ref = plan_pub.on_instance(A).publish(
+pub_ref = plan_pub.on_instance(source_instance).publish(
     engine_request_id=last_rid,
     ttl_ms=migration_ttl_ms,  # default 120 s
 )
@@ -761,14 +960,129 @@ publish_manifest = res_pub.step(pub_ref).artifact_result.publish_manifest
 
 ctx_hyd = tc.context(...)
 plan_hyd = runtime.plan(ctx_hyd)
-hyd_ref = plan_hyd.on_instance(B).hydrate(publish_manifest=publish_manifest)
+hyd_ref = plan_hyd.on_instance(target_instance).hydrate(
+    publish_manifest=publish_manifest,
+)
 plan_hyd.run()
 
 session_state[S].home_instance = B
 session_state[S].last_published_manifest = publish_manifest
 ```
 
-Subtleties locked in for v1:
+The implementation should not invent a second Tensorcast API wrapper.
+It should mirror the known-good call shape from
+`kv/request_transfer/caller_driver.py`: `CallContext`,
+`runtime.plan(context)`, `plan.on_instance(...).publish(...)`, then
+`plan.on_instance(...).hydrate(...)`, checking that the publish step
+returns a `PublishResult` with a non-null `publish_manifest` and that
+the hydrate step returns a `HydrateResult`.
+
+The plan calls are synchronous in the Tensorcast SDK. tc_router runs them
+in an executor so the asyncio workload loop is not blocked.
+
+#### 6.5.3 Host-residency invariant for explicit publish
+
+In `explicit_request_transfer` mode, `host_resident` in SGLang's
+request-bundle page state is a concrete ownership invariant, not a loose
+"stable page" hint. For a non-READY page it means the bundle manager has
+a recorded retained host slot for `(rank, page_hash)` and can force-flush
+that page during an explicit `publish(...)` call.
+
+The live-request sync path must therefore derive `host_resident` from the
+recorded host-resident page table. It must not mark every stable live page
+as host-resident. Doing so lets the publish closure attempt a force-flush
+for an ABSENT page with no host backing, which fails inside Tensorcast as
+a `PlanFailedError` with a missing host-resident page-byte diagnostic.
+
+Publish closure readiness follows these rules:
+
+- READY pages can be published directly.
+- ABSENT pages with a recorded host-resident slot can be force-flushed by
+  the explicit publish path.
+- ABSENT pages without recorded host backing are not ready. The migration
+  should wait until the publish deadline and return a structured
+  `publish_failed` row instead of issuing an invalid Tensorcast plan.
+
+`batch_set_v1()` in explicit request-transfer mode is the path that commits
+or retains host slots and records host residency for publishable pages.
+After a successful force-flush, the retained host slot is released so the
+allocator-backed host pool does not leak across requests or cells.
+
+#### 6.5.4 Pending migration routing semantics
+
+Once a migration starts for session `S`, the router sets
+`session_state[S].pending_migration` before issuing Tensorcast plans.
+This prevents duplicate migrations of the same source request and gives
+the next request a deterministic choice:
+
+- If the next turn for `S` arrives while the migration is still running,
+  `generate()` waits up to `pending_migration_wait_timeout_s`.
+- If the migration succeeds within the wait, `home_instance` has already
+  been updated to the target and the request routes to the target.
+- If the migration fails or times out, `home_instance` remains the
+  source and the request routes to the source.
+- If the wait itself times out but the migration is still running, the
+  request routes to the current home. The migration may still complete
+  later, but it is marked unconsumed unless a later turn uses it.
+
+This wait is intentionally session-local. It does not block unrelated
+sessions and does not serialize a worker's request stream. The wait is a
+correctness guard for the E2E migration smoke test; later policies can
+lower the timeout once bundle reuse has been validated.
+
+#### 6.5.5 Minimal E2E rebalance policy
+
+The first policy used to test session-scoped request migration is
+`migrate_once_after_turn`, configured for example as:
+
+```yaml
+policy:
+  kind: migrate_once_after_turn
+  seed: 0
+  after_turn_count: 1
+  target_strategy: next_instance        # or least_loaded
+  max_migrations_per_session: 1
+  pending_migration_wait_timeout_s: 30
+  plan_deadline_ms: 30000
+  publish_ttl_ms: 600000
+```
+
+This policy does not attempt to optimize load. It is successful if:
+
+1. the first successful source turn leaves a publishable
+   `last_engine_request_id`,
+2. `publish(last_engine_request_id)` succeeds on the source,
+3. `hydrate(publish_manifest)` succeeds on a different target instance,
+4. the next turn of the same `session_id` routes to the target,
+5. SGLang target admission attaches the session-scoped prepared bundle,
+6. the target turn reports non-zero `cached_tokens`.
+
+Only after this path is stable should the benchmark tune
+`ThresholdPolicy` or other load-aware policies.
+
+#### 6.5.6 Bundle reuse verification signals
+
+The router's own state is not enough to prove that the target actually
+consumed the hydrated bundle. The E2E gate verifies multiple signals:
+
+- `migrations.jsonl` contains a successful migration with source,
+  target, publish latency, hydrate latency, and manifest digest.
+- The next turn for that session has `served_instance == target` and
+  `was_just_migrated == true`.
+- The next turn has `cached_tokens > 0`; for stricter validation, compare
+  against the published cutoff minus tail-valid tokens encoded in the
+  SGLang publish manifest.
+- The target SGLang log contains
+  `Tensorcast prepared-bundle attached` for the migrated request and the
+  publish manifest digest, and does not contain a matching fallback,
+  fail-closed, or consume-failed line.
+
+`used_hydrated_bundle` in `turns.jsonl` is a router-level best-effort
+field. For the smoke test it may be set when a just-migrated turn lands
+on the target and reports `cached_tokens > 0`. The authoritative
+prepared-bundle proof is the SGLang target log signal.
+
+#### 6.5.7 Subtleties locked in for v1
 
 - **Partial snapshot is accepted.** Per `tensorcast_kv_protocol.md` § 5.3,
   `publish(engine_request_id=E)` covers only the prompt-prefix up to E's
@@ -833,22 +1147,26 @@ topologies in a single run are not supported (§ 2).
 
 ## 7. Physical Topology
 
-The current checked-in implementation supports a **local single-node
-topology** through `resource/local.py`. The driver host is also the
-worker host; one local worker describes the machine's GPU set, and the
-placement planner can pack multiple SGLang instances onto disjoint GPU
-windows on that worker. This is the supported path for local smoke runs
-on the 8xH800 machine.
+The current checked-in implementation supports two provider shapes:
 
-The original publication-grade experiment still wants a cross-host
-topology so Tensorcast `publish` / `hydrate` traffic measures real
-network transport rather than same-host paths. That requires adding a
-new `ResourceProvider` for the target cluster; legacy remote-provider
-support has been removed and is not part of the current runnable code.
+- `resource/local.py`: a single local worker. The driver host is also the
+  worker host; the placement planner can pack multiple SGLang instances
+  onto disjoint GPU windows on the 8xH800 machine.
+- `resource/static.py`: a static local-plus-SSH worker set. Workers are
+  already acquired outside the benchmark and are described in
+  `cluster.yaml`. The benchmark starts services through local subprocesses
+  or SSH commands and assumes the shared `/mnt/data` filesystem is visible
+  on every worker. No `scp` or `rsync` is part of the provider contract.
+
+The publication-grade experiment uses the static provider so Tensorcast
+`publish` / `hydrate` traffic can measure real cross-host transport.
+The benchmark still supports local smoke runs because they are faster and
+useful for debugging launch and routing logic.
 
 The benchmark consumes workers described in a cluster YAML (see § 9.1).
-For `provider.kind: local`, those workers are not acquired out of band;
-they are simply a declarative view of the current host.
+For `provider.kind: local`, those workers are a declarative view of the
+current host. For `provider.kind: static`, they are a declarative view of
+already-reachable local/remote hosts.
 
 ### 7.1 Worker layout
 
@@ -860,6 +1178,17 @@ Local smoke layout:
 - the same local worker hosts the Tensorcast global store and one
   Tensorcast daemon
 
+Static local+remote layout:
+
+- one local worker and one or more SSH workers, all sharing `/mnt/data`
+- `/home/yuhan` is a symlink to `/mnt/data` on every worker, so generated
+  configs, service logs, PID files, and benchmark outputs are visible
+  without file transfer
+- one Tensorcast daemon runs on each worker that hosts SGLang instances
+- the Tensorcast global store usually runs on the local worker so the
+  in-process tc_router can connect to a local or low-latency daemon while
+  the directory still sees remote worker registrations
+
 The placement planner is greedy and provider-agnostic: it walks workers
 in YAML order, allocating non-overlapping `tp_size` GPU windows until
 `instances.count` instances have been placed. For future cross-host
@@ -869,16 +1198,16 @@ planner will spread or pack instances according to available GPUs.
 ### 7.2 Driver host
 
 For local runs, the router and traffic generator run on the same host as
-the SGLang instances. The driver host:
+the SGLang instances. For static multi-worker runs, the router and
+traffic generator run on the local driver host and send HTTP requests to
+both local and remote SGLang instances. The driver host:
 
 - has network reachability to every worker's SGLang HTTP endpoint and
-  Tensorcast daemon; for local runs these are `127.0.0.1:<port>`
+  Tensorcast daemon; for local runs these are `127.0.0.1:<port>`, while
+  static runs use each worker's configured routable address
 - runs the `tc_router` Python process (router + workload generator +
   Tensorcast runtime client) for tc_router configs, and the
   gateway-baseline wrapper for `gw_*` configs
-
-For future cross-host experiments, the same driver can run on a
-separate login node to keep serving workers symmetric.
 
 ### 7.3 Distinct-host requirement
 
@@ -953,7 +1282,7 @@ tc_router/
     base.py                # Worker, ResourceProvider, RemoteProcess Protocols
     factory.py             # dispatch on cluster_yaml.provider.kind
     local.py               # LocalProvider: Worker.run uses local subprocesses
-    static.py              # placeholder for future SSH-like fallback
+    static.py              # StaticProvider: local + SSH workers on shared /mnt/data
   services/                # service launchers, all Provider-agnostic
     __init__.py
     base.py                # Service / ServiceLauncher abstract interfaces
@@ -1005,15 +1334,21 @@ Responsibilities:
 - if a future cross-host config enables RDMA, validate transport before
   launching services
 - group configs by serving profile before launching SGLang:
-  - `plain`: `gw_load_aware`, `gw_cache_aware`, and `tc_router`
+  - `plain`: `gw_load_aware`, `gw_cache_aware`
+  - `tensorcast`: `tc_router`
   - `mooncake`: `gw_load_aware_mooncake`
 - for each serving profile that appears in the filtered config set:
   - launch the service prerequisites for that profile; the Mooncake profile
-    starts the Mooncake master/metadata singleton before SGLang, while the
-    plain profile has no Mooncake service
+    starts the Mooncake master/metadata singleton before SGLang, the
+    Tensorcast profile starts the global store plus one daemon per worker
+    before SGLang, and the plain profile has no storage-service
+    prerequisite
   - launch the SGLang instance fleet for that profile, using the placement
     plan derived from `instances.count`, `model.tp_size`, and worker GPU
     windows
+  - for the Tensorcast profile, launch SGLang with explicit
+    request-transfer HiCache extra config and then wait until every logical
+    SGLang `instance_id` resolves in the Tensorcast directory
   - run all configs in that profile, then tear down that profile's SGLang
     fleet and service prerequisites
 - for each `(config, c_target, trial, preset)` cell of the sweep:
@@ -1021,6 +1356,12 @@ Responsibilities:
     remains
   - POST `/flush_cache` directly to every SGLang instance and retry until all
     instances return HTTP 200, subject to a bounded timeout
+  - for Tensorcast-backed tc_router cells, POST
+    `/clear_hicache_storage_backend` directly to every SGLang instance if
+    the cell needs strict prepared-bundle isolation; the default migration
+    smoke can rely on fresh SGLang/Tensorcast profile startup plus per-cell
+    `/flush_cache`, but publication experiments should clear storage
+    backends between cells when comparing cache effects
   - for Mooncake-backed cells, POST `/clear_hicache_storage_backend`
     directly to every SGLang instance and retry until all instances return
     HTTP 200, subject to a bounded timeout
@@ -1096,6 +1437,11 @@ class ResourceProvider(Protocol):
 The Provider adapts a cluster YAML to a uniform `Worker` interface. For
 `provider.kind: local`, no acquisition happens; the provider runs
 commands directly on the current host with local subprocesses.
+For `provider.kind: static`, no acquisition happens either; the provider
+uses the local worker directly and reaches remote workers with SSH. The
+static provider assumes every worker sees the same `/mnt/data` tree, so
+`put_file` / `get_file` are only compatibility hooks and are not used for
+benchmark source or output transfer.
 
 ### 8.3 `services/` — Provider-agnostic service launchers
 
@@ -1177,16 +1523,20 @@ Mooncake master plus HTTP metadata service. Both fields are required in
 the cluster schema so a single cluster YAML can support every benchmark
 config kind.
 
-For non-local providers added in the future, the cluster YAML may again
-describe acquired remote state. For `provider.kind: local`, it is just
-the machine-local execution contract.
+For `provider.kind: local`, the cluster YAML is the machine-local
+execution contract. For `provider.kind: static`, it describes already
+reachable local/remote workers and the shared mount contract; the
+benchmark does not acquire or release those workers.
 
 At runtime the driver writes an effective `cluster.yaml` into
-`outputs/<timestamp>_<run_id>/` and, for the local provider, rewrites
+`outputs/<timestamp>_<run_id>/`. For the local provider, it rewrites
 `driver_host.scratch_dir`, `mount.path`, and every worker `scratch_dir`
-under that run directory. The input YAML is preserved as
-`cluster_input.yaml`. This keeps SGLang logs, PID files, resolved configs,
-turn JSONL files, and summaries together in a single experiment folder.
+under that run directory. For the static provider, it preserves the
+operator-provided worker addresses and shared mount semantics while
+resolving per-run output paths under the shared filesystem. The input
+YAML is preserved as `cluster_input.yaml`. This keeps SGLang logs, PID
+files, resolved configs, turn JSONL files, and summaries together in a
+single experiment folder.
 
 ### 9.2 `benchmark.yaml` — describes an experiment
 
@@ -1222,8 +1572,14 @@ workload:
 configs:
   - kind: tc_router
     policy:
-      kind: never_rebalance
+      kind: migrate_once_after_turn     # use never_rebalance for sticky stub runs
       seed: 0
+      after_turn_count: 1
+      target_strategy: next_instance
+      max_migrations_per_session: 1
+      pending_migration_wait_timeout_s: 30
+      plan_deadline_ms: 30000
+      publish_ttl_ms: 600000
   - kind: gw_cache_aware
     policy:                            # optional gateway CLI knobs
       cache_threshold: 0.0             # emits --cache-threshold
@@ -1240,6 +1596,13 @@ mooncake:
   eviction_high_watermark_ratio: 0.9
   device_name: ""                   # optional; empty is valid for TCP
   clear_storage_between_cells: true
+tensorcast:
+  global_store_port: 61050             # only used by tc_router
+  daemon_port: 61053
+  daemon_p2p_port: 61090
+  instance_agent_base_port: 61400
+  daemon_stable_bytes: 16GB
+  clear_storage_between_cells: true
 load_polling:
   period_ms: 250
 ```
@@ -1251,8 +1614,9 @@ Validation rules at load time:
   instances onto one worker
 - `inter_turn_delay.preset == custom` requires `custom_mu` and
   `custom_sigma`; otherwise they MUST be absent.
-- `provider.kind: local` allows empty `base_env`; non-local providers
-  are expected to define the environment needed by their transport.
+- `provider.kind: local` and `provider.kind: static` both allow empty
+  `base_env`; the cluster YAML should define only the environment needed
+  by that worker's CUDA/NCCL/RDMA/runtime setup.
 - `gw_cache_aware.policy`, when present, may contain only
   `cache_threshold`, `balance_abs_threshold`, and
   `balance_rel_threshold`; the driver forwards them to
@@ -1263,6 +1627,18 @@ Validation rules at load time:
   service and SGLang Mooncake connection payload. It intentionally does
   not contain a `prefetch_threshold` field; the benchmark uses SGLang's
   upstream default instead of pinning a benchmark-specific value.
+- `tensorcast` is only consumed when at least one config has
+  `kind: tc_router`. It controls the global-store port, per-worker daemon
+  ports, instance-agent base port, daemon memory budget, and whether
+  Tensorcast HiCache storage backends are cleared between cells.
+- `tc_router.policy.kind=never_rebalance` is valid for sticky-router
+  regression runs. `tc_router.policy.kind=migrate_once_after_turn` is the
+  required first E2E migration gate. `ThresholdPolicy` and later policies
+  may add their own knobs, but they must reuse the same migration
+  execution path.
+- `tensorcast.instance_agent_base_port + instances.count - 1` must stay
+  within the valid TCP port range and must not overlap serving HTTP,
+  Tensorcast daemon, Tensorcast P2P, Mooncake, gateway, or NCCL ports.
 
 ### 9.3 Invocation
 
@@ -1327,22 +1703,40 @@ Written to `outputs/<run_id>/<config>/c<C_target>/trial<i>/migrations.jsonl`
 ```jsonc
 {
   "ts": 1717919998.901,
+  "migration_id": "migrate:session-a:000001",
+  "is_warmup": false,
   "session_id": "gpt-4o-2024-08-06_maxiter_30_N_v2.1-no-hint-train-t04-run_1",
   "source_instance": "inst-0",
   "target_instance": "inst-1",
+  "source_engine_request_id": "tcrouter:run_1:turn04",
+  "status": "consumed",
   "publish_latency_ms": 41.0,
   "hydrate_latency_ms": 88.3,
+  "publish_manifest_digest": "b2c9...",
+  "artifact_manifest_digest": "13e4...",
+  "published_cutoff_token_count": 9216,
+  "tail_valid_tokens": 512,
   "transferred_bytes_estimated": 134217728,
-  "decided_by": "ThresholdPolicy",
+  "decided_by": "MigrateOnceAfterTurnPolicy",
   "consumed_by_turn_rid": "tcrouter:run_1:turn05",
   "consumed_within_s": 6.4,
+  "target_turn_cached_tokens": 8704,
+  "prepared_bundle_attached": true,
+  "prepared_bundle_fallback": false,
+  "prepared_bundle_fail_closed": false,
+  "prepared_bundle_consume_failed": false,
   "wasted": false
 }
 ```
 
-`consumed_by_turn_rid` is populated lazily after the next turn of the
+`migrations.jsonl` contains one finalized row per migration. The router
+may log intermediate publish/hydrate attempts to `router.log`, but the
+summary reader expects each JSONL row to represent a single migration's
+final state: `status=consumed`, `status=unconsumed`,
+`status=publish_failed`, `status=hydrate_failed`, or `status=timeout`.
+`consumed_by_turn_rid` is populated only after a later turn of the same
 session lands on the target. If no such turn occurs before the bundle's
-TTL expires, the row is rewritten with `wasted: true`.
+TTL expires or before the cell ends, `wasted=true`.
 
 ### 10.3 Run summary
 
@@ -1391,18 +1785,37 @@ Bring-up order (each step must pass before moving on):
 2. Single config (`gw_load_aware`), `N = 3`, `C_target = 3`. Sanity:
    each session lands on its own instance, no surprises.
 3. `tc_router` with `should_rebalance` stubbed to always-False. Must
-   behave identically to `gw_load_aware` (no migrations).
-4. `tc_router` with `should_rebalance` stubbed to always-True for one
-   target session. Verify the migration flow: `publish` succeeds,
-   `hydrate` succeeds, `prepared-bundle attached` appears in the target
-   log, the next turn lands on the new instance with high
-   `cached_tokens`. This reuses the verification logic from
-   `request_transfer`.
-5. Full `C_target` sweep on the smallest valid grid
+   launch the Tensorcast serving profile, resolve every SGLang instance
+   in the Tensorcast directory, and behave like a sticky load-aware
+   router with zero migrations.
+4. `tc_router` with `policy.kind=migrate_once_after_turn`, `N = 2`,
+   `C_target = 1` or `2`, and short wall time. Verify:
+   `publish` succeeds, `hydrate` succeeds, the next turn for that
+   `session_id` waits for the pending migration if necessary, lands on
+   the target instance, and reports non-zero `cached_tokens`.
+5. Reuse the prepared-bundle verification logic from
+   `request_transfer`: target log must contain
+   `Tensorcast prepared-bundle attached` for the expected manifest digest
+   and must not contain matching fallback, fail-closed, or consume-failed
+   lines.
+6. Confirm `migrations.jsonl` is present, contains finalized migration
+   rows, and `summary.csv` reports non-zero `migration_count`,
+   non-null `migration_utilization`, and mean publish/hydrate latency.
+   Completed smoke baseline:
+   `outputs/20260713-135900_static-tc-router-migration-smoke-4inst-tp2`
+   on the static 4-instance TP=2 local+remote cluster. It completed
+   73 / 73 turns with zero request failures, emitted 12 finalized
+   migration rows, consumed 6 of them (`migration_utilization = 0.5`),
+   and reported 6 target turns with both `was_just_migrated=true` and
+   `used_hydrated_bundle=true`. No publish/hydrate/PlanFailed errors were
+   observed in the successful run. The unconsumed rows are migrations that
+   published and hydrated successfully but did not receive another
+   same-session turn before the 180 s smoke window ended.
+7. Full `C_target` sweep on the smallest valid grid
    (`C_target in {3, 8}`) for all four configs, single trial.
-6. Full sweep with `trials = 3`.
+8. Full sweep with `trials = 3`.
 
-Only after step 6 is reproducibly green do we treat the headline plot as
+Only after step 8 is reproducibly green do we treat the headline plot as
 a result.
 
 ## 13. Open Questions Tracked Outside This Doc
@@ -1411,12 +1824,13 @@ The following are deferred and will be specified when their cost / risk
 becomes clear during implementation:
 
 - exact knobs of `ThresholdPolicy` (`rebalance_ratio`, etc.) — tuned in
-  step 5 of validation.
+  step 7 of validation.
 - whether to add a "placeholder-request" mechanism for whole-session
   snapshots (would upgrade partial → full coverage). v1 is partial; this
   is a possible v2.
 - bandwidth budgeting for the rebalancer under high migration rates.
-- TP > 1 launch-harness support.
+- mixed-TP launch-harness support. Uniform TP > 1 is already part of the
+  v1 serving contract.
 - richer policy variants (length-aware target picking, predictive
   pre-migration based on inter-turn delay distribution, etc.).
 
@@ -1479,12 +1893,20 @@ metrics code do not change.
   worker is a job for acquisition / provisioning code, not the
   benchmark.
 
-### 14.4 Static fallback
+### 14.4 Static provider
 
-`resource/static.py::StaticProvider` is still a placeholder. It is not
-implemented in the current code. Clusters that expose SSH or another
-remote shell should add a real provider and register it in
-`resource/factory.py`.
+`resource/static.py::StaticProvider` is the supported SSH-based provider
+for the current local+remote H800 setup. It assumes:
+
+- the local driver can run commands on the local worker directly,
+- remote workers are reachable through SSH without an interactive
+  password prompt,
+- every worker sees the same `/mnt/data` filesystem,
+- `/home/yuhan` points at `/mnt/data` on every worker,
+- and generated configs/logs/outputs are written under that shared tree.
+
+Because the filesystem is shared, the static provider does not copy the
+repository, model, dataset, configs, or outputs between workers.
 
 ## Appendix A. Dataset format reference
 
